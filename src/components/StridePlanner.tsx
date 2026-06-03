@@ -214,7 +214,6 @@ function fitnessUpdateSuggestion(profile, runs) {
 
 const KEYS = {
   profile: "stride:profile",
-  plan: "stride:plan",
   runs: "stride:runs",
   cross: "stride:cross",
   fuel: "stride:fuel",
@@ -359,15 +358,14 @@ export default function App() {
 
   useEffect(() => {
     (async () => {
-      const [p, pl, r, c, f] = await Promise.all([
+      const [p, r, c, f] = await Promise.all([
         loadKey(KEYS.profile, null),
-        loadKey(KEYS.plan, []),
         loadKey(KEYS.runs, []),
         loadKey(KEYS.cross, []),
         loadKey(KEYS.fuel, []),
       ]);
       setProfile(p);
-      setPlan(pl);
+      setPlan(p ? generatePlan(p) : []); // plan is derived from profile, not stored
       setRuns(r);
       setCross(c);
       setFuel(f);
@@ -381,9 +379,7 @@ export default function App() {
   const saveProfile = useCallback((p) => {
     setProfile(p);
     saveKey(KEYS.profile, p);
-    const newPlan = generatePlan(p);
-    setPlan(newPlan);
-    saveKey(KEYS.plan, newPlan);
+    setPlan(generatePlan(p)); // derived, no longer persisted
   }, []);
 
   const addRun = (run) => {

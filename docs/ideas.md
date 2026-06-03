@@ -35,3 +35,35 @@ For each song, take `played_at` + track duration as a window, find the HR/pace s
 
 - **Personal version** (song-by-song breakdown of your own runs): very buildable, low risk.
 - **Public leaderboard**: a real maybe — gated on Spotify approval and policy, not on our code.
+
+---
+
+## Long run fueling warning
+
+The long run fueling warning says the following:
+
+"Practice fuelling on anything over 90min."
+
+Instead, estimate time based on pace and then advise that, "fueling recommended" due to run duration.
+
+---
+
+## Plan: flexibility & day selection
+
+Two related features that evolve `plan` from purely-derived into a real, editable schedule. Both are post–piece-3 feature work (they don't block finishing the storage keys), and the base plan stays derived from profile either way — only user edits would get stored.
+
+### 1. Pick preferred running days at setup (smaller)
+
+Let the user choose which days they run (e.g. Wed/Sun) during Setup, instead of `generatePlan` using the hardcoded Sun/Tue/Thu/Mon/Wed/Fri/Sat pattern.
+
+- **Storage:** one additive column on `profile` (`preferred_days`, e.g. `text[]` or comma string) + a line in the profile mappers. Additive/nullable, so it's safe to add anytime — even after launch.
+- **Logic:** `generatePlan` assigns long/quality/easy sessions to the chosen days.
+
+### 2. Move run dates within a week (bigger — the persistence trigger)
+
+Let the user drag/reschedule sessions, because plans change and flexibility matters.
+
+- This is the point where **plan stops being derived and earns storage**: edits are user state that must persist.
+- **Likely shape:** generate the base from profile (incl. preferred days) → materialize it onto real calendar dates in a stored table (e.g. `plan_sessions`, or the currently-unused `plan` table) → "move a run" = update that session's date.
+- Base plan still generated from profile; the user's overrides are what get saved.
+  **Sequencing:** #1 is a cheap additive profile column whenever. #2 is the larger build and the deliberate moment plan becomes a dated, stored, editable schedule.
