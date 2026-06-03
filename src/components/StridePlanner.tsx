@@ -214,7 +214,6 @@ function fitnessUpdateSuggestion(profile, runs) {
 
 const KEYS = {
   profile: "stride:profile",
-  runs: "stride:runs",
   cross: "stride:cross",
   fuel: "stride:fuel",
 };
@@ -322,6 +321,100 @@ async function saveKey(key, value) {
   }
 }
 
+// --- runs: activities (objective) + run_logs (subjective), 1 run = 2 rows ----
+// DB rows -> the flat run object the app expects. id = activity UUID (used for
+// React keys and delete). distance kept as a 2dp string to match the app.
+function rowsToRun(activity, log) {
+  const d = activity.distance_km != null ? Number(activity.distance_km) : null;
+  return {
+    id: activity.id,
+    date: (log && log.date) || (activity.date ? String(activity.date).slice(0, 10) : ""),
+    type: activity.type || (log && log.run_type) || "easy",
+    distance: d != null ? d.toFixed(2) : "0.00",
+    timeSec: activity.moving_time_s ?? 0,
+    score: log ? log.score : null,
+    warmup: log ? !!log.warmup : false,
+    wrong: (log && log.wrong) || [],
+    pain: (log && log.pain) || [],
+    notes: (log && log.notes) || "",
+  };
+}
+
+async function loadRuns() {
+  try {
+    const supabase = sb();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) return [];
+    // activities is the spine; embed its run_log. newest first.
+    const { data, error } = await supabase
+      .from("activities")
+      .select("*, run_logs(*)")
+      .order("date", { ascending: false });
+    if (error) throw error;
+    return (data || []).map((a) => rowsToRun(a, a.run_logs && a.run_logs[0] ? a.run_logs[0] : null));
+  } catch (e) {
+    console.error("load runs failed", e);
+    return [];
+  }
+}
+
+// insert one run as activity (+ linked run_log); returns the flat run object.
+async function insertRun(run) {
+  const supabase = sb();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) throw new Error("not signed in");
+
+  const dist = Number(run.distance);
+  const distanceKm = isFinite(dist) && dist > 0 ? dist : null;
+  const timeS = run.timeSec ?? null;
+  const avgPaceS = distanceKm && timeS ? timeS / distanceKm : null;
+
+  const { data: act, error: e1 } = await supabase
+    .from("activities")
+    .insert({
+      user_id: user.id,
+      date: run.date || null,
+      type: run.type || null,
+      distance_km: distanceKm,
+      moving_time_s: timeS,
+      avg_pace_s: avgPaceS,
+      source: "manual",
+    })
+    .select()
+    .single();
+  if (e1) throw e1;
+
+  const { data: log, error: e2 } = await supabase
+    .from("run_logs")
+    .insert({
+      user_id: user.id,
+      activity_id: act.id,
+      date: run.date,
+      run_type: run.type || null,
+      score: run.score ?? null,
+      warmup: !!run.warmup,
+      wrong: run.wrong || [],
+      pain: run.pain || [],
+      notes: run.notes || null,
+    })
+    .select()
+    .single();
+  if (e2) throw e2;
+
+  return rowsToRun(act, log);
+}
+
+// delete one run by activity id; run_log cascades via activity_id FK.
+async function deleteRun(id) {
+  const supabase = sb();
+  const { error } = await supabase.from("activities").delete().eq("id", id);
+  if (error) throw error;
+}
+
 /* ---------- small UI atoms ---------- */
 
 const Stat = ({ label, value, accent }) => (
@@ -360,7 +453,7 @@ export default function App() {
     (async () => {
       const [p, r, c, f] = await Promise.all([
         loadKey(KEYS.profile, null),
-        loadKey(KEYS.runs, []),
+        loadRuns(),
         loadKey(KEYS.cross, []),
         loadKey(KEYS.fuel, []),
       ]);
@@ -382,19 +475,25 @@ export default function App() {
     setPlan(generatePlan(p)); // derived, no longer persisted
   }, []);
 
-  const addRun = (run) => {
-    const next = [run, ...runs];
-    setRuns(next);
-    saveKey(KEYS.runs, next);
+  const addRun = async (run) => {
+    try {
+      const saved = await insertRun(run);
+      setRuns((prev) => [saved, ...prev]);
+    } catch (e) {
+      console.error("add run failed", e);
+    }
   };
   const updateFitness = (distKm, timeSec) => {
     const p = { ...profile, benchDistKm: distKm, benchTimeSec: timeSec };
     saveProfile(p);
   };
-  const delRun = (id) => {
-    const next = runs.filter((r) => r.id !== id);
-    setRuns(next);
-    saveKey(KEYS.runs, next);
+  const delRun = async (id) => {
+    try {
+      await deleteRun(id);
+      setRuns((prev) => prev.filter((r) => r.id !== id));
+    } catch (e) {
+      console.error("del run failed", e);
+    }
   };
   const addCross = (x) => {
     const next = [x, ...cross];
