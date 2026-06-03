@@ -2,6 +2,7 @@
 "use client";
 
 import React, { useState, useEffect, useCallback } from "react";
+import { createClient } from "@/utils/supabase/client";
 
 /* ============================================================
    STRIDE — a running planner
@@ -219,7 +220,78 @@ const KEYS = {
   fuel: "stride:fuel",
 };
 
+// Lazy browser Supabase client (instantiated on first use, client-side only).
+let _sb = null;
+function sb() {
+  _sb = _sb || createClient();
+  return _sb;
+}
+
+// --- profile <-> table mapping --------------------------------------------
+// DB row (snake_case) -> app profile object (camelCase). goalLabel is derived,
+// so it isn't stored; we rebuild it here so the app object keeps its shape.
+function rowToProfile(row) {
+  if (!row) return null;
+  const goalDistanceKm = row.goal_distance_km != null ? Number(row.goal_distance_km) : null;
+  const goalType = row.goal_type || "distance";
+  const goalTime = row.goal_time || "";
+  const goalLabel =
+    goalType === "time" && goalTime
+      ? `${goalDistanceKm}km in ${goalTime}`
+      : `${goalDistanceKm}km`;
+  return {
+    name: row.name || "",
+    goalType,
+    goalDistanceKm,
+    goalTime,
+    goalLabel,
+    raceDate: row.race_date || "",
+    currentWeeklyKm: row.current_weekly_km != null ? Number(row.current_weekly_km) : null,
+    daysPerWeek: row.days_per_week,
+    benchDistKm: row.bench_dist_km != null ? Number(row.bench_dist_km) : null,
+    benchTimeSec: row.bench_time_s,
+    easyPaceSec: row.easy_pace_s,
+  };
+}
+// app profile object -> DB row. Drops derived goalLabel; "" race date -> null.
+function profileToRow(p, userId) {
+  return {
+    id: userId,
+    name: p.name ?? null,
+    goal_type: p.goalType ?? null,
+    goal_distance_km: p.goalDistanceKm ?? null,
+    goal_time: p.goalTime ?? null,
+    race_date: p.raceDate ? p.raceDate : null,
+    current_weekly_km: p.currentWeeklyKm ?? null,
+    days_per_week: p.daysPerWeek ?? null,
+    bench_dist_km: p.benchDistKm ?? null,
+    bench_time_s: p.benchTimeSec ?? null,
+    easy_pace_s: p.easyPaceSec ?? null,
+  };
+}
+
+// The storage seam. profile -> Postgres; the other keys still use localStorage
+// (converted one at a time in later steps of piece 3).
 async function loadKey(key, fallback) {
+  if (key === KEYS.profile) {
+    try {
+      const supabase = sb();
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (!user) return fallback;
+      const { data, error } = await supabase
+        .from("profile")
+        .select("*")
+        .eq("id", user.id)
+        .maybeSingle();
+      if (error) throw error;
+      return data ? rowToProfile(data) : fallback;
+    } catch (e) {
+      console.error("load profile failed", e);
+      return fallback;
+    }
+  }
   try {
     const r = typeof window !== "undefined" ? window.localStorage.getItem(key) : null;
     return r ? JSON.parse(r) : fallback;
@@ -228,6 +300,22 @@ async function loadKey(key, fallback) {
   }
 }
 async function saveKey(key, value) {
+  if (key === KEYS.profile) {
+    try {
+      const supabase = sb();
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (!user) throw new Error("not signed in");
+      const { error } = await supabase
+        .from("profile")
+        .upsert(profileToRow(value, user.id), { onConflict: "id" });
+      if (error) throw error;
+    } catch (e) {
+      console.error("save profile failed", e);
+    }
+    return;
+  }
   try {
     if (typeof window !== "undefined") window.localStorage.setItem(key, JSON.stringify(value));
   } catch (e) {
