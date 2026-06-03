@@ -6,7 +6,7 @@ import { createClient } from "@/utils/supabase/client";
 
 /* ============================================================
    STRIDE — a running planner
-   Single-file React app. Persists via window.localStorage (swapped to Supabase in piece 3).
+   Single-file React app. Persists to Supabase (Postgres) via per-domain functions.
    ============================================================ */
 
 /* ---------- time + math helpers ---------- */
@@ -214,7 +214,6 @@ function fitnessUpdateSuggestion(profile, runs) {
 
 const KEYS = {
   profile: "stride:profile",
-  fuel: "stride:fuel",
 };
 
 // Lazy browser Supabase client (instantiated on first use, client-side only).
@@ -267,8 +266,9 @@ function profileToRow(p, userId) {
   };
 }
 
-// The storage seam. profile -> Postgres; the other keys still use localStorage
-// (converted one at a time in later steps of piece 3).
+// profile read/write. (runs/cross/fuel use their own functions above; plan is
+// derived from profile, not stored. The localStorage branch is now unused but
+// kept as a harmless generic fallback.)
 async function loadKey(key, fallback) {
   if (key === KEYS.profile) {
     try {
@@ -466,6 +466,61 @@ async function insertCross(x) {
   return rowToCross(data);
 }
 
+// --- fuel: daily meal log in fuel_logs (single table; add + list) ----------
+function rowToFuel(row) {
+  return {
+    id: row.id,
+    date: row.date ? String(row.date).slice(0, 10) : "",
+    breakfast: row.breakfast || "",
+    lunch: row.lunch || "",
+    dinner: row.dinner || "",
+    snacks: row.snacks || "",
+    water: row.water || "",
+  };
+}
+
+async function loadFuel() {
+  try {
+    const supabase = sb();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) return [];
+    const { data, error } = await supabase
+      .from("fuel_logs")
+      .select("*")
+      .order("date", { ascending: false });
+    if (error) throw error;
+    return (data || []).map(rowToFuel);
+  } catch (e) {
+    console.error("load fuel failed", e);
+    return [];
+  }
+}
+
+async function insertFuel(f) {
+  const supabase = sb();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) throw new Error("not signed in");
+  const { data, error } = await supabase
+    .from("fuel_logs")
+    .insert({
+      user_id: user.id,
+      date: f.date,
+      breakfast: f.breakfast || null,
+      lunch: f.lunch || null,
+      dinner: f.dinner || null,
+      snacks: f.snacks || null,
+      water: f.water || null,
+    })
+    .select()
+    .single();
+  if (error) throw error;
+  return rowToFuel(data);
+}
+
 /* ---------- small UI atoms ---------- */
 
 const Stat = ({ label, value, accent }) => (
@@ -506,7 +561,7 @@ export default function App() {
         loadKey(KEYS.profile, null),
         loadRuns(),
         loadCross(),
-        loadKey(KEYS.fuel, []),
+        loadFuel(),
       ]);
       setProfile(p);
       setPlan(p ? generatePlan(p) : []); // plan is derived from profile, not stored
@@ -554,10 +609,13 @@ export default function App() {
       console.error("add cross failed", e);
     }
   };
-  const addFuel = (f) => {
-    const next = [f, ...fuel];
-    setFuel(next);
-    saveKey(KEYS.fuel, next);
+  const addFuel = async (f) => {
+    try {
+      const saved = await insertFuel(f);
+      setFuel((prev) => [saved, ...prev]);
+    } catch (e) {
+      console.error("add fuel failed", e);
+    }
   };
 
   if (!loaded)
