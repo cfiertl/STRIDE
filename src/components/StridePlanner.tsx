@@ -214,7 +214,6 @@ function fitnessUpdateSuggestion(profile, runs) {
 
 const KEYS = {
   profile: "stride:profile",
-  cross: "stride:cross",
   fuel: "stride:fuel",
 };
 
@@ -415,6 +414,58 @@ async function deleteRun(id) {
   if (error) throw error;
 }
 
+// --- cross-training (single table; add + list, no delete in UI) ------------
+function rowToCross(row) {
+  return {
+    id: row.id,
+    date: row.date ? String(row.date).slice(0, 10) : "",
+    activity: row.activity || "",
+    minutes: row.minutes ?? null,
+    intensity: row.intensity || "",
+  };
+}
+
+async function loadCross() {
+  try {
+    const supabase = sb();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) return [];
+    const { data, error } = await supabase
+      .from("cross_training")
+      .select("*")
+      .order("date", { ascending: false });
+    if (error) throw error;
+    return (data || []).map(rowToCross);
+  } catch (e) {
+    console.error("load cross failed", e);
+    return [];
+  }
+}
+
+async function insertCross(x) {
+  const supabase = sb();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) throw new Error("not signed in");
+  const mins = x.minutes != null && x.minutes !== "" ? parseInt(x.minutes, 10) : null;
+  const { data, error } = await supabase
+    .from("cross_training")
+    .insert({
+      user_id: user.id,
+      date: x.date,
+      activity: x.activity || null,
+      minutes: Number.isFinite(mins) ? mins : null,
+      intensity: x.intensity || null,
+    })
+    .select()
+    .single();
+  if (error) throw error;
+  return rowToCross(data);
+}
+
 /* ---------- small UI atoms ---------- */
 
 const Stat = ({ label, value, accent }) => (
@@ -454,7 +505,7 @@ export default function App() {
       const [p, r, c, f] = await Promise.all([
         loadKey(KEYS.profile, null),
         loadRuns(),
-        loadKey(KEYS.cross, []),
+        loadCross(),
         loadKey(KEYS.fuel, []),
       ]);
       setProfile(p);
@@ -495,10 +546,13 @@ export default function App() {
       console.error("del run failed", e);
     }
   };
-  const addCross = (x) => {
-    const next = [x, ...cross];
-    setCross(next);
-    saveKey(KEYS.cross, next);
+  const addCross = async (x) => {
+    try {
+      const saved = await insertCross(x);
+      setCross((prev) => [saved, ...prev]);
+    } catch (e) {
+      console.error("add cross failed", e);
+    }
   };
   const addFuel = (f) => {
     const next = [f, ...fuel];
