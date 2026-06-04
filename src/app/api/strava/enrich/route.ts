@@ -71,6 +71,8 @@ export async function GET() {
       gear_name: d.gear?.name ?? null,
       device_name: d.device_name ?? null,
       description: d.description ?? null,
+      perceived_exertion: d.perceived_exertion ?? null,
+      effort_source: d.perceived_exertion != null ? "strava" : null,
     };
 
     const { error: upErr } = await admin

@@ -1,25 +1,25 @@
-// src/app/api/strava/backfill/route.ts — last 90 days, summary (scalar) data
-import { NextResponse } from "next/server";
+// src/app/api/strava/backfill/route.ts — full history (or ?days=N), summary data
+import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/utils/supabase/server";
-import { createAdminClient } from "@/utils/supabase/admin"; // match your callback's import
+import { createAdminClient } from "@/utils/supabase/admin";
 import { getStravaAccessToken } from "@/utils/strava/token";
 
-const DAYS = 90;
 const PER_PAGE = 200;
+const MAX_PAGES = 50; // 50 × 200 = 10,000 activities — generous safety stop
 
 interface StravaSummary {
   id: number;
   start_date: string;
   type?: string;
   sport_type?: string;
-  distance?: number;            // metres
-  moving_time?: number;         // seconds
+  distance?: number;
+  moving_time?: number;
   average_heartrate?: number;
   max_heartrate?: number;
   total_elevation_gain?: number;
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   const supabase = await createClient();
   const {
     data: { user },
@@ -33,18 +33,24 @@ export async function GET() {
     return NextResponse.json({ error: String(e) }, { status: 400 });
   }
 
-  const after = Math.floor(Date.now() / 1000) - DAYS * 24 * 60 * 60;
+  // Optional ?days=N bounds the window; omit it for full history.
+  const daysParam = new URL(request.url).searchParams.get("days");
+  const days = daysParam ? Number(daysParam) : null;
+  const after =
+    days && Number.isFinite(days)
+      ? Math.floor(Date.now() / 1000) - days * 24 * 60 * 60
+      : null;
 
-  // Page through summaries until a short page signals the end.
   const rows: ReturnType<typeof mapActivity>[] = [];
   let page = 1;
   let fetched = 0;
-  while (true) {
+  while (page <= MAX_PAGES) {
     const params = new URLSearchParams({
-      after: String(after),
       per_page: String(PER_PAGE),
       page: String(page),
     });
+    if (after) params.set("after", String(after));
+
     const res = await fetch(
       `https://www.strava.com/api/v3/athlete/activities?${params}`,
       { headers: { Authorization: `Bearer ${token}` } }
@@ -53,7 +59,7 @@ export async function GET() {
       const detail = await res.text();
       return NextResponse.json(
         { step: "fetch", page, error: `Strava ${res.status}`, detail },
-        { status: 502 }
+        { status: res.status === 429 ? 429 : 502 }
       );
     }
     const batch: StravaSummary[] = await res.json();
@@ -61,23 +67,25 @@ export async function GET() {
     for (const a of batch) rows.push(mapActivity(a, user.id));
     if (batch.length < PER_PAGE) break; // last page
     page += 1;
-    if (page > 10) break; // safety stop
   }
 
-  if (rows.length === 0) {
+  if (rows.length === 0)
     return NextResponse.json({ ok: true, fetched: 0, upserted: 0, note: "Nothing in window." });
-  }
 
   const admin = createAdminClient();
   const { error } = await admin
     .from("activities")
     .upsert(rows, { onConflict: "strava_id" });
-
-  if (error) {
+  if (error)
     return NextResponse.json({ step: "upsert", error: error.message }, { status: 500 });
-  }
 
-  return NextResponse.json({ ok: true, days: DAYS, fetched, upserted: rows.length });
+  return NextResponse.json({
+    ok: true,
+    scope: days ? `${days} days` : "all history",
+    pages: page,
+    fetched,
+    upserted: rows.length,
+  });
 }
 
 function mapActivity(a: StravaSummary, userId: string) {
@@ -85,7 +93,7 @@ function mapActivity(a: StravaSummary, userId: string) {
   const moving_time_s = a.moving_time ?? null;
   const avg_pace_s =
     distance_km && distance_km > 0 && moving_time_s
-      ? moving_time_s / distance_km // seconds per km
+      ? moving_time_s / distance_km
       : null;
   return {
     user_id: userId,
@@ -99,6 +107,5 @@ function mapActivity(a: StravaSummary, userId: string) {
     max_hr: a.max_heartrate != null ? Math.round(a.max_heartrate) : null,
     elevation_m: a.total_elevation_gain ?? null,
     source: "strava",
-    // splits left null — filled by the enrichment pass
   };
 }
