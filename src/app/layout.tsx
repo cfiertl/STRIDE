@@ -3,8 +3,11 @@ import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 
 export const viewport: Viewport = {
-     themeColor: "#0d0f0e",
-   };
+  themeColor: "#0d0f0e",
+  width: "device-width",   // pin layout width to the actual screen
+  initialScale: 1,         // render at 1:1, no zoom-to-fit
+  viewportFit: "cover",    // safe-area support for the PWA later
+};
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -39,3 +42,5 @@ export default function RootLayout({
     </html>
   );
 }
+
+

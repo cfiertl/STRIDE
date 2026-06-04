@@ -331,7 +331,12 @@ function rowsToRun(activity, log) {
     type: activity.type || (log && log.run_type) || "easy",
     distance: d != null ? d.toFixed(2) : "0.00",
     timeSec: activity.moving_time_s ?? 0,
-    score: log ? log.score : null,
+    score:
+      log && log.score != null
+        ? log.score
+        : activity.perceived_exertion != null
+        ? Number(activity.perceived_exertion)
+        : null,
     warmup: log ? !!log.warmup : false,
     wrong: (log && log.wrong) || [],
     pain: (log && log.pain) || [],
@@ -405,6 +410,16 @@ async function insertRun(run) {
   if (e2) throw e2;
 
   return rowsToRun(act, log);
+}
+
+// set a manual effort score (1-10) on an activity that has none (e.g. a Strava import).
+async function setActivityEffort(activityId, score) {
+  const supabase = sb();
+  const { error } = await supabase
+    .from("activities")
+    .update({ perceived_exertion: score, effort_source: "manual" })
+    .eq("id", activityId);
+  if (error) throw error;
 }
 
 // delete one run by activity id; run_log cascades via activity_id FK.
@@ -554,6 +569,10 @@ export default function App() {
   const [runs, setRuns] = useState([]);
   const [cross, setCross] = useState([]);
   const [fuel, setFuel] = useState([]);
+  const reloadRuns = useCallback(async () => {
+    const r = await loadRuns();
+    setRuns(r);
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -657,7 +676,7 @@ export default function App() {
         {tab === "today" && <Today profile={profile} plan={plan} runs={runs} zones={zones} go={setTab} onUpdateFitness={updateFitness} />}
         {tab === "plan" && <PlanView plan={plan} zones={zones} profile={profile} />}
         {tab === "log" && <LogRun profile={profile} zones={zones} onSave={addRun} fuel={fuel} />}
-        {tab === "activity" && <Activity runs={runs} cross={cross} onDelRun={delRun} onAddCross={addCross} zones={zones} />}
+        {tab === "activity" && <Activity runs={runs} cross={cross} onDelRun={delRun} onAddCross={addCross} onReloadRuns={reloadRuns} zones={zones} />}
         {tab === "fuel" && <FuelView fuel={fuel} onSave={addFuel} runs={runs} />}
         {tab === "insights" && <Insights runs={runs} fuel={fuel} zones={zones} />}
         {tab === "setup" && <Setup profile={profile} onSave={saveProfile} zones={zones} />}
@@ -742,7 +761,7 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness }) {
             <Stat label="Type" value={ZONE_META[last.type] ? ZONE_META[last.type].name.split(" ")[0] : last.type} />
             <Stat label="Distance" value={`${last.distance}km`} />
             <Stat label="Pace" value={fmtPace(paceOf(last))} />
-            <Stat label="Score" value={`${last.score}/10`} accent />
+            <Stat label="Score" value={last.score != null ? `${last.score}/10` : "—"} accent />          
           </div>
         </section>
       )}
@@ -1023,10 +1042,18 @@ function LogRun({ profile, zones, onSave, fuel }) {
 
 /* ---------- ACTIVITY (runs + cross-training) ---------- */
 
-function Activity({ runs, cross, onDelRun, onAddCross, zones }) {
+function Activity({ runs, cross, onDelRun, onAddCross, onReloadRuns, zones }) {
   const [showCross, setShowCross] = useState(false);
   return (
     <div className="stack">
+      <section className="card">
+        <div className="card-head">
+          <h3>Strava sync</h3>
+          <SyncButton onDone={onReloadRuns} />
+        </div>
+        <p className="muted small">Pulls your latest activities, their details (splits, laps, effort) and stream data. Safe to run anytime — it only fetches what's new.</p>
+      </section>
+
       <section className="card">
         <div className="card-head">
           <h3>Cross-training</h3>
@@ -1053,7 +1080,11 @@ function Activity({ runs, cross, onDelRun, onAddCross, zones }) {
               {r.warmup && <Pill tone="accent">warmed up</Pill>}
             </div>
             <div className="run-feel">
-              <span style={{ color: scoreColor(r.score) }}>{r.score}/10</span>
+              {r.score != null ? (
+                <span style={{ color: scoreColor(r.score) }}>{r.score}/10</span>
+              ) : (
+                <EffortAdder activityId={r.id} onSet={onReloadRuns} />
+              )}
               {r.wrong && r.wrong.length > 0 && <span className="muted small"> · {r.wrong.join(", ")}</span>}
               {r.pain && r.pain.length > 0 && <span className="pain-tag"> · 🩹 {r.pain.join(", ")}</span>}
             </div>
@@ -1065,6 +1096,73 @@ function Activity({ runs, cross, onDelRun, onAddCross, zones }) {
           </div>
         ))}
       </section>
+    </div>
+  );
+}
+
+// Inline 1-10 picker shown on runs that have no effort score yet.
+function EffortAdder({ activityId, onSet }) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const pick = async (v) => {
+    setBusy(true);
+    try { await setActivityEffort(activityId, v); await onSet(); }
+    catch (e) { console.error("set effort failed", e); setBusy(false); }
+  };
+  if (!open) return <button className="effort-add" onClick={() => setOpen(true)}>＋ effort</button>;
+  return (
+    <span className="effort-pick">
+      {[1,2,3,4,5,6,7,8,9,10].map((v) => (
+        <button key={v} className="effort-chip" disabled={busy} onClick={() => pick(v)}>{v}</button>
+      ))}
+    </span>
+  );
+}
+
+// Runs backfill → enrich → streams, looping each past the rate limit until done.
+function SyncButton({ onDone }) {
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState("");
+  const call = (path) => fetch(path).then((r) => r.json());
+
+  const loop = async (path, label, maxRounds = 12) => {
+    let last = null;
+    for (let i = 0; i < maxRounds; i++) {
+      last = await call(path);
+      if (!last.ok) throw new Error(last.error || `${label} failed`);
+      setStatus(`${label}… ${last.remaining ?? 0} left`);
+      if (last.stoppedForRateLimit) return { ...last, rateLimited: true };
+      if ((last.remaining ?? 0) === 0) return last;
+    }
+    return last;
+  };
+
+  const sync = async () => {
+    setBusy(true);
+    try {
+      setStatus("Importing activities…");
+      const bf = await call("/api/strava/backfill");
+      if (!bf.ok) throw new Error(bf.error || "import failed");
+      setStatus("Fetching details…");
+      const en = await loop("/api/strava/enrich", "Details");
+      setStatus("Fetching streams…");
+      const st = await loop("/api/strava/streams", "Streams");
+      await onDone();
+      setStatus(
+        en.rateLimited || st.rateLimited
+          ? "Strava's 15-min limit reached — synced what I could. Tap Sync again in ~15 min to finish."
+          : `Synced — ${bf.upserted} activities up to date.`
+      );
+    } catch (e) {
+      setStatus(`Sync failed: ${e.message}`);
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div className="sync">
+      {status && <span className="muted small sync-status">{status}</span>}
+      <button className="btn-ghost" onClick={sync} disabled={busy}>{busy ? "Syncing…" : "⟳ Sync Strava"}</button>
     </div>
   );
 }
@@ -1174,10 +1272,11 @@ function FuelView({ fuel, onSave, runs }) {
 /* ---------- INSIGHTS ---------- */
 
 function Insights({ runs, fuel, zones }) {
-  if (runs.length < 3) return <Empty msg="Log a few runs and the patterns will show up here." />;
+  const scored = runs.filter((r) => r.score != null);
+  if (scored.length < 3) return <Empty msg="Log or score a few runs and the patterns will show up here." />;
 
-  const lowRuns = runs.filter((r) => r.score <= 6);
-  const goodRuns = runs.filter((r) => r.score >= 8);
+  const lowRuns = scored.filter((r) => r.score <= 6);
+  const goodRuns = scored.filter((r) => r.score >= 8);
 
   // most common "what went wrong"
   const wrongTally = {};
@@ -1190,8 +1289,8 @@ function Insights({ runs, fuel, zones }) {
   const topPain = Object.entries(painTally).sort((a, b) => b[1] - a[1]);
 
   // warm-up effect
-  const warmedScores = runs.filter((r) => r.warmup).map((r) => r.score);
-  const coldScores = runs.filter((r) => !r.warmup).map((r) => r.score);
+  const warmedScores = scored.filter((r) => r.warmup).map((r) => r.score);
+  const coldScores = scored.filter((r) => !r.warmup).map((r) => r.score);
   const avg = (a) => (a.length ? (a.reduce((x, y) => x + y, 0) / a.length).toFixed(1) : null);
 
   // easy runs run too hard
@@ -1207,9 +1306,9 @@ function Insights({ runs, fuel, zones }) {
       <section className="card">
         <h3>What your data is telling you</h3>
         <div className="hero-row">
-          <Stat label="Runs logged" value={runs.length} />
-          <Stat label="Avg score" value={avg(runs.map((r) => r.score)) || "—"} accent />
-          <Stat label="Warmed-up runs" value={`${Math.round((runs.filter(r=>r.warmup).length / runs.length) * 100)}%`} />
+          <Stat label="Runs scored" value={scored.length} />
+          <Stat label="Avg score" value={avg(scored.map((r) => r.score)) || "—"} accent />
+          <Stat label="Warmed-up runs" value={`${Math.round((scored.filter(r=>r.warmup).length / scored.length) * 100)}%`} />
         </div>
       </section>
 
@@ -1476,12 +1575,12 @@ function StyleBlock() {
         --coral:#ff6b5e; --amber:#ffc24b;
         font-family:'Bricolage Grotesque', sans-serif;
         background: radial-gradient(1200px 600px at 80% -10%, #1a221b 0%, var(--bg) 55%);
-        color:var(--ink); min-height:100%; padding:0 0 60px; max-width:760px; margin:0 auto;
+        color:var(--ink); min-height:100vh; min-height:100dvh; padding:0 0 calc(60px + env(safe-area-inset-bottom)); max-width:760px; margin:0 auto;
       }
       .mono, .stat-val, .pt-pace, .score-big, .run-meta { font-family:'JetBrains Mono', monospace; }
       .loading { padding:80px 24px; text-align:center; color:var(--muted); font-size:18px; }
 
-      .topbar { display:flex; align-items:baseline; justify-content:space-between; padding:22px 22px 8px; }
+      .topbar { display:flex; align-items:baseline; justify-content:space-between; padding:calc(22px + env(safe-area-inset-top)) 22px 8px; }
       .brand { font-weight:800; font-size:26px; letter-spacing:-0.04em; display:flex; align-items:center; gap:9px; }
       .logo { height:34px; width:34px; flex-shrink:0; filter:drop-shadow(0 0 10px rgba(202,255,94,0.25)); }
       .brand-word { line-height:1; }
@@ -1625,6 +1724,16 @@ function StyleBlock() {
       .pt-zone { color:var(--ink); }
       .pt-pace { color:var(--accent); font-weight:600; }
       .chev { color:var(--muted); }
+
+      .sync { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
+      .effort-add { background:none; border:1px dashed var(--line); color:var(--muted); border-radius:999px;
+        padding:3px 10px; font-family:inherit; font-size:12px; cursor:pointer; font-weight:600; }
+      .effort-add:hover { color:var(--ink); border-color:var(--accent-dim); }
+      .effort-pick { display:inline-flex; gap:3px; flex-wrap:wrap; vertical-align:middle; }
+      .effort-chip { width:26px; height:26px; border-radius:7px; border:1px solid var(--line);
+        background:var(--bg); color:var(--ink); font-family:inherit; font-size:12px; cursor:pointer; }
+      .effort-chip:hover:not(:disabled) { background:var(--accent); color:#10130d; border-color:var(--accent); }
+      .effort-chip:disabled { opacity:.4; cursor:default; }
 
       @media (max-width:520px){ .form-grid { grid-template-columns:1fr; } .bar-label{width:96px;} }
     `}</style>
