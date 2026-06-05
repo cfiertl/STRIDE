@@ -4,6 +4,8 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { createClient } from "@/utils/supabase/client";
 import { ComposedChart, Line, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
+import dynamic from "next/dynamic";
+const RouteMap = dynamic(() => import("@/components/RouteMap"), { ssr: false, loading: () => <div className="card muted small">Loading map…</div> });
 
 /* ============================================================
    STRIDE — a running planner
@@ -1235,6 +1237,17 @@ function ActivityDetail({ activityId, onBack, profile }) {
       </section>
 
       <StreamChart streams={streams} />
+
+      {streams && (() => {
+        const ll = streams.latlng && (Array.isArray(streams.latlng) ? streams.latlng : streams.latlng.data);
+        return ll && ll.length > 1 ? (
+          <section className="card">
+            <h3>Route</h3>
+            <RouteMap latlng={ll} />
+          </section>
+        ) : null;
+      })()}
+      
       <HRZoneBreakdown streams={streams} lt1={profile?.lt1Hr} lt2={profile?.lt2Hr} />
 
       {splits.length > 0 && (
