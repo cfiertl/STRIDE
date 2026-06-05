@@ -3,6 +3,7 @@
 
 import React, { useState, useEffect, useCallback } from "react";
 import { createClient } from "@/utils/supabase/client";
+import { ComposedChart, Line, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
 
 /* ============================================================
    STRIDE — a running planner
@@ -380,6 +381,22 @@ async function loadActivityDetail(activityId) {
     return { activity: act, log: act.run_logs && act.run_logs[0] ? act.run_logs[0] : null };
   } catch (e) {
     console.error("load activity detail failed", e);
+    return null;
+  }
+}
+
+async function loadActivityStreams(activityId) {
+  try {
+    const supabase = sb();
+    const { data, error } = await supabase
+      .from("activity_streams")
+      .select("streams")
+      .eq("activity_id", activityId)
+      .maybeSingle();
+    if (error) throw error;
+    return data ? data.streams : null;
+  } catch (e) {
+    console.error("load streams failed", e);
     return null;
   }
 }
@@ -1125,11 +1142,13 @@ function Activity({ runs, cross, onDelRun, onAddCross, onReloadRuns, onOpenRun, 
 function ActivityDetail({ activityId, onBack }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [streams, setStreams] = useState(null);
 
   useEffect(() => {
     let alive = true;
     setLoading(true);
-    loadActivityDetail(activityId).then((d) => { if (alive) { setData(d); setLoading(false); } });
+    Promise.all([loadActivityDetail(activityId), loadActivityStreams(activityId)])
+      .then(([d, s]) => { if (alive) { setData(d); setStreams(s); setLoading(false); } });
     return () => { alive = false; };
   }, [activityId]);
 
@@ -1182,9 +1201,7 @@ function ActivityDetail({ activityId, onBack }) {
         {a.description && <p className="muted small" style={{ marginTop: 10 }}>"{a.description}"</p>}
       </section>
 
-      <section className="card chart-placeholder muted small">
-        Charts (HR · pace · elevation), HR zones, and the route map arrive in the next pieces.
-      </section>
+      <StreamChart streams={streams} />
 
       {splits.length > 0 && (
         <section className="card">
@@ -1255,6 +1272,84 @@ function ActivityDetail({ activityId, onBack }) {
     </div>
   );
 }
+
+function buildSeries(streams) {
+  if (!streams) return null;
+  const get = (k) => (streams[k] && Array.isArray(streams[k].data) ? streams[k].data : null);
+  const time = get("time");
+  if (!time) return null;
+  const hr = get("heartrate"), vel = get("velocity_smooth"), alt = get("altitude"), cad = get("cadence");
+  const n = time.length;
+  const step = Math.max(1, Math.ceil(n / 300));   // decimate to ~300 points
+  const points = [];
+  for (let i = 0; i < n; i += step) {
+    const v = vel ? vel[i] : null;
+    points.push({
+      t: time[i],
+      hr: hr ? hr[i] : null,
+      pace: v && v > 0.5 ? 1000 / v : null,        // s/km; drop near-stops so pace doesn't spike
+      elev: alt ? alt[i] : null,
+      cad: cad ? Math.round(cad[i] * 2) : null,    // per-leg RPM → spm
+    });
+  }
+  return { points, has: { hr: !!hr, pace: !!vel, elev: !!alt, cad: !!cad } };
+}
+
+function ChartTip({ active, payload, label }) {
+  if (!active || !payload || !payload.length) return null;
+  const v = {};
+  payload.forEach((p) => { v[p.dataKey] = p.value; });
+  return (
+    <div className="chart-tip">
+      <div className="chart-tip-t">{fmtTime(label)}</div>
+      {v.hr != null && <div><span style={{ color: "var(--coral)" }}>HR</span> {Math.round(v.hr)} bpm</div>}
+      {v.pace != null && <div><span style={{ color: "var(--accent)" }}>Pace</span> {fmtPace(v.pace)}</div>}
+      {v.elev != null && <div><span style={{ color: "var(--muted)" }}>Elev</span> {Math.round(v.elev)} m</div>}
+      {v.cad != null && <div><span style={{ color: "var(--amber)" }}>Cadence</span> {v.cad} spm</div>}
+    </div>
+  );
+}
+
+function StreamChart({ streams }) {
+  const series = buildSeries(streams);
+  const [show, setShow] = useState({ hr: true, pace: true, elev: true, cad: false });
+  if (!series || series.points.length < 2) return null;  
+  const toggles = [
+    ["hr", "HR", "var(--coral)"], ["pace", "Pace", "var(--accent)"],
+    ["elev", "Elevation", "var(--muted)"], ["cad", "Cadence", "var(--amber)"],
+  ].filter(([k]) => has[k]);
+
+  return (
+    <section className="card">
+      <h3>Over the run</h3>
+      <div className="chips" style={{ marginBottom: 10 }}>
+        {toggles.map(([k, label, color]) => (
+          <button key={k} className={`chip ${show[k] ? "chip-on" : ""}`} onClick={() => setShow((s) => ({ ...s, [k]: !s[k] }))}>
+            <span className="dot" style={{ background: color }} />{label}
+          </button>
+        ))}
+      </div>
+      <div style={{ width: "100%", height: 260 }}>
+        <ResponsiveContainer>
+          <ComposedChart data={points} margin={{ top: 6, right: 4, bottom: 0, left: 4 }}>
+            <CartesianGrid stroke="var(--line)" vertical={false} />
+            <XAxis dataKey="t" tickFormatter={fmtTime} tick={{ fill: "var(--muted)", fontSize: 11 }} stroke="var(--line)" minTickGap={40} />
+            <YAxis yAxisId="hr" domain={["auto", "auto"]} hide />
+            <YAxis yAxisId="pace" reversed domain={["auto", "auto"]} hide />
+            <YAxis yAxisId="elev" domain={["auto", "auto"]} hide />
+            <YAxis yAxisId="cad" domain={["auto", "auto"]} hide />
+            <Tooltip content={<ChartTip />} />
+            {has.elev && show.elev && <Area yAxisId="elev" dataKey="elev" stroke="none" fill="var(--muted)" fillOpacity={0.18} isAnimationActive={false} connectNulls />}
+            {has.pace && show.pace && <Line yAxisId="pace" dataKey="pace" stroke="var(--accent)" dot={false} strokeWidth={2} isAnimationActive={false} connectNulls />}
+            {has.hr && show.hr && <Line yAxisId="hr" dataKey="hr" stroke="var(--coral)" dot={false} strokeWidth={2} isAnimationActive={false} connectNulls />}
+            {has.cad && show.cad && <Line yAxisId="cad" dataKey="cad" stroke="var(--amber)" dot={false} strokeWidth={1.5} isAnimationActive={false} connectNulls />}
+          </ComposedChart>
+        </ResponsiveContainer>
+      </div>
+    </section>
+  );
+}
+
 
 // Inline 1-10 picker shown on runs that have no effort score yet.
 function EffortAdder({ activityId, onSet }) {
@@ -1900,6 +1995,10 @@ function StyleBlock() {
       .srow { display:grid; grid-template-columns:44px 1fr 1fr 1fr; gap:8px; padding:8px 0; border-top:1px solid var(--line); font-size:13.5px; align-items:center; }
       .srow:first-of-type { border-top:none; }
       .shead { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:0.05em; }
+
+      .chart-tip { background:var(--panel-2); border:1px solid var(--line); border-radius:10px; padding:8px 10px; font-size:12.5px; line-height:1.5; }
+      .chart-tip-t { color:var(--muted); font-size:11px; margin-bottom:4px; }
+      .chip .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle; }
 
       @media (max-width:520px){ .form-grid { grid-template-columns:1fr; } .bar-label{width:96px;} }
     `}</style>
