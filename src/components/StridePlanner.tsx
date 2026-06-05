@@ -44,6 +44,12 @@ function fmtPace(secPerKm) {
   return `${m}:${String(s).padStart(2, "0")}/km`;
 }
 
+// pace without the "/km" suffix — for tight stat boxes where a label already says PACE
+function fmtPaceBare(secPerKm) {
+  const p = fmtPace(secPerKm);
+  return p === "—" ? p : p.replace("/km", "");
+}
+
 // Riegel race-time prediction: t2 = t1 * (d2/d1)^1.06
 function riegel(t1, d1, d2) {
   return t1 * Math.pow(d2 / d1, 1.06);
@@ -1118,6 +1124,23 @@ function LogRun({ profile, zones, onSave, fuel }) {
 
 function Activity({ runs, cross, onDelRun, onAddCross, onReloadRuns, onOpenRun, zones }) {
   const [showCross, setShowCross] = useState(false);
+  const [openOverride, setOpenOverride] = useState({});
+  const isOpen = (key, idx) => (key in openOverride ? openOverride[key] : idx < 2); // first month open by default
+  const toggleGroup = (key, idx) => setOpenOverride((o) => ({ ...o, [key]: !isOpen(key, idx) }));
+  const nowYear = new Date().getFullYear();
+  const groups = [];
+  runs.forEach((r) => {
+    const dt = new Date(r.date);
+    const key = `${dt.getFullYear()}-${dt.getMonth()}`;
+    let g = groups.find((x) => x.key === key);
+    if (!g) {
+      const label = dt.toLocaleDateString(undefined, { month: "long" }) + (dt.getFullYear() !== nowYear ? ` ${dt.getFullYear()}` : "");
+      g = { key, label, runs: [], km: 0 };
+      groups.push(g);
+    }
+    g.runs.push(r);
+    if (parseFloat(r.distance) > 0) g.km += parseFloat(r.distance);
+  });
   return (
     <div className="stack">
       <section className="card">
@@ -1146,29 +1169,41 @@ function Activity({ runs, cross, onDelRun, onAddCross, onReloadRuns, onOpenRun, 
       <section className="card">
         <h3>Run history</h3>
         {runs.length === 0 && <p className="muted">No runs yet.</p>}
-        {runs.map((r) => (
-          <div key={r.id} className="run-item">
-            <div className="run-main clickable" onClick={() => onOpenRun(r.id)}>
-              <span className="run-type">{ZONE_META[r.type] ? ZONE_META[r.type].name : cap(r.type)}</span>
-              <span className="run-meta">{r.distance}km · {fmtTime(r.timeSec)} · {fmtPace(paceOf(r))}</span>
-              {r.warmup && <Pill tone="accent">warmed up</Pill>}
+        {groups.map((g, gi) => {
+          const open = isOpen(g.key, gi);
+          return (
+            <div key={g.key} className="run-group">
+              <button className="run-group-head" onClick={() => toggleGroup(g.key, gi)}>
+                <span className="run-group-chev">{open ? "▾" : "▸"}</span>
+                <span className="run-group-label">{g.label}</span>
+                <span className="run-group-meta muted small">{g.runs.length} {g.runs.length === 1 ? "activity" : "activities"}{g.km > 0 ? ` · ${g.km.toFixed(0)}km` : ""}</span>
+              </button>
+              {open && g.runs.map((r) => (
+                <div key={r.id} className="run-item">
+                  <div className="run-main clickable" onClick={() => onOpenRun(r.id)}>
+                    <span className="run-type">{ZONE_META[r.type] ? ZONE_META[r.type].name : cap(r.type)}</span>
+                    <span className="run-meta">{parseFloat(r.distance) > 0 ? `${r.distance}km · ${fmtTime(r.timeSec)} · ${fmtPace(paceOf(r))}` : fmtTime(r.timeSec)}</span>
+                    {r.warmup && <Pill tone="accent">warmed up</Pill>}
+                  </div>
+                  <div className="run-feel">
+                    {r.score != null ? (
+                      <span style={{ color: scoreColor(r.score) }}>{r.score}/10</span>
+                    ) : (
+                      <EffortAdder activityId={r.id} onSet={onReloadRuns} />
+                    )}
+                    {r.wrong && r.wrong.length > 0 && <span className="muted small"> · {r.wrong.join(", ")}</span>}
+                    {r.pain && r.pain.length > 0 && <span className="pain-tag"> · 🩹 {r.pain.join(", ")}</span>}
+                  </div>
+                  {r.notes && <div className="run-notes">"{r.notes}"</div>}
+                  <div className="run-foot">
+                    <span className="muted small">{relDate(r.date)}</span>
+                    <button className="del" onClick={() => onDelRun(r.id)}>delete</button>
+                  </div>
+                </div>
+              ))}
             </div>
-            <div className="run-feel">
-              {r.score != null ? (
-                <span style={{ color: scoreColor(r.score) }}>{r.score}/10</span>
-              ) : (
-                <EffortAdder activityId={r.id} onSet={onReloadRuns} />
-              )}
-              {r.wrong && r.wrong.length > 0 && <span className="muted small"> · {r.wrong.join(", ")}</span>}
-              {r.pain && r.pain.length > 0 && <span className="pain-tag"> · 🩹 {r.pain.join(", ")}</span>}
-            </div>
-            {r.notes && <div className="run-notes">"{r.notes}"</div>}
-            <div className="run-foot">
-              <span className="muted small">{relDate(r.date)}</span>
-              <button className="del" onClick={() => onDelRun(r.id)}>delete</button>
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </section>
     </div>
   );
@@ -1215,9 +1250,9 @@ function ActivityDetail({ activityId, onBack, profile }) {
       <section className="card hero">
         <div className="card-head"><h3>{typeName}</h3><span className="muted">{dateStr}</span></div>
         <div className="hero-row">
-          <Stat label="Distance" value={dist != null ? `${dist.toFixed(2)}km` : "—"} accent />
+          {dist != null && dist > 0 && <Stat label="Distance" value={`${dist.toFixed(2)}km`} accent />}
           <Stat label="Moving" value={fmtTime(a.moving_time_s)} />
-          <Stat label="Pace" value={fmtPace(pace)} />
+          {dist != null && dist > 0 && <Stat label="Pace" value={fmtPaceBare(pace)} accent />}
         </div>
         <div className="hero-row" style={{ marginTop: 10 }}>
           <Stat label="Avg HR" value={a.avg_hr ? String(a.avg_hr) : "—"} />
@@ -1247,7 +1282,7 @@ function ActivityDetail({ activityId, onBack, profile }) {
           </section>
         ) : null;
       })()}
-      
+
       <HRZoneBreakdown streams={streams} lt1={profile?.lt1Hr} lt2={profile?.lt2Hr} />
 
       {splits.length > 0 && (
@@ -1362,6 +1397,10 @@ function StreamChart({ streams }) {
   const [show, setShow] = useState({ hr: true, pace: true, elev: true, cad: false });
   if (!series || series.points.length < 2) return null;
   const { points, has } = series;
+  const maxT = points.length ? points[points.length - 1].t : 0;
+  const tickStep = maxT > 5400 ? 1200 : maxT > 2400 ? 600 : 300; // >90min→20m, >40min→10m, else 5m
+  const ticks = [];
+  for (let s = 0; s <= maxT; s += tickStep) ticks.push(s);
   const toggles = [
     ["hr", "HR", "var(--coral)"], ["pace", "Pace", "var(--accent)"],
     ["elev", "Elevation", "var(--muted)"], ["cad", "Cadence", "var(--amber)"],
@@ -1381,8 +1420,7 @@ function StreamChart({ streams }) {
         <ResponsiveContainer>
           <ComposedChart data={points} margin={{ top: 6, right: 4, bottom: 0, left: 4 }}>
             <CartesianGrid stroke="var(--line)" vertical={false} />
-            <XAxis dataKey="t" tickFormatter={fmtTime} tick={{ fill: "var(--muted)", fontSize: 11 }} stroke="var(--line)" minTickGap={40} />
-            <YAxis yAxisId="hr" domain={["auto", "auto"]} hide />
+            <XAxis dataKey="t" type="number" domain={[0, maxT]} ticks={ticks} tickFormatter={fmtTime} tick={{ fill: "var(--muted)", fontSize: 11 }} stroke="var(--line)" />            <YAxis yAxisId="hr" domain={["auto", "auto"]} hide />
             <YAxis yAxisId="pace" reversed domain={["auto", "auto"]} hide />
             <YAxis yAxisId="elev" domain={["auto", "auto"]} hide />
             <YAxis yAxisId="cad" domain={["auto", "auto"]} hide />
@@ -1440,15 +1478,17 @@ function HRZoneBreakdown({ streams, lt1, lt2 }) {
           : null)}
       </div>
       <div className="zlist">
-        {Z.map((z, i) => (
-          <div key={z.key} className="zrow">
-            <span className="zdot" style={{ background: z.color }} />
-            <span className="zname">{z.name}</span>
-            <span className="ztime mono muted">{secs[i] > 0 ? fmtTime(secs[i]) : "—"}</span>
-            <span className="zshare mono">{pct(secs[i])}%</span>
+            {hrZoneBands(lt1, lt2).map((z) => (
+              <div key={z.key} className="zitem">
+                <div className="zrow">
+                  <span className="zdot" style={{ background: z.color }} />
+                  <span className="zname">{z.name}</span>
+                  <span className="zpct muted">{z.range} bpm</span>
+                </div>
+                <p className="zone-note muted small">{z.note}</p>
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
     </section>
   );
 }
@@ -1458,9 +1498,9 @@ const LT1_FACTOR = 0.85; // LT1 pre-fill ≈ 85% of LT2; refined later via talk 
 
 function hrZoneBands(lt1, lt2) {
   return [
-    { key: "z1", name: "Z1 · Easy",      range: `< ${lt1}`,        color: "var(--accent-dim)" },
-    { key: "z2", name: "Z2 · Gray zone", range: `${lt1}–${lt2 - 1}`, color: "var(--amber)" },
-    { key: "z3", name: "Z3 · Hard",      range: `${lt2}+`,         color: "var(--coral)" },
+    { key: "z1", name: "Z1 · Easy",      range: `< ${lt1}`,          color: "var(--accent-dim)", note: "Conversational, fully aerobic. This should be the bulk of your running." },
+    { key: "z2", name: "Z2 · Gray zone", range: `${lt1}–${lt2 - 1}`,  color: "var(--amber)",      note: "Too hard to recover from, too easy to drive big gains. Keep time here low." },
+    { key: "z3", name: "Z3 · Hard",      range: `${lt2}+`,           color: "var(--coral)",      note: "Threshold and above — your quality sessions and intervals." },
   ];
 }
 
@@ -2018,14 +2058,17 @@ function daysUntil(iso) {
 function withinDays(iso, n) {
   return (new Date() - new Date(iso)) / (24 * 3600 * 1000) <= n;
 }
+
 function relDate(iso) {
   const d = Math.floor((new Date().setHours(0,0,0,0) - new Date(iso).setHours(0,0,0,0)) / (24 * 3600 * 1000));
   if (d === 0) return "today";
   if (d === 1) return "yesterday";
   if (d < 7) return `${d} days ago`;
-  return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  const dt = new Date(iso);
+  const opts = { month: "short", day: "numeric" };
+  if (dt.getFullYear() !== new Date().getFullYear()) opts.year = "numeric";
+  return dt.toLocaleDateString(undefined, opts);
 }
-
 /* ---------- styles ---------- */
 
 function StyleBlock() {
@@ -2229,6 +2272,20 @@ function StyleBlock() {
       .zrow { grid-template-columns:14px 1fr auto auto; }
       .ztime { font-size:12px; text-align:right; }
       .zshare { color:var(--accent); text-align:right; min-width:40px; }
+
+      .run-group { margin-top:18px; }
+      .run-group:first-of-type { margin-top:4px; }
+      .run-group { margin-top:10px; }
+      .run-group:first-of-type { margin-top:0; }
+      .run-group-head { display:flex; align-items:center; gap:10px; width:100%; padding:12px 14px; margin-bottom:2px; background:var(--panel-2); border:1px solid var(--line); border-radius:10px; cursor:pointer; font-family:inherit; text-align:left; }
+      .run-group-head:hover { border-color:var(--accent-dim); }
+      .run-group-chev { color:var(--accent); font-size:12px; width:12px; }
+      .run-group-label { font-weight:800; font-size:14px; letter-spacing:0.05em; text-transform:uppercase; }
+      .run-group-meta { margin-left:auto; }
+      .zitem { padding:9px 0; border-top:1px solid var(--line); }
+      .zitem:first-of-type { border-top:none; }
+      .zitem .zrow { border-top:none; padding:0; }
+      .zone-note { margin:4px 0 0 24px; }
 
       @media (max-width:520px){ .form-grid { grid-template-columns:1fr; } .bar-label{width:96px;} }
     `}</style>
