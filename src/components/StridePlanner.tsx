@@ -248,6 +248,10 @@ function rowToProfile(row) {
     benchDistKm: row.bench_dist_km != null ? Number(row.bench_dist_km) : null,
     benchTimeSec: row.bench_time_s,
     easyPaceSec: row.easy_pace_s,
+    lt1Hr: row.lt1_hr ?? null,
+    lt2Hr: row.lt2_hr ?? null,
+    lt2SourceActivity: row.lt2_source_activity ?? null,
+    hrTestedAt: row.hr_tested_at ?? null,
   };
 }
 // app profile object -> DB row. Drops derived goalLabel; "" race date -> null.
@@ -264,6 +268,10 @@ function profileToRow(p, userId) {
     bench_dist_km: p.benchDistKm ?? null,
     bench_time_s: p.benchTimeSec ?? null,
     easy_pace_s: p.easyPaceSec ?? null,
+    lt1_hr: p.lt1Hr ?? null,
+    lt2_hr: p.lt2Hr ?? null,
+    lt2_source_activity: p.lt2SourceActivity ?? null,
+    hr_tested_at: p.hrTestedAt ?? null,
   };
 }
 
@@ -342,6 +350,7 @@ function rowsToRun(activity, log) {
     wrong: (log && log.wrong) || [],
     pain: (log && log.pain) || [],
     notes: (log && log.notes) || "",
+    avgHr: activity.avg_hr ?? null,
   };
 }
 
@@ -397,6 +406,30 @@ async function loadActivityStreams(activityId) {
     return data ? data.streams : null;
   } catch (e) {
     console.error("load streams failed", e);
+    return null;
+  }
+}
+
+// Estimate LT2 / LTHR from a 30-min test activity: average HR over the final 20 minutes
+// of the heartrate stream. Returns { lt2, samples, durationS } or null if not enough data.
+async function computeLt2FromActivity(activityId) {
+  try {
+    const streams = await loadActivityStreams(activityId);
+    if (!streams) return null;
+    const hr = streams.heartrate && (Array.isArray(streams.heartrate) ? streams.heartrate : streams.heartrate.data);
+    const time = streams.time && (Array.isArray(streams.time) ? streams.time : streams.time.data);
+    if (!hr || !time || hr.length < 2) return null;
+
+    const endT = time[time.length - 1];
+    const windowStart = endT - 20 * 60; // final 20 minutes
+    let sum = 0, n = 0;
+    for (let i = 0; i < hr.length; i++) {
+      if (time[i] >= windowStart && hr[i] > 0) { sum += hr[i]; n++; }
+    }
+    if (n < 30) return null; // too few samples in the window to trust
+    return { lt2: Math.round(sum / n), samples: n, durationS: endT };
+  } catch (e) {
+    console.error("computeLt2FromActivity failed", e);
     return null;
   }
 }
@@ -714,11 +747,11 @@ export default function App() {
         {tab === "plan" && <PlanView plan={plan} zones={zones} profile={profile} />}
         {tab === "log" && <LogRun profile={profile} zones={zones} onSave={addRun} fuel={fuel} />}
         {tab === "activity" && (selectedActivityId
-          ? <ActivityDetail activityId={selectedActivityId} onBack={() => setSelectedActivityId(null)} />
+          ? <ActivityDetail activityId={selectedActivityId} profile={profile} onBack={() => setSelectedActivityId(null)} />
           : <Activity runs={runs} cross={cross} onDelRun={delRun} onAddCross={addCross} onReloadRuns={reloadRuns} onOpenRun={setSelectedActivityId} zones={zones} />)}        
         {tab === "fuel" && <FuelView fuel={fuel} onSave={addFuel} runs={runs} />}
         {tab === "insights" && <Insights runs={runs} fuel={fuel} zones={zones} />}
-        {tab === "setup" && <Setup profile={profile} onSave={saveProfile} zones={zones} />}
+        {tab === "setup" && <Setup profile={profile} onSave={saveProfile} zones={zones} runs={runs} />}      
       </main>
     </div>
   );
@@ -1139,7 +1172,7 @@ function Activity({ runs, cross, onDelRun, onAddCross, onReloadRuns, onOpenRun, 
   );
 }
 
-function ActivityDetail({ activityId, onBack }) {
+function ActivityDetail({ activityId, onBack, profile }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [streams, setStreams] = useState(null);
@@ -1202,6 +1235,7 @@ function ActivityDetail({ activityId, onBack }) {
       </section>
 
       <StreamChart streams={streams} />
+      <HRZoneBreakdown streams={streams} lt1={profile?.lt1Hr} lt2={profile?.lt2Hr} />
 
       {splits.length > 0 && (
         <section className="card">
@@ -1351,6 +1385,166 @@ function StreamChart({ streams }) {
   );
 }
 
+function HRZoneBreakdown({ streams, lt1, lt2 }) {
+  if (!streams) return null;
+  const hr = streams.heartrate && (Array.isArray(streams.heartrate) ? streams.heartrate : streams.heartrate.data);
+  const time = streams.time && (Array.isArray(streams.time) ? streams.time : streams.time.data);
+  if (!hr || !time || hr.length < 2) return null; // no HR → omit
+
+  if (!lt1 || !lt2) {
+    return (
+      <section className="card">
+        <h3>Time in zones</h3>
+        <p className="muted small">Set up your HR zones in Setup to see this run's breakdown.</p>
+      </section>
+    );
+  }
+
+  const Z = [
+    { key: "z1", name: "Z1 · Easy",      color: "var(--accent-dim)", test: (b) => b < lt1 },
+    { key: "z2", name: "Z2 · Gray zone", color: "var(--amber)",      test: (b) => b >= lt1 && b < lt2 },
+    { key: "z3", name: "Z3 · Hard",      color: "var(--coral)",      test: (b) => b >= lt2 },
+  ];
+
+  const secs = [0, 0, 0];
+  let total = 0;
+  for (let i = 0; i < hr.length - 1; i++) {
+    const dt = time[i + 1] - time[i];
+    if (dt <= 0 || dt > 30) continue; // skip pauses / gaps
+    const zi = Z.findIndex((z) => z.test(hr[i]));
+    if (zi >= 0) { secs[zi] += dt; total += dt; }
+  }
+  if (total <= 0) return null;
+
+  const pct = (s) => Math.round((s / total) * 100);
+
+  return (
+    <section className="card">
+      <div className="card-head"><h3>Time in zones</h3><span className="muted small">LT1 {lt1} · LT2 {lt2}</span></div>
+      <div className="zbar">
+        {Z.map((z, i) => secs[i] > 0
+          ? <div key={z.key} className="zbar-seg" style={{ flex: secs[i], background: z.color }} title={`${z.name}: ${fmtTime(secs[i])}`} />
+          : null)}
+      </div>
+      <div className="zlist">
+        {Z.map((z, i) => (
+          <div key={z.key} className="zrow">
+            <span className="zdot" style={{ background: z.color }} />
+            <span className="zname">{z.name}</span>
+            <span className="ztime mono muted">{secs[i] > 0 ? fmtTime(secs[i]) : "—"}</span>
+            <span className="zshare mono">{pct(secs[i])}%</span>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+
+const LT1_FACTOR = 0.85; // LT1 pre-fill ≈ 85% of LT2; refined later via talk test
+
+function hrZoneBands(lt1, lt2) {
+  return [
+    { key: "z1", name: "Z1 · Easy",      range: `< ${lt1}`,        color: "var(--accent-dim)" },
+    { key: "z2", name: "Z2 · Gray zone", range: `${lt1}–${lt2 - 1}`, color: "var(--amber)" },
+    { key: "z3", name: "Z3 · Hard",      range: `${lt2}+`,         color: "var(--coral)" },
+  ];
+}
+
+function HRZoneHub({ profile, runs, onSaveHr }) {
+  const [picking, setPicking] = useState(false);
+  const [busyId, setBusyId] = useState(null);
+  const [lt1Draft, setLt1Draft] = useState(profile?.lt1Hr ?? "");
+
+  const lt2 = profile?.lt2Hr ?? null;
+  const lt1 = profile?.lt1Hr ?? null;
+  const isSetUp = lt2 != null;
+
+  // candidate tests: have HR, ~22–45 min, hardest (highest avg HR) first
+  const candidates = (runs || [])
+    .filter((r) => r.avgHr && r.timeSec >= 1320 && r.timeSec <= 2700)
+    .sort((a, b) => (b.avgHr || 0) - (a.avgHr || 0))
+    .slice(0, 12);
+
+  const linkActivity = async (r) => {
+    setBusyId(r.id);
+    const res = await computeLt2FromActivity(r.id);
+    setBusyId(null);
+    if (!res) { alert("Couldn't read enough HR data from that run — pick another."); return; }
+    const newLt1 = lt1 != null ? lt1 : Math.round(res.lt2 * LT1_FACTOR); // keep a refined LT1 if set
+    onSaveHr({ lt2Hr: res.lt2, lt1Hr: newLt1, lt2SourceActivity: r.id, hrTestedAt: new Date().toISOString().slice(0, 10) });
+    setLt1Draft(newLt1);
+    setPicking(false);
+  };
+
+  const saveLt1 = () => {
+    const v = parseInt(lt1Draft, 10);
+    if (!Number.isFinite(v) || v <= 0 || (lt2 && v >= lt2)) { alert("LT1 should be a number below your LT2."); return; }
+    onSaveHr({ lt1Hr: v });
+  };
+
+  return (
+    <section className="card">
+      <h3>Heart-rate zones</h3>
+
+      {!isSetUp && !picking && (
+        <>
+          <p className="muted small">
+            Your zones come from two thresholds. <strong>LT2</strong> (lactate threshold) is read automatically from a <strong>30-minute test</strong> — warm up, then run a hard, steady, even effort for 30 minutes; the app averages your HR over the final 20 minutes. <strong>LT1</strong> (the top of "easy") is the talk-test point where full sentences get hard — we estimate it from LT2 and you refine it later.
+          </p>
+          <button className="btn-primary" onClick={() => setPicking(true)}>Link a test activity</button>
+        </>
+      )}
+
+      {picking && (
+        <>
+          <p className="muted small">Pick your 30-minute test. Showing hard runs of ~25–40 min, highest average HR first.</p>
+          {candidates.length === 0 && <p className="muted small">No suitable runs found — you need a synced run of ~25–40 min with HR data.</p>}
+          <div className="splits-table">
+            {candidates.map((r) => (
+              <button key={r.id} className="test-pick" disabled={busyId === r.id} onClick={() => linkActivity(r)}>
+                <span>{relDate(r.date)}</span>
+                <span className="mono">{r.distance}km</span>
+                <span className="mono">{fmtTime(r.timeSec)}</span>
+                <span className="mono">{r.avgHr} bpm</span>
+                <span className="test-go">{busyId === r.id ? "…" : "use ›"}</span>
+              </button>
+            ))}
+          </div>
+          {isSetUp && <button className="btn-ghost" style={{ marginTop: 10 }} onClick={() => setPicking(false)}>Cancel</button>}
+        </>
+      )}
+
+      {isSetUp && !picking && (
+        <>
+          <div className="zlist">
+            {hrZoneBands(lt1, lt2).map((z) => (
+              <div key={z.key} className="zrow">
+                <span className="zdot" style={{ background: z.color }} />
+                <span className="zname">{z.name}</span>
+                <span className="zpct muted">{z.range} bpm</span>
+              </div>
+            ))}
+          </div>
+          <p className="muted small" style={{ marginTop: 8 }}>
+            LT2 {lt2} bpm{profile?.hrTestedAt ? ` · tested ${relDate(profile.hrTestedAt)}` : ""}.
+          </p>
+
+          <label className="field" style={{ marginTop: 10 }}>
+            <span>LT1 (talk-test) <span className="muted">· pre-filled — refine from an easy run</span></span>
+            <div className="row-gap">
+              <input type="number" value={lt1Draft} onChange={(e) => setLt1Draft(e.target.value)} style={{ maxWidth: 120 }} />
+              <button className="btn-ghost" onClick={saveLt1}>Save LT1</button>
+            </div>
+          </label>
+          <p className="muted small">On an easy run, note the HR where talking in full sentences gets hard — enter it here to sharpen the easy/gray-zone line.</p>
+
+          <button className="btn-ghost" style={{ marginTop: 12 }} onClick={() => setPicking(true)}>↻ Re-test / relink</button>
+        </>
+      )}
+    </section>
+  );
+}
 
 // Inline 1-10 picker shown on runs that have no effort score yet.
 function EffortAdder({ activityId, onSet }) {
@@ -1632,7 +1826,7 @@ function Insights({ runs, fuel, zones }) {
 
 /* ---------- SETUP ---------- */
 
-function Setup({ profile, onSave, zones }) {
+function Setup({ profile, onSave, zones, runs }) {
   const [name, setName] = useState(profile?.name || "");
   const [goalType, setGoalType] = useState(profile?.goalType || "distance");
   const [goalDistanceKm, setGoalDistanceKm] = useState(profile?.goalDistanceKm || 21.1);
@@ -1661,6 +1855,10 @@ function Setup({ profile, onSave, zones }) {
       benchDistKm: parseFloat(benchDist),
       benchTimeSec: parseTime(benchTime),
       easyPaceSec: easyPace && parseTime(easyPace) > 0 ? parseTime(easyPace) : null,
+      lt1Hr: profile?.lt1Hr ?? null,
+      lt2Hr: profile?.lt2Hr ?? null,
+      lt2SourceActivity: profile?.lt2SourceActivity ?? null,
+      hrTestedAt: profile?.hrTestedAt ?? null,
     });
     setSaved(true); setTimeout(() => setSaved(false), 2200);
   };
@@ -1742,6 +1940,7 @@ function Setup({ profile, onSave, zones }) {
         ) : null}
       </section>
 
+      <HRZoneHub profile={profile} runs={runs} onSaveHr={(fields) => onSave({ ...profile, ...fields })} />
       <button className="btn-primary" onClick={submit} disabled={(!benchTime || parseTime(benchTime) <= 0) && (!easyPace || parseTime(easyPace) <= 0)}>{saved ? "✓ Saved — check the Plan tab" : "Save & generate plan"}</button>
     </div>
   );
@@ -2000,6 +2199,23 @@ function StyleBlock() {
       .chart-tip { background:var(--panel-2); border:1px solid var(--line); border-radius:10px; padding:8px 10px; font-size:12.5px; line-height:1.5; }
       .chart-tip-t { color:var(--muted); font-size:11px; margin-bottom:4px; }
       .chip .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+
+      .zlist { display:flex; flex-direction:column; }
+      .zrow { display:grid; grid-template-columns:14px 1fr auto; gap:10px; align-items:center; padding:7px 0; border-top:1px solid var(--line); font-size:13px; }
+      .zrow:first-of-type { border-top:none; }
+      .zdot { width:10px; height:10px; border-radius:3px; }
+      .zname { font-weight:600; }
+      .zpct { font-size:12px; text-align:right; }
+      .test-pick { display:grid; grid-template-columns:1fr auto auto auto auto; gap:10px; align-items:center; width:100%; text-align:left; background:var(--bg); border:1px solid var(--line); color:var(--ink); border-radius:10px; padding:10px 12px; font-family:inherit; font-size:13px; cursor:pointer; margin-bottom:6px; }
+      .test-pick:hover:not(:disabled) { border-color:var(--accent-dim); }
+      .test-pick:disabled { opacity:.5; }
+      .test-go { color:var(--accent); font-weight:600; }
+
+      .zbar { display:flex; height:14px; border-radius:999px; overflow:hidden; background:var(--bg); margin-bottom:12px; }
+      .zbar-seg { min-width:2px; }
+      .zrow { grid-template-columns:14px 1fr auto auto; }
+      .ztime { font-size:12px; text-align:right; }
+      .zshare { color:var(--accent); text-align:right; min-width:40px; }
 
       @media (max-width:520px){ .form-grid { grid-template-columns:1fr; } .bar-label{width:96px;} }
     `}</style>
