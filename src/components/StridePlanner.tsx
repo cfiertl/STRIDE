@@ -1313,7 +1313,8 @@ function ChartTip({ active, payload, label }) {
 function StreamChart({ streams }) {
   const series = buildSeries(streams);
   const [show, setShow] = useState({ hr: true, pace: true, elev: true, cad: false });
-  if (!series || series.points.length < 2) return null;  
+  if (!series || series.points.length < 2) return null;
+  const { points, has } = series;
   const toggles = [
     ["hr", "HR", "var(--coral)"], ["pace", "Pace", "var(--accent)"],
     ["elev", "Elevation", "var(--muted)"], ["cad", "Cadence", "var(--amber)"],
