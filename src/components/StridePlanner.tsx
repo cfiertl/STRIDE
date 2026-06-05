@@ -364,6 +364,26 @@ async function loadRuns() {
   }
 }
 
+// load one activity's full detail (all columns + its run_log) for the detail view.
+async function loadActivityDetail(activityId) {
+  try {
+    const supabase = sb();
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return null;
+    const { data: act, error } = await supabase
+      .from("activities")
+      .select("*, run_logs(*)")
+      .eq("id", activityId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!act) return null;
+    return { activity: act, log: act.run_logs && act.run_logs[0] ? act.run_logs[0] : null };
+  } catch (e) {
+    console.error("load activity detail failed", e);
+    return null;
+  }
+}
+
 // insert one run as activity (+ linked run_log); returns the flat run object.
 async function insertRun(run) {
   const supabase = sb();
@@ -569,6 +589,7 @@ export default function App() {
   const [runs, setRuns] = useState([]);
   const [cross, setCross] = useState([]);
   const [fuel, setFuel] = useState([]);
+  const [selectedActivityId, setSelectedActivityId] = useState(null);
   const reloadRuns = useCallback(async () => {
     const r = await loadRuns();
     setRuns(r);
@@ -665,8 +686,7 @@ export default function App() {
           <button
             key={id}
             className={`tab ${tab === id ? "tab-active" : ""}`}
-            onClick={() => setTab(id)}
-          >
+            onClick={() => { setTab(id); setSelectedActivityId(null); }}          >
             {label}
           </button>
         ))}
@@ -676,7 +696,9 @@ export default function App() {
         {tab === "today" && <Today profile={profile} plan={plan} runs={runs} zones={zones} go={setTab} onUpdateFitness={updateFitness} />}
         {tab === "plan" && <PlanView plan={plan} zones={zones} profile={profile} />}
         {tab === "log" && <LogRun profile={profile} zones={zones} onSave={addRun} fuel={fuel} />}
-        {tab === "activity" && <Activity runs={runs} cross={cross} onDelRun={delRun} onAddCross={addCross} onReloadRuns={reloadRuns} zones={zones} />}
+        {tab === "activity" && (selectedActivityId
+          ? <ActivityDetail activityId={selectedActivityId} onBack={() => setSelectedActivityId(null)} />
+          : <Activity runs={runs} cross={cross} onDelRun={delRun} onAddCross={addCross} onReloadRuns={reloadRuns} onOpenRun={setSelectedActivityId} zones={zones} />)}        
         {tab === "fuel" && <FuelView fuel={fuel} onSave={addFuel} runs={runs} />}
         {tab === "insights" && <Insights runs={runs} fuel={fuel} zones={zones} />}
         {tab === "setup" && <Setup profile={profile} onSave={saveProfile} zones={zones} />}
@@ -1042,7 +1064,7 @@ function LogRun({ profile, zones, onSave, fuel }) {
 
 /* ---------- ACTIVITY (runs + cross-training) ---------- */
 
-function Activity({ runs, cross, onDelRun, onAddCross, onReloadRuns, zones }) {
+function Activity({ runs, cross, onDelRun, onAddCross, onReloadRuns, onOpenRun, zones }) {
   const [showCross, setShowCross] = useState(false);
   return (
     <div className="stack">
@@ -1074,7 +1096,7 @@ function Activity({ runs, cross, onDelRun, onAddCross, onReloadRuns, zones }) {
         {runs.length === 0 && <p className="muted">No runs yet.</p>}
         {runs.map((r) => (
           <div key={r.id} className="run-item">
-            <div className="run-main">
+            <div className="run-main clickable" onClick={() => onOpenRun(r.id)}>
               <span className="run-type">{ZONE_META[r.type] ? ZONE_META[r.type].name : cap(r.type)}</span>
               <span className="run-meta">{r.distance}km · {fmtTime(r.timeSec)} · {fmtPace(paceOf(r))}</span>
               {r.warmup && <Pill tone="accent">warmed up</Pill>}
@@ -1095,6 +1117,140 @@ function Activity({ runs, cross, onDelRun, onAddCross, onReloadRuns, zones }) {
             </div>
           </div>
         ))}
+      </section>
+    </div>
+  );
+}
+
+function ActivityDetail({ activityId, onBack }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    loadActivityDetail(activityId).then((d) => { if (alive) { setData(d); setLoading(false); } });
+    return () => { alive = false; };
+  }, [activityId]);
+
+  if (loading) return <div className="card empty">Loading activity…</div>;
+  if (!data)
+    return (
+      <div className="stack">
+        <button className="btn-ghost back-btn" onClick={onBack}>‹ Back</button>
+        <div className="card empty">Couldn't load this activity.</div>
+      </div>
+    );
+
+  const a = data.activity;
+  const log = data.log;
+  const dist = a.distance_km != null ? Number(a.distance_km) : null;
+  const pace = a.avg_pace_s != null ? Number(a.avg_pace_s) : (dist && a.moving_time_s ? a.moving_time_s / dist : null);
+  const splits = Array.isArray(a.splits) ? a.splits : [];
+  const laps = Array.isArray(a.laps) ? a.laps : [];
+  const best = Array.isArray(a.best_efforts) ? a.best_efforts : [];
+  const typeName = ZONE_META[a.type] ? ZONE_META[a.type].name : cap(a.type || "Run");
+  const dateStr = a.date
+    ? new Date(a.date).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" })
+    : "";
+
+  return (
+    <div className="stack">
+      <button className="btn-ghost back-btn" onClick={onBack}>‹ Back to activity</button>
+
+      <section className="card hero">
+        <div className="card-head"><h3>{typeName}</h3><span className="muted">{dateStr}</span></div>
+        <div className="hero-row">
+          <Stat label="Distance" value={dist != null ? `${dist.toFixed(2)}km` : "—"} accent />
+          <Stat label="Moving" value={fmtTime(a.moving_time_s)} />
+          <Stat label="Pace" value={fmtPace(pace)} />
+        </div>
+        <div className="hero-row" style={{ marginTop: 10 }}>
+          <Stat label="Avg HR" value={a.avg_hr ? String(a.avg_hr) : "—"} />
+          <Stat label="Max HR" value={a.max_hr ? String(a.max_hr) : "—"} />
+          <Stat label="Elev gain" value={a.elevation_m != null ? `${Math.round(a.elevation_m)}m` : "—"} />
+          <Stat label="Effort" value={a.perceived_exertion != null ? `${a.perceived_exertion}/10` : (a.relative_effort != null ? `${a.relative_effort}` : "—")} />
+        </div>
+        {(a.gear_name || a.device_name || a.calories || a.avg_cadence) && (
+          <div className="detail-meta muted small">
+            {a.gear_name && <span>👟 {a.gear_name}</span>}
+            {a.avg_cadence && <span>🦶 {Math.round(a.avg_cadence * 2)} spm</span>}
+            {a.calories && <span>🔥 {Math.round(a.calories)} cal</span>}
+            {a.device_name && <span>⌚ {a.device_name}</span>}
+          </div>
+        )}
+        {a.description && <p className="muted small" style={{ marginTop: 10 }}>"{a.description}"</p>}
+      </section>
+
+      <section className="card chart-placeholder muted small">
+        Charts (HR · pace · elevation), HR zones, and the route map arrive in the next pieces.
+      </section>
+
+      {splits.length > 0 && (
+        <section className="card">
+          <h3>Splits</h3>
+          <div className="splits-table">
+            <div className="srow shead"><span>Km</span><span>Pace</span><span>HR</span><span>Elev</span></div>
+            {splits.map((s, i) => {
+              const sp = s.average_speed ? 1000 / s.average_speed : null;
+              return (
+                <div key={i} className="srow">
+                  <span>{s.split ?? i + 1}</span>
+                  <span className="mono">{fmtPace(sp)}</span>
+                  <span className="mono">{s.average_heartrate ? Math.round(s.average_heartrate) : "—"}</span>
+                  <span className="mono">{s.elevation_difference != null ? `${s.elevation_difference > 0 ? "+" : ""}${Math.round(s.elevation_difference)}m` : "—"}</span>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      {best.length > 0 && (
+        <section className="card">
+          <h3>Best efforts this run</h3>
+          {best.map((b, i) => (
+            <div key={i} className="row-item"><span>{b.name}</span><span className="mono">{fmtTime(b.elapsed_time ?? b.moving_time)}</span></div>
+          ))}
+        </section>
+      )}
+
+      {laps.length > 1 && (
+        <section className="card">
+          <h3>Laps</h3>
+          <div className="splits-table">
+            <div className="srow shead"><span>Lap</span><span>Dist</span><span>Pace</span><span>HR</span></div>
+            {laps.map((l, i) => {
+              const ld = l.distance != null ? l.distance / 1000 : null;
+              const lp = l.average_speed ? 1000 / l.average_speed : null;
+              return (
+                <div key={i} className="srow">
+                  <span>{l.lap_index ?? i + 1}</span>
+                  <span className="mono">{ld != null ? ld.toFixed(2) : "—"}</span>
+                  <span className="mono">{fmtPace(lp)}</span>
+                  <span className="mono">{l.average_heartrate ? Math.round(l.average_heartrate) : "—"}</span>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      <section className="card">
+        <h3>How it felt</h3>
+        {log && log.score != null ? (
+          <>
+            <div className="hero-row">
+              <Stat label="Score" value={`${log.score}/10`} accent />
+              {log.warmup && <Stat label="Warm-up" value="Yes" />}
+            </div>
+            {log.wrong && log.wrong.length > 0 && <p className="muted small">Flagged: {log.wrong.join(", ")}</p>}
+            {log.pain && log.pain.length > 0 && <p className="pain-tag small">🩹 {log.pain.join(", ")}</p>}
+            {log.notes && <p className="run-notes">"{log.notes}"</p>}
+          </>
+        ) : (
+          <p className="muted small">Not scored yet — full scoring for synced runs comes in Phase 4.</p>
+        )}
       </section>
     </div>
   );
@@ -1734,6 +1890,16 @@ function StyleBlock() {
         background:var(--bg); color:var(--ink); font-family:inherit; font-size:12px; cursor:pointer; }
       .effort-chip:hover:not(:disabled) { background:var(--accent); color:#10130d; border-color:var(--accent); }
       .effort-chip:disabled { opacity:.4; cursor:default; }
+
+      .back-btn { align-self:flex-start; }
+      .detail-meta { display:flex; gap:14px; flex-wrap:wrap; margin-top:12px; }
+      .chart-placeholder { background:var(--panel-2); text-align:center; }
+      .run-chev { margin-left:auto; color:var(--muted); font-size:18px; }
+      .run-main.clickable:hover .run-chev { color:var(--accent); }
+      .splits-table { display:flex; flex-direction:column; }
+      .srow { display:grid; grid-template-columns:44px 1fr 1fr 1fr; gap:8px; padding:8px 0; border-top:1px solid var(--line); font-size:13.5px; align-items:center; }
+      .srow:first-of-type { border-top:none; }
+      .shead { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:0.05em; }
 
       @media (max-width:520px){ .form-grid { grid-template-columns:1fr; } .bar-label{width:96px;} }
     `}</style>
