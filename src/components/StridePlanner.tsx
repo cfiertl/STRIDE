@@ -723,6 +723,25 @@ export default function App() {
     const p = { ...profile, benchDistKm: distKm, benchTimeSec: timeSec };
     saveProfile(p);
   };
+
+  const [paceToast, setPaceToast] = useState(null);
+
+// Auto re-benchmark: when a synced run beats current paces, update silently.
+useEffect(() => {
+  if (!profile || !runs.length) return;
+  const suggestion = fitnessUpdateSuggestion(profile, runs);
+  if (!suggestion) return;
+  const distKm = parseFloat(suggestion.run.distance);
+  // guard: don't re-fire for a bench we already hold
+  if (profile.benchDistKm === distKm && profile.benchTimeSec === suggestion.run.timeSec) return;
+  updateFitness(distKm, suggestion.run.timeSec);
+  setPaceToast({
+    distKm,
+    timeSec: suggestion.run.timeSec,
+    gain: suggestion.gain,
+  });
+}, [runs, profile]);
+  
   const delRun = async (id) => {
     try {
       await deleteRun(id);
@@ -793,6 +812,16 @@ export default function App() {
         {tab === "insights" && <Insights runs={runs} fuel={fuel} zones={zones} />}
         {tab === "setup" && <Setup profile={profile} onSave={saveProfile} zones={zones} runs={runs} />}      
       </main>
+       {paceToast && (
+        <div className="toast" role="status">
+          <span>
+            Paces updated from your {paceToast.distKm}km in {fmtTime(paceToast.timeSec)} — about
+            {" "}{Math.round(paceToast.gain * 100)}% quicker.
+          </span>
+          <button className="link-btn" onClick={() => setTab("setup")}>View pace history</button>
+          <button className="toast-close" onClick={() => setPaceToast(null)}>✕</button>
+        </div>
+      )}
     </div>
   );
 }
@@ -1024,11 +1053,7 @@ function PlanView({ plan, zones, profile }) {
 const WRONG_OPTIONS = [
   "Started too fast", "Tired / low energy", "Breathing felt off",
   "Legs heavy / dead", "GI issues", "Too hot / humid",
-  "Under-fuelled", "Poor sleep", "Stressed / distracted", "Pain",
-];
-const PAIN_AREAS = [
-  "Knee (front)", "Knee (outside / ITB)", "Shin", "Calf", "Achilles",
-  "Foot / arch", "Hamstring", "Hip / glute", "Lower back", "Ankle",
+  "Under-fuelled", "Poor sleep", "Stressed / distracted",
 ];
 const RUN_TYPES = ["easy", "long", "tempo", "interval", "reps", "marathon", "race", "other"];
 
@@ -1060,7 +1085,7 @@ function LogRun({ profile, zones, onSave, fuel }) {
       score: Number(score),
       warmup,
       wrong: score <= 6 ? wrong : [],
-      pain: wrong.includes("Pain") || pain.length ? pain : [],
+      pain,
       notes,
     });
     setSaved(true);

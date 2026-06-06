@@ -74,4 +74,18 @@ Let the user drag/reschedule sessions, because plans change and flexibility matt
 
 Quick wins for the post-storage iteration pass. None touch data shape or storage, so they're deferred until the five keys are done.
 
-- **Delete confirmation.** Deleting a run removes it on a single tap. Add a confirmation step (dialog or undo) before the delete fires. Applies to cross-training and fuel entries too once those are wired.
+## UI polish: pain map multi-region nudge
+
+Now that pain is tracked split by side (`Left ITB` vs `Right ITB`), multiple
+regions can independently hit the 3× threshold. The physio nudge currently only
+reads `topPain[0]`, so a second flagged region (e.g. `Right knee 3×`) gets a
+warn Pill but no nudge line.
+
+Two options when picking this up:
+
+- Render the nudge for every entry `>= 3` — replace the `topPain[0][1] >= 3`
+  check with `topPain.filter(([, n]) => n >= 3).map(...)`.
+- Or collapse flagged regions into one line: "Left ITB and Right knee have each
+  come up 3+ times…"
+
+Pure render logic, no schema impact — batch-later.
