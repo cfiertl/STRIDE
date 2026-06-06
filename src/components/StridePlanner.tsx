@@ -348,12 +348,7 @@ function rowsToRun(activity, log) {
     type: activity.type || (log && log.run_type) || "easy",
     distance: d != null ? d.toFixed(2) : "0.00",
     timeSec: activity.moving_time_s ?? 0,
-    score:
-      log && log.score != null
-        ? log.score
-        : activity.perceived_exertion != null
-        ? Number(activity.perceived_exertion)
-        : null,
+    score: log && log.score != null ? log.score : null,
     warmup: log ? !!log.warmup : false,
     wrong: (log && log.wrong) || [],
     pain: (log && log.pain) || [],
@@ -490,14 +485,50 @@ async function insertRun(run) {
   return rowsToRun(act, log);
 }
 
-// set a manual effort score (1-10) on an activity that has none (e.g. a Strava import).
-async function setActivityEffort(activityId, score) {
+// Attach or update the subjective "how it felt" layer on an existing activity.
+// Inserts a run_log if none exists for this activity, updates it if one does.
+async function saveRunLog(activityId, feel) {
   const supabase = sb();
-  const { error } = await supabase
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) throw new Error("not signed in");
+
+  // pull the activity's date so the log isn't dateless
+  const { data: act, error: eA } = await supabase
     .from("activities")
-    .update({ perceived_exertion: score, effort_source: "manual" })
-    .eq("id", activityId);
-  if (error) throw error;
+    .select("date")
+    .eq("id", activityId)
+    .single();
+  if (eA) throw eA;
+  const logDate = act.date ? String(act.date).slice(0, 10) : null;
+
+  const { data: existing, error: e0 } = await supabase
+    .from("run_logs")
+    .select("id")
+    .eq("activity_id", activityId)
+    .maybeSingle();
+  if (e0) throw e0;
+
+  const row = {
+    user_id: user.id,
+    activity_id: activityId,
+    date: logDate,
+    run_type: feel.type ?? null,
+    score: feel.score ?? null,
+    warmup: !!feel.warmup,
+    wrong: feel.wrong || [],
+    pain: feel.pain || [],
+    notes: feel.notes || null,
+  };
+
+  if (existing) {
+    const { error } = await supabase.from("run_logs").update(row).eq("id", existing.id);
+    if (error) throw error;
+    return existing.id;
+  } else {
+    const { data, error } = await supabase.from("run_logs").insert(row).select("id").single();
+    if (error) throw error;
+    return data.id;
+  }
 }
 
 // delete one run by activity id; run_log cascades via activity_id FK.
@@ -1189,7 +1220,7 @@ function Activity({ runs, cross, onDelRun, onAddCross, onReloadRuns, onOpenRun, 
                     {r.score != null ? (
                       <span style={{ color: scoreColor(r.score) }}>{r.score}/10</span>
                     ) : (
-                      <EffortAdder activityId={r.id} onSet={onReloadRuns} />
+                      <span className="muted small">— tap to score</span>
                     )}
                     {r.wrong && r.wrong.length > 0 && <span className="muted small"> · {r.wrong.join(", ")}</span>}
                     {r.pain && r.pain.length > 0 && <span className="pain-tag"> · 🩹 {r.pain.join(", ")}</span>}
@@ -1213,6 +1244,7 @@ function ActivityDetail({ activityId, onBack, profile }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [streams, setStreams] = useState(null);
+  const [reloadTick, setReloadTick] = useState(0);
 
   useEffect(() => {
     let alive = true;
@@ -1220,7 +1252,7 @@ function ActivityDetail({ activityId, onBack, profile }) {
     Promise.all([loadActivityDetail(activityId), loadActivityStreams(activityId)])
       .then(([d, s]) => { if (alive) { setData(d); setStreams(s); setLoading(false); } });
     return () => { alive = false; };
-  }, [activityId]);
+  }, [activityId, reloadTick]);
 
   if (loading) return <div className="card empty">Loading activity…</div>;
   if (!data)
@@ -1258,7 +1290,7 @@ function ActivityDetail({ activityId, onBack, profile }) {
           <Stat label="Avg HR" value={a.avg_hr ? String(a.avg_hr) : "—"} />
           <Stat label="Max HR" value={a.max_hr ? String(a.max_hr) : "—"} />
           <Stat label="Elev gain" value={a.elevation_m != null ? `${Math.round(a.elevation_m)}m` : "—"} />
-          <Stat label="Effort" value={a.perceived_exertion != null ? `${a.perceived_exertion}/10` : (a.relative_effort != null ? `${a.relative_effort}` : "—")} />
+          <Stat label="Effort" value={a.relative_effort != null ? `${a.relative_effort}` : "—"} />        
         </div>
         {(a.gear_name || a.device_name || a.calories || a.avg_cadence) && (
           <div className="detail-meta muted small">
@@ -1335,22 +1367,7 @@ function ActivityDetail({ activityId, onBack, profile }) {
         </section>
       )}
 
-      <section className="card">
-        <h3>How it felt</h3>
-        {log && log.score != null ? (
-          <>
-            <div className="hero-row">
-              <Stat label="Score" value={`${log.score}/10`} accent />
-              {log.warmup && <Stat label="Warm-up" value="Yes" />}
-            </div>
-            {log.wrong && log.wrong.length > 0 && <p className="muted small">Flagged: {log.wrong.join(", ")}</p>}
-            {log.pain && log.pain.length > 0 && <p className="pain-tag small">🩹 {log.pain.join(", ")}</p>}
-            {log.notes && <p className="run-notes">"{log.notes}"</p>}
-          </>
-        ) : (
-          <p className="muted small">Not scored yet — full scoring for synced runs comes in Phase 4.</p>
-        )}
-      </section>
+      <ScoreCard activity={a} log={log} onSaved={() => setReloadTick((t) => t + 1)} />
     </div>
   );
 }
@@ -1431,6 +1448,115 @@ function StreamChart({ streams }) {
             {has.cad && show.cad && <Line yAxisId="cad" dataKey="cad" stroke="var(--amber)" dot={false} strokeWidth={1.5} isAnimationActive={false} connectNulls />}
           </ComposedChart>
         </ResponsiveContainer>
+      </div>
+    </section>
+  );
+}
+
+function ScoreCard({ activity, log, onSaved }) {
+  const [editing, setEditing] = useState(false);
+  const [score, setScore] = useState(log?.score ?? 7);
+  const [warmup, setWarmup] = useState(log?.warmup ?? false);
+  const [wrong, setWrong] = useState(log?.wrong ?? []);
+  const [pain, setPain] = useState(log?.pain ?? []);
+  const [notes, setNotes] = useState(log?.notes ?? "");
+  const [saving, setSaving] = useState(false);
+
+  const toggle = (arr, set, v) => set(arr.includes(v) ? arr.filter((x) => x !== v) : [...arr, v]);
+
+  const startEdit = () => {
+    setScore(log?.score ?? 7); setWarmup(log?.warmup ?? false);
+    setWrong(log?.wrong ?? []); setPain(log?.pain ?? []); setNotes(log?.notes ?? "");
+    setEditing(true);
+  };
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await saveRunLog(activity.id, {
+        type: activity.type || null,
+        score: Number(score),
+        warmup,
+        wrong: score <= 6 ? wrong : [],
+        pain: pain,
+        notes,
+      });
+      setEditing(false);
+      onSaved();
+    } catch (e) {
+      console.error("save score failed", e);
+      alert("Couldn't save — try again.");
+    }
+    setSaving(false);
+  };
+
+  // ---- saved (read) state ----
+  if (!editing) {
+    const scored = log && log.score != null;
+    return (
+      <section className="card">
+        <div className="card-head">
+          <h3>How it felt</h3>
+          <button className="btn-ghost" onClick={startEdit}>{scored ? "Edit" : "Score this run"}</button>
+        </div>
+        {scored ? (
+          <>
+            <div className="hero-row">
+              <Stat label="Score" value={`${log.score}/10`} accent />
+              {log.warmup && <Stat label="Warm-up" value="Yes" />}
+            </div>
+            {log.wrong && log.wrong.length > 0 && <p className="muted small">Flagged: {log.wrong.join(", ")}</p>}
+            {log.pain && log.pain.length > 0 && <p className="pain-tag small">🩹 {log.pain.join(", ")}</p>}
+            {log.notes && <p className="run-notes">"{log.notes}"</p>}
+          </>
+        ) : (
+          <p className="muted small">Strava captured the numbers — add how it actually felt.</p>
+        )}
+      </section>
+    );
+  }
+
+  // ---- editing state ----
+  return (
+    <section className="card">
+      <div className="card-head">
+        <h3>How did it feel?</h3>
+        <span className="score-big" style={{ color: scoreColor(score) }}>{score}/10</span>
+      </div>
+      <input type="range" min="1" max="10" value={score} onChange={(e) => setScore(e.target.value)} className="slider" />
+      <div className="slider-ends"><span>rough</span><span>effortless</span></div>
+
+      <label className="check-row">
+        <input type="checkbox" checked={warmup} onChange={(e) => setWarmup(e.target.checked)} />
+        <span>I warmed up first</span>
+      </label>
+
+      {score <= 6 && (
+        <>
+          <h4 className="sub-h">What went wrong?</h4>
+          <div className="chips">
+            {WRONG_OPTIONS.map((o) => (
+              <button key={o} className={`chip ${wrong.includes(o) ? "chip-on" : ""}`} onClick={() => toggle(wrong, setWrong, o)}>{o}</button>
+            ))}
+          </div>
+        </>
+      )}
+
+      <h4 className="sub-h">Any pain? <span className="muted small">(tap where it hurt)</span></h4>
+      <div className="chips">
+        {PAIN_AREAS.map((o) => (
+          <button key={o} className={`chip ${pain.includes(o) ? "chip-pain" : ""}`} onClick={() => toggle(pain, setPain, o)}>{o}</button>
+        ))}
+      </div>
+
+      <label className="field" style={{ marginTop: 12 }}>
+        <span>Notes</span>
+        <textarea rows="3" placeholder="How you slept, weather, anything else…" value={notes} onChange={(e) => setNotes(e.target.value)} />
+      </label>
+
+      <div className="row-gap" style={{ marginTop: 12 }}>
+        <button className="btn-primary slim" onClick={save} disabled={saving}>{saving ? "Saving…" : "Save"}</button>
+        <button className="btn-ghost" onClick={() => setEditing(false)} disabled={saving}>Cancel</button>
       </div>
     </section>
   );
@@ -1596,25 +1722,6 @@ function HRZoneHub({ profile, runs, onSaveHr }) {
         </>
       )}
     </section>
-  );
-}
-
-// Inline 1-10 picker shown on runs that have no effort score yet.
-function EffortAdder({ activityId, onSet }) {
-  const [open, setOpen] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const pick = async (v) => {
-    setBusy(true);
-    try { await setActivityEffort(activityId, v); await onSet(); }
-    catch (e) { console.error("set effort failed", e); setBusy(false); }
-  };
-  if (!open) return <button className="effort-add" onClick={() => setOpen(true)}>＋ effort</button>;
-  return (
-    <span className="effort-pick">
-      {[1,2,3,4,5,6,7,8,9,10].map((v) => (
-        <button key={v} className="effort-chip" disabled={busy} onClick={() => pick(v)}>{v}</button>
-      ))}
-    </span>
   );
 }
 
@@ -2286,6 +2393,8 @@ function StyleBlock() {
       .zitem:first-of-type { border-top:none; }
       .zitem .zrow { border-top:none; padding:0; }
       .zone-note { margin:4px 0 0 24px; }
+
+      .sub-h { font-size:13px; font-weight:700; margin:16px 0 8px; }
 
       @media (max-width:520px){ .form-grid { grid-template-columns:1fr; } .bar-label{width:96px;} }
     `}</style>

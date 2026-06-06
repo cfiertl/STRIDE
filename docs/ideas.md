@@ -67,3 +67,11 @@ Let the user drag/reschedule sessions, because plans change and flexibility matt
 - **Likely shape:** generate the base from profile (incl. preferred days) → materialize it onto real calendar dates in a stored table (e.g. `plan_sessions`, or the currently-unused `plan` table) → "move a run" = update that session's date.
 - Base plan still generated from profile; the user's overrides are what get saved.
   **Sequencing:** #1 is a cheap additive profile column whenever. #2 is the larger build and the deliberate moment plan becomes a dated, stored, editable schedule.
+
+---
+
+## UI polish / small iterations
+
+Quick wins for the post-storage iteration pass. None touch data shape or storage, so they're deferred until the five keys are done.
+
+- **Delete confirmation.** Deleting a run removes it on a single tap. Add a confirmation step (dialog or undo) before the delete fires. Applies to cross-training and fuel entries too once those are wired.
