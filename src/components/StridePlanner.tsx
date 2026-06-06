@@ -5,6 +5,7 @@ import React, { useState, useEffect, useCallback } from "react";
 import { createClient } from "@/utils/supabase/client";
 import { ComposedChart, Line, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
 import dynamic from "next/dynamic";
+import BodyMap from "@/components/BodyMap";
 const RouteMap = dynamic(() => import("@/components/RouteMap"), { ssr: false, loading: () => <div className="card muted small">Loading map…</div> });
 
 /* ============================================================
@@ -1125,17 +1126,14 @@ function LogRun({ profile, zones, onSave, fuel }) {
         </section>
       )}
 
-      {(wrong.includes("Pain") || pain.length > 0) && (
-        <section className="card">
-          <h3>Where did it hurt?</h3>
-          <p className="muted">Logging this builds a picture over time. Persistent pain in one spot is worth showing a physio.</p>
-          <div className="chips">
-            {PAIN_AREAS.map((o) => (
-              <button key={o} className={`chip ${pain.includes(o) ? "chip-pain" : ""}`} onClick={() => toggle(pain, setPain, o)}>{o}</button>
-            ))}
-          </div>
-        </section>
-      )}
+      <section className="card">
+        <BodyMap
+          selected={pain}
+          onToggle={(a) => toggle(pain, setPain, a)}
+          collapsible
+          note="Logging this builds a picture over time. Persistent pain in one spot is worth showing a physio."
+        />
+      </section>
 
       <section className="card">
         <label className="field">
@@ -1542,12 +1540,7 @@ function ScoreCard({ activity, log, onSaved }) {
         </>
       )}
 
-      <h4 className="sub-h">Any pain? <span className="muted small">(tap where it hurt)</span></h4>
-      <div className="chips">
-        {PAIN_AREAS.map((o) => (
-          <button key={o} className={`chip ${pain.includes(o) ? "chip-pain" : ""}`} onClick={() => toggle(pain, setPain, o)}>{o}</button>
-        ))}
-      </div>
+      <BodyMap selected={pain} onToggle={(a) => toggle(pain, setPain, a)} collapsible/>
 
       <label className="field" style={{ marginTop: 12 }}>
         <span>Notes</span>
