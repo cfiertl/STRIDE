@@ -138,7 +138,6 @@ function generatePlan(profile) {
     const weekVol = Math.round(vol);
     weeks.push(buildWeek(w, totalWeeks, weekVol, goalDistanceKm, days, isTaper, cutback));
   }
-  console.log("generatePlan goalMode:", profile.goalMode, "taper:", taper);
   return weeks;
 }
 
@@ -782,11 +781,17 @@ export default function App() {
   const addRun = async (run) => {
     try {
       const saved = await insertRun(run);
+      if (run.plannedWeek && run.plannedDay) {
+        await saveCompletion(saved.id, run.plannedWeek, run.plannedDay);
+      }
       setRuns((prev) => [saved, ...prev]);
+      setSelectedActivityId(saved.id);   // open the new run...
+      setTab("activity");                // ...on its detail page
     } catch (e) {
       console.error("add run failed", e);
     }
   };
+
   const updateFitness = (distKm, timeSec) => {
     const p = { ...profile, benchDistKm: distKm, benchTimeSec: timeSec };
     saveProfile(p);
@@ -1128,7 +1133,6 @@ const RUN_TYPES = ["easy", "long", "tempo", "interval", "reps", "marathon", "rac
 function LogRun({ profile, zones, onSave, fuel }) {
   const today = new Date().toISOString().slice(0, 10);
   const [date, setDate] = useState(today);
-  const [type, setType] = useState("easy");
   const [distance, setDistance] = useState("");
   const [time, setTime] = useState("");
   const [score, setScore] = useState(7);
@@ -1137,17 +1141,28 @@ function LogRun({ profile, zones, onSave, fuel }) {
   const [pain, setPain] = useState([]);
   const [notes, setNotes] = useState("");
   const [saved, setSaved] = useState(false);
+  const [selectedDay, setSelectedDay] = useState(null);
 
   const toggle = (arr, set, v) =>
     set(arr.includes(v) ? arr.filter((x) => x !== v) : [...arr, v]);
 
   const livePace = distance && time ? parseTime(time) / parseFloat(distance) : 0;
 
+  // plan-linking on the log page: map the entered date to its plan week and
+  // offer that week's sessions, with the same smart suggestion as the detail view.
+  const plan = profile ? generatePlan(profile) : [];
+  const wk = planWeekForDate(plan, profile?.goalDate, date);
+  const suggestedIdx = !selectedDay && wk
+    ? suggestSessionIdx(wk.sessions, { date: `${date}T12:00:00`, distance_km: distance ? parseFloat(distance) : null })
+    : -1;
+
   const submit = () => {
     if (!distance || !time) return;
+    const sess = wk && selectedDay ? wk.sessions.find((s) => s.day === selectedDay) : null;
     onSave({
       id: Date.now(),
-      date, type,
+      date,
+      type: sess ? sess.type : "run",
       distance: parseFloat(distance).toFixed(2),
       timeSec: parseTime(time),
       score: Number(score),
@@ -1155,10 +1170,12 @@ function LogRun({ profile, zones, onSave, fuel }) {
       wrong: score <= 6 ? wrong : [],
       pain,
       notes,
+      plannedWeek: sess ? wk.week : null,
+      plannedDay: sess ? sess.day : null,
     });
     setSaved(true);
     setTimeout(() => setSaved(false), 2200);
-    setDistance(""); setTime(""); setScore(7); setWrong([]); setPain([]); setNotes(""); setWarmup(false);
+    setDistance(""); setTime(""); setScore(7); setWrong([]); setPain([]); setNotes(""); setWarmup(false); setSelectedDay(null);
   };
 
   return (
@@ -1169,14 +1186,6 @@ function LogRun({ profile, zones, onSave, fuel }) {
           <label className="field">
             <span>Date</span>
             <input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
-          </label>
-          <label className="field">
-            <span>Type</span>
-            <select value={type} onChange={(e) => setType(e.target.value)}>
-              {RUN_TYPES.map((t) => (
-                <option key={t} value={t}>{ZONE_META[t] ? ZONE_META[t].name : cap(t)}</option>
-              ))}
-            </select>
           </label>
           <label className="field">
             <span>Distance (km)</span>
@@ -1190,12 +1199,31 @@ function LogRun({ profile, zones, onSave, fuel }) {
         {livePace > 0 && (
           <div className="pace-readout">
             Pace: <strong>{fmtPace(livePace)}</strong>
-            {zones && type === "easy" && livePace < zones.easy[1] && (
-              <span className="warn"> ⚠ faster than your easy zone ({fmtPace(zones.easy[1])}) — easy runs should feel boringly slow.</span>
-            )}
           </div>
         )}
       </section>
+
+      {wk && (
+        <section className="card">
+          <div className="card-head"><h3>Planned session</h3></div>
+          <p className="muted small">Week {wk.week} · {wk.label} — link this run so it's typed, or skip it for an unplanned run.</p>
+          <div className="sessions">
+            {wk.sessions.map((s, i) => {
+              const d = sessionDescription(s, zones);
+              const on = selectedDay === s.day;
+              const sug = !selectedDay && i === suggestedIdx;
+              return (
+                <button key={i} type="button" className={`session pick ${on ? "on" : ""}`} onClick={() => setSelectedDay(on ? null : s.day)}>
+                  <div className="session-day">{s.day}</div>
+                  <div className="session-body"><div className="session-title">{d.title}</div></div>
+                  {sug && <Pill tone="accent">likely</Pill>}
+                  {s.quality && <Pill tone="hard">quality</Pill>}
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      )}
 
       <section className="card">
         <div className="card-head"><h3>How did it feel?</h3><span className="score-big" style={{ color: scoreColor(score) }}>{score}/10</span></div>
@@ -2522,7 +2550,7 @@ function StyleBlock() {
       .session.pick:disabled { opacity:.5; cursor:default; }
       .session.pick.on { border-color:var(--accent); background:rgba(202,255,94,0.08); }
       .session.pick.sug { border-color:var(--accent-dim); }
-      
+
       .warmup-card { border-color:rgba(202,255,94,0.25); }
       .warmup { margin:10px 0 0; padding-left:20px; }
       .warmup li { font-size:13.5px; margin-bottom:7px; line-height:1.45; }
