@@ -89,3 +89,38 @@ Two options when picking this up:
   come up 3+ times…"
 
 Pure render logic, no schema impact — batch-later.
+
+---
+
+## Phase 5 follow-up: weekly review nudge (lightly tested)
+
+The `weekReview` card on the Today tab is built and wired, but only verified by
+logic, not by lived data — real testing needs a past, fully completed plan week
+with linked, scored runs, which didn't exist yet at build time. It's silent by
+default (no card when a week has zero completions), so the failure mode is
+showing nothing, never something wrong.
+
+**When revisiting, confirm each of the four branches fires on a genuine
+completed week:**
+
+- **Missed a key session** (long or quality, week now past) → amber "ease into
+  this week" caution.
+- **All sessions done, feeling good** (avg score ≥7, or unscored) → accent
+  "strong week, keep rolling."
+- **Done but rough** (avg score ≤5) → amber "hold steady, repeat don't build."
+- **Partial** → neutral "on track, close the gap."
+
+**Also decide / check:**
+
+- **Placement.** Currently top-of-stack on Today (above the fitness banner). On
+  a strong week this stacks two green-ish cards (review + "you're getting
+  faster"). If that doubling feels heavy, moving the review card to just below
+  the goal/countdown hero — right above the "Week N · sessions" card it refers
+  to — reads just as naturally.
+- **Score join.** Sanity-check the `activity_id` → run-score lookup holds up
+  once several linked runs share one past week (the avg is computed across all
+  scored completions in that week).
+
+No schema impact — advisory only, reads `session_completions` + run scores. The
+plan stays derived from profile; rewriting it in place is the separate "movable
+sessions" idea below/above.
