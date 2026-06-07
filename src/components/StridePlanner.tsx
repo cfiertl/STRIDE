@@ -378,7 +378,7 @@ function rowsToRun(activity, log) {
   return {
     id: activity.id,
     date: (log && log.date) || (activity.date ? String(activity.date).slice(0, 10) : ""),
-    type: activity.type || (log && log.run_type) || "easy",
+    type: (log && log.run_type) || activity.type || "easy",
     distance: d != null ? d.toFixed(2) : "0.00",
     timeSec: activity.moving_time_s ?? 0,
     score: log && log.score != null ? log.score : null,
@@ -562,6 +562,42 @@ async function saveRunLog(activityId, feel) {
     if (error) throw error;
     return data.id;
   }
+}
+
+// --- session completions: link a run to the planned slot it filled ----------
+async function loadCompletion(activityId) {
+  try {
+    const supabase = sb();
+    const { data, error } = await supabase
+      .from("session_completions")
+      .select("*")
+      .eq("activity_id", activityId)
+      .maybeSingle();
+    if (error) throw error;
+    return data || null;
+  } catch (e) {
+    console.error("load completion failed", e);
+    return null;
+  }
+}
+
+async function saveCompletion(activityId, plannedWeek, plannedDay) {
+  const supabase = sb();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) throw new Error("not signed in");
+  const { error } = await supabase
+    .from("session_completions")
+    .upsert(
+      { activity_id: activityId, user_id: user.id, planned_week: plannedWeek, planned_day: plannedDay },
+      { onConflict: "activity_id" }
+    );
+  if (error) throw error;
+}
+
+async function deleteCompletion(activityId) {
+  const supabase = sb();
+  const { error } = await supabase.from("session_completions").delete().eq("activity_id", activityId);
+  if (error) throw error;
 }
 
 // delete one run by activity id; run_log cascades via activity_id FK.
@@ -888,7 +924,7 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness }) {
       <section className="card hero">
         <div className="hero-row">
           <Stat label="Goal" value={profile.goalLabel || `${profile.goalDistanceKm}km`} accent />
-          <Stat label="Countdown" value={profile.goalDate ? daysUntil(profile.goalDate) + "d" : "—"} />          
+          <Stat label={profile.goalMode === "fitness" ? "Target" : "Race day"} value={profile.goalDate ? daysUntil(profile.goalDate) + "d" : "—"} />          
           <Stat label="This week" value={`${weekKm.toFixed(1)}km`} />
         </div>
       </section>
@@ -1300,11 +1336,12 @@ function ActivityDetail({ activityId, onBack, profile }) {
   const [loading, setLoading] = useState(true);
   const [streams, setStreams] = useState(null);
   const [reloadTick, setReloadTick] = useState(0);
+  const [completion, setCompletion] = useState(null);
 
   useEffect(() => {
     let alive = true;
     setLoading(true);
-    Promise.all([loadActivityDetail(activityId), loadActivityStreams(activityId)])
+    Promise.all([loadActivityDetail(activityId), loadActivityStreams(activityId), loadCompletion(activityId)])
       .then(([d, s]) => { if (alive) { setData(d); setStreams(s); setLoading(false); } });
     return () => { alive = false; };
   }, [activityId, reloadTick]);
@@ -1422,6 +1459,7 @@ function ActivityDetail({ activityId, onBack, profile }) {
         </section>
       )}
 
+      <LinkSession activity={a} log={log} completion={completion} profile={profile} onSaved={() => setReloadTick((t) => t + 1)} />
       <ScoreCard activity={a} log={log} onSaved={() => setReloadTick((t) => t + 1)} />
     </div>
   );
@@ -1529,7 +1567,7 @@ function ScoreCard({ activity, log, onSaved }) {
     setSaving(true);
     try {
       await saveRunLog(activity.id, {
-        type: activity.type || null,
+        type: (log && log.run_type) || activity.type || null,
         score: Number(score),
         warmup,
         wrong: score <= 6 ? wrong : [],
@@ -1611,6 +1649,112 @@ function ScoreCard({ activity, log, onSaved }) {
     </section>
   );
 }
+
+function LinkSession({ activity, log, completion, profile, onSaved }) {
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const plan = profile ? generatePlan(profile) : [];
+  const wk = planWeekForDate(plan, profile?.goalDate, activity.date);
+
+  const link = async (s) => {
+    setSaving(true);
+    try {
+      await saveCompletion(activity.id, wk.week, s.day);
+      await saveRunLog(activity.id, {
+        type: s.type,
+        score: log?.score ?? null,
+        warmup: log?.warmup ?? false,
+        wrong: log?.wrong ?? [],
+        pain: log?.pain ?? [],
+        notes: log?.notes ?? "",
+      });
+      setEditing(false);
+      onSaved();
+    } catch (e) {
+      console.error("link session failed", e);
+      alert("Couldn't link — try again.");
+    }
+    setSaving(false);
+  };
+
+  const unlink = async () => {
+    setSaving(true);
+    try {
+      await deleteCompletion(activity.id);
+      onSaved();
+    } catch (e) {
+      console.error("unlink failed", e);
+      alert("Couldn't unlink — try again.");
+    }
+    setSaving(false);
+  };
+
+  if (!profile || !profile.goalDate || !wk) {
+    return (
+      <section className="card">
+        <div className="card-head"><h3>Planned session</h3></div>
+        <p className="muted small">Set a goal date in Setup to match runs to your plan.</p>
+      </section>
+    );
+  }
+
+  const suggestedIdx = completion ? -1 : suggestSessionIdx(wk.sessions, activity);
+  const suggested = suggestedIdx >= 0 ? wk.sessions[suggestedIdx] : null;
+
+  if (!editing) {
+    const t = log && log.run_type;
+    const typeName = t ? (ZONE_META[t] ? ZONE_META[t].name.split(" ")[0] : cap(t)) : "—";
+    return (
+      <section className="card">
+        <div className="card-head">
+          <h3>Planned session</h3>
+          <button className="btn-ghost" onClick={() => setEditing(true)}>{completion ? "Change" : "Link to plan"}</button>
+        </div>
+        {completion ? (
+          <div className="hero-row">
+            <Stat label="Week" value={`W${completion.planned_week}`} />
+            <Stat label="Day" value={completion.planned_day} />
+            <Stat label="Type" value={typeName} accent />
+          </div>
+        ) : suggested ? (
+          <p className="muted small">Looks like <strong>{sessionDescription(suggested, null).title}</strong> ({suggested.day}). Tap "Link to plan" to confirm — or pick another.</p>
+        ) : (
+          <p className="muted small">Not linked yet. Linking sets this run's type (easy, tempo…) so it counts in your insights.</p>
+        )}
+      </section>
+    );
+  }
+
+  return (
+    <section className="card">
+      <div className="card-head">
+        <h3>Which session was this?</h3>
+        <button className="btn-ghost" onClick={() => setEditing(false)}>Cancel</button>
+      </div>
+      <p className="muted small">Week {wk.week} · {wk.label} — tap the planned session this run was.</p>
+      <div className="sessions">
+        {wk.sessions.map((s, i) => {
+          const d = sessionDescription(s, null);
+          const on = completion && completion.planned_week === wk.week && completion.planned_day === s.day;
+          const sug = !on && i === suggestedIdx;
+          return (
+            <button key={i} className={`session pick ${on ? "on" : ""} ${sug ? "sug" : ""}`} onClick={() => link(s)} disabled={saving}>
+              <div className="session-day">{s.day}</div>
+              <div className="session-body"><div className="session-title">{d.title}</div></div>
+              {sug && <Pill tone="accent">likely</Pill>}
+              {s.quality && <Pill tone="hard">quality</Pill>}
+            </button>
+          );
+        })}
+      </div>
+      {completion && (
+        <button className="btn-ghost wide" onClick={unlink} disabled={saving} style={{ marginTop: 10 }}>Unlink this run</button>
+      )}
+    </section>
+  );
+}
+
 
 function HRZoneBreakdown({ streams, lt1, lt2 }) {
   if (!streams) return null;
@@ -2254,6 +2398,37 @@ function currentWeek(profile, plan) {
   const idx = Math.min(total - 1, Math.max(0, total - wksOut - 1));
   return plan[idx];
 }
+
+// Map a run's date to its plan week, using the same numbering currentWeek relies on.
+function planWeekForDate(plan, goalDate, dateIso) {
+  if (!plan.length || !goalDate || !dateIso) return null;
+  const total = plan.length;
+  const wksOut = weeksBetween(dateIso, goalDate);
+  const idx = Math.min(total - 1, Math.max(0, total - wksOut - 1));
+  return plan[idx];
+}
+
+const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+// Best-guess which planned session a run was: weekday first, distance second.
+// Returns an index into sessions, or -1 if nothing scores.
+function suggestSessionIdx(sessions, activity) {
+  if (!sessions || !sessions.length) return -1;
+  const runDay = activity.date ? DOW[new Date(activity.date).getDay()] : null;
+  const dist = activity.distance_km != null ? Number(activity.distance_km) : null;
+  let bestIdx = -1, best = 0;
+  sessions.forEach((s, i) => {
+    let score = 0;
+    if (runDay && s.day === runDay) score += 100;            // same weekday: strongest signal
+    if (dist != null && s.km) {                              // distance fit (long/easy carry km)
+      score += Math.max(0, 40 * (1 - Math.abs(dist - s.km) / s.km));
+      if (s.type === "long" && dist >= s.km * 0.85) score += 25;  // a long effort leans long
+    }
+    if (score > best) { best = score; bestIdx = i; }
+  });
+  return bestIdx;
+}
+
 function daysUntil(iso) {
   const d = Math.ceil((new Date(iso) - new Date()) / (24 * 3600 * 1000));
   return Math.max(0, d);
@@ -2342,6 +2517,12 @@ function StyleBlock() {
       .session-title { font-weight:700; font-size:14px; }
       .session-detail { font-size:12.5px; color:var(--muted); margin-top:3px; line-height:1.45; }
 
+      .session.pick { width:100%; text-align:left; color:var(--ink); font:inherit; cursor:pointer; transition:.15s; }
+      .session.pick:hover { border-color:var(--accent-dim); }
+      .session.pick:disabled { opacity:.5; cursor:default; }
+      .session.pick.on { border-color:var(--accent); background:rgba(202,255,94,0.08); }
+      .session.pick.sug { border-color:var(--accent-dim); }
+      
       .warmup-card { border-color:rgba(202,255,94,0.25); }
       .warmup { margin:10px 0 0; padding-left:20px; }
       .warmup li { font-size:13.5px; margin-bottom:7px; line-height:1.45; }
