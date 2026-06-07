@@ -247,7 +247,54 @@ function loadWatch(runs) {
   return { weeks, jump, flagged, last, prev };
 }
 
+const TYPE_WORD = { long: "long run", tempo: "tempo session", interval: "interval session", easy: "easy run" };
 
+// Read last completed plan week vs. what got linked + how it felt, and turn it
+// into one nudge for the week ahead. Advisory only — the plan is derived from
+// profile, so this informs rather than rewrites it.
+function weekReview(plan, profile, runs, completions) {
+  if (!plan.length || !profile?.goalDate || !completions.length) return null;
+  const cur = currentWeek(profile, plan);
+  const lastNum = (cur ? cur.week : 1) - 1;
+  if (lastNum < 1) return null;
+  const lastWk = plan.find((w) => w.week === lastNum);
+  if (!lastWk) return null;
+
+  const doneDays = new Set(
+    completions.filter((c) => c.planned_week === lastNum).map((c) => c.planned_day)
+  );
+  if (doneDays.size === 0) return null; // weren't tracking that week — stay quiet
+
+  const sessions = lastWk.sessions;
+  const total = sessions.length;
+  const doneCount = sessions.filter((s) => doneDays.has(s.day)).length;
+  const keySessions = sessions.filter((s) => s.type === "long" || s.quality);
+  const missedKey = keySessions.filter((s) => !doneDays.has(s.day));
+
+  const byId = new Map(runs.map((r) => [r.id, r]));
+  const scores = completions
+    .filter((c) => c.planned_week === lastNum)
+    .map((c) => byId.get(c.activity_id))
+    .filter((r) => r && r.score != null)
+    .map((r) => r.score);
+  const avg = scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null;
+
+  if (missedKey.length) {
+    const what = missedKey.length === 1 ? (TYPE_WORD[missedKey[0].type] || "session") : `${missedKey.length} key sessions`;
+    return { tone: "warn", title: "Ease into this week", doneCount, total,
+      msg: `You missed last week's ${what}. Don't stack this week on top to catch up — keep the progression gentle and let consistency do the work.` };
+  }
+  if (doneCount === total && (avg == null || avg >= 7)) {
+    return { tone: "accent", title: "Strong week — keep rolling", doneCount, total,
+      msg: `All ${total} sessions done${avg != null ? ` and feeling good (avg ${avg.toFixed(1)}/10)` : ""}. You're set to progress as planned.` };
+  }
+  if (avg != null && avg <= 5) {
+    return { tone: "warn", title: "Hold steady this week", doneCount, total,
+      msg: `You got ${doneCount}/${total} in, but they felt rough (avg ${avg.toFixed(1)}/10). Repeat rather than build this week, and back off further if it doesn't ease.` };
+  }
+  return { tone: "base", title: "On track", doneCount, total,
+    msg: `Last week: ${doneCount}/${total} sessions done. Solid — aim to close the gap this week.` };
+}
 
 /* ---------- storage layer ---------- */
 
@@ -584,7 +631,7 @@ async function loadCompletions() {
     if (!user) return [];
     const { data, error } = await supabase
       .from("session_completions")
-      .select("planned_week, planned_day");
+      .select("planned_week, planned_day, activity_id");
     if (error) throw error;
     return data || [];
   } catch (e) {
@@ -917,7 +964,14 @@ useEffect(() => {
 /* ---------- TODAY ---------- */
 
 function Today({ profile, plan, runs, zones, go, onUpdateFitness }) {
+  const [completions, setCompletions] = useState([]);
+  useEffect(() => {
+    let alive = true;
+    loadCompletions().then((c) => { if (alive) setCompletions(c); });
+    return () => { alive = false; };
+  }, []);
   if (!profile) return <Empty msg="Head to Setup to get started." />;
+  const review = weekReview(plan, profile, runs, completions);
   const wk = currentWeek(profile, plan);
   const last = runs[0];
   const weekKm = runs
@@ -927,6 +981,15 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness }) {
 
   return (
     <div className="stack">
+      {review && (
+        <section className={`card review-card review-${review.tone}`}>
+          <div className="card-head">
+            <h3>{review.title}</h3>
+            <Pill tone={review.tone}>{review.doneCount}/{review.total} last wk</Pill>
+          </div>
+          <p className="muted small">{review.msg}</p>
+        </section>
+      )}
       {fitness && (
         <section className="card fitness-banner">
           <div>
@@ -2565,6 +2628,11 @@ function StyleBlock() {
       .card-head h3 { margin:0; }
       .clickable { cursor:pointer; }
       .empty { text-align:center; color:var(--muted); padding:34px 18px; }
+
+      .review-card { border-left:3px solid var(--line); }
+      .review-accent { border-left-color:var(--accent); }
+      .review-warn { border-left-color:var(--amber); }
+      .review-base { border-left-color:var(--line); }
 
       .toast { position:fixed; left:50%; bottom:88px; transform:translateX(-50%); z-index:1000; display:flex; align-items:center; gap:12px; max-width:calc(100% - 32px); width:max-content; padding:12px 14px; background:var(--panel); border:1px solid rgba(202,255,94,0.35); border-radius:12px; box-shadow:0 8px 28px rgba(0,0,0,0.5); color:var(--ink); font-size:14px; line-height:1.4; animation:toast-in 0.25s ease-out; }
       .toast span { flex:1; }
