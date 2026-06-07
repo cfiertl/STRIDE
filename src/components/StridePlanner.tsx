@@ -565,20 +565,35 @@ async function saveRunLog(activityId, feel) {
 
 // --- session completions: link a run to the planned slot it filled ----------
 async function loadCompletion(activityId) {
-  try {
-    const supabase = sb();
-    const { data, error } = await supabase
-      .from("session_completions")
-      .select("*")
-      .eq("activity_id", activityId)
-      .maybeSingle();
-    if (error) throw error;
-    return data || null;
-  } catch (e) {
-    console.error("load completion failed", e);
+  const supabase = sb();
+  const { data, error } = await supabase
+    .from("session_completions")
+    .select("*")
+    .eq("activity_id", activityId)
+    .maybeSingle();
+  if (error) {
+    console.error("load completion failed", error);
     return null;
   }
+  return data || null;
 }
+async function loadCompletions() {
+  try {
+    const supabase = sb();
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return [];
+    const { data, error } = await supabase
+      .from("session_completions")
+      .select("planned_week, planned_day");
+    if (error) throw error;
+    return data || [];
+  } catch (e) {
+    console.error("load completions failed", e);
+    return [];
+  }
+}
+
+
 
 async function saveCompletion(activityId, plannedWeek, plannedDay) {
   const supabase = sb();
@@ -1079,8 +1094,22 @@ function WarmupTimer() {
 
 function PlanView({ plan, zones, profile }) {
   const [open, setOpen] = useState(null);
+  const [done, setDone] = useState(() => new Set());
+
+  useEffect(() => {
+    let alive = true;
+    loadCompletions().then((rows) => {
+      if (alive) setDone(new Set(rows.map((r) => `${r.planned_week}:${r.planned_day}`)));
+    });
+    return () => { alive = false; };
+  }, []);
+
   if (!profile) return <Empty msg="Set your goal in Setup to generate a plan." />;
   if (!plan.length) return <Empty msg="No plan yet — check your goal date in Setup." />;
+
+  const cur = currentWeek(profile, plan);
+  const curNum = cur ? cur.week : 1;
+
   return (
     <div className="stack">
       <section className="card">
@@ -1090,33 +1119,45 @@ function PlanView({ plan, zones, profile }) {
           ~10%/week with a recovery week every 4th, then a taper. Tap a week for sessions.
         </p>
       </section>
-      {plan.map((w) => (
-        <section key={w.week} className="card week-card">
-          <div className="card-head clickable" onClick={() => setOpen(open === w.week ? null : w.week)}>
-            <h3>Week {w.week} <span className="muted">· {w.label}</span></h3>
-            <div className="row-gap">
-              <Pill tone="accent">{w.volume}km</Pill>
-              <span className="chev">{open === w.week ? "▾" : "▸"}</span>
+      {plan.map((w) => {
+        const total = w.sessions.length;
+        const doneCount = w.sessions.filter((s) => done.has(`${w.week}:${s.day}`)).length;
+        const isPast = w.week < curNum;
+        const showCount = (isPast || w.week === curNum) && doneCount > 0;
+        return (
+          <section key={w.week} className={`card week-card ${w.week === curNum ? "week-current" : ""}`}>
+            <div className="card-head clickable" onClick={() => setOpen(open === w.week ? null : w.week)}>
+              <h3>Week {w.week} <span className="muted">· {w.label}</span></h3>
+              <div className="row-gap">
+                <Pill tone="accent">{w.volume}km</Pill>
+                {showCount && <Pill tone="base">{doneCount}/{total} done</Pill>}
+                <span className="chev">{open === w.week ? "▾" : "▸"}</span>
+              </div>
             </div>
-          </div>
-          {open === w.week && (
-            <div className="sessions">
-              {w.sessions.map((s, i) => {
-                const d = sessionDescription(s, zones);
-                return (
-                  <div key={i} className="session">
-                    <div className="session-day">{s.day}</div>
-                    <div className="session-body">
-                      <div className="session-title">{d.title}</div>
-                      <div className="session-detail">{d.detail}</div>
+            {open === w.week && (
+              <div className="sessions">
+                {w.sessions.map((s, i) => {
+                  const d = sessionDescription(s, zones);
+                  const isDone = done.has(`${w.week}:${s.day}`);
+                  const isMissed = isPast && !isDone;
+                  return (
+                    <div key={i} className="session">
+                      <div className="session-day">{s.day}</div>
+                      <div className="session-body">
+                        <div className="session-title">{d.title}</div>
+                        <div className="session-detail">{d.detail}</div>
+                      </div>
+                      {s.quality && <Pill tone="hard">quality</Pill>}
+                      {isDone && <span className="sess-mark done">✓</span>}
+                      {isMissed && <span className="sess-mark miss">✕</span>}
                     </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </section>
-      ))}
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        );
+      })}
     </div>
   );
 }
@@ -1363,14 +1404,20 @@ function ActivityDetail({ activityId, onBack, profile }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [streams, setStreams] = useState(null);
-  const [reloadTick, setReloadTick] = useState(0);
   const [completion, setCompletion] = useState(null);
+  const [reloadTick, setReloadTick] = useState(0);
+  
 
   useEffect(() => {
     let alive = true;
     setLoading(true);
     Promise.all([loadActivityDetail(activityId), loadActivityStreams(activityId), loadCompletion(activityId)])
-      .then(([d, s]) => { if (alive) { setData(d); setStreams(s); setLoading(false); } });
+      .then(([d, s, c]) => {
+        if (alive) {
+          console.log("ActivityDetail loaded — id:", activityId, "completion:", c);
+          setData(d); setStreams(s); setCompletion(c); setLoading(false);
+        }
+      });
     return () => { alive = false; };
   }, [activityId, reloadTick]);
 
@@ -2550,6 +2597,11 @@ function StyleBlock() {
       .session.pick:disabled { opacity:.5; cursor:default; }
       .session.pick.on { border-color:var(--accent); background:rgba(202,255,94,0.08); }
       .session.pick.sug { border-color:var(--accent-dim); }
+
+      .week-card.week-current { border-color:var(--accent-dim); }
+      .sess-mark { font-family:'JetBrains Mono',monospace; font-size:13px; font-weight:700; width:22px; height:22px; display:inline-flex; align-items:center; justify-content:center; border-radius:50%; flex-shrink:0; }
+      .sess-mark.done { color:var(--accent); background:rgba(202,255,94,0.12); border:1px solid rgba(202,255,94,0.3); }
+      .sess-mark.miss { color:var(--coral); background:rgba(255,107,94,0.10); border:1px solid rgba(255,107,94,0.25); }
 
       .warmup-card { border-color:rgba(202,255,94,0.25); }
       .warmup { margin:10px 0 0; padding-left:20px; }
