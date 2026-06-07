@@ -5,6 +5,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { createAdminClient } from "@/utils/supabase/admin";
 import { getStravaAccessToken } from "@/utils/strava/token";
 
+const STREAM_KEYS =
+  "time,distance,latlng,altitude,velocity_smooth,heartrate,cadence,watts,temp,moving,grade_smooth";
+
 // Strava verifies the subscription by calling back with
 // ?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...
 // We must echo { "hub.challenge": <challenge> } iff the verify token matches.
@@ -90,8 +93,27 @@ export async function POST(request: NextRequest) {
     description: d.description ?? null,
   };
 
-  const { error: upErr } = await admin.from("activities").upsert(row, { onConflict: "strava_id" });
-  if (upErr) return NextResponse.json({ ok: true, note: upErr.message });
+  const { data: upserted, error: upErr } = await admin
+    .from("activities")
+    .upsert(row, { onConflict: "strava_id" })
+    .select("id")
+    .single();
+  if (upErr || !upserted) return NextResponse.json({ ok: true, note: upErr?.message });
+
+  // Streams — fetch the per-sample series and store one jsonb blob, mirroring
+  // the streams route. 404 = no streams (manual entry); store {} so the chart
+  // treats it as "checked, none" rather than re-trying forever.
+  const sres = await fetch(
+    `https://www.strava.com/api/v3/activities/${stravaId}/streams?keys=${STREAM_KEYS}&key_by_type=true`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (sres.ok || sres.status === 404) {
+    const streams = sres.ok ? await sres.json() : {};
+    await admin.from("activity_streams").upsert(
+      { activity_id: upserted.id, user_id: userId, streams, fetched_at: new Date().toISOString() },
+      { onConflict: "activity_id" }
+    );
+  }
 
   return NextResponse.json({ ok: true });
 }
