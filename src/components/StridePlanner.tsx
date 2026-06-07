@@ -1119,7 +1119,6 @@ function LogRun({ profile, zones, onSave, fuel }) {
       wrong: score <= 6 ? wrong : [],
       pain,
       notes,
-      goalMode,
     });
     setSaved(true);
     setTimeout(() => setSaved(false), 2200);
@@ -2096,7 +2095,9 @@ function Setup({ profile, onSave, zones, runs }) {
         ? `${goalDistanceKm}km in ${goalTime}`
         : `${goalDistanceKm}km`;
     onSave({
-      name, goalType,
+      name, 
+      goalType,
+      goalMode,
       goalDistanceKm: parseFloat(goalDistanceKm),
       goalTime,
       goalLabel,
