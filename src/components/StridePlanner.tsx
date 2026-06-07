@@ -112,9 +112,9 @@ function weeksBetween(fromISO, toISO) {
 }
 
 function generatePlan(profile) {
-  const { goalDistanceKm, raceDate, currentWeeklyKm, daysPerWeek } = profile;
-  if (!goalDistanceKm || !raceDate || !currentWeeklyKm) return [];
-  const totalWeeks = Math.min(24, Math.max(4, weeksBetween(new Date().toISOString(), raceDate)));
+  const { goalDistanceKm, goalDate, currentWeeklyKm, daysPerWeek } = profile;
+  if (!goalDistanceKm || !goalDate || !currentWeeklyKm) return [];
+  const totalWeeks = Math.min(24, Math.max(4, weeksBetween(new Date().toISOString(), goalDate)));  
   const days = Math.min(6, Math.max(2, daysPerWeek || 4));
 
   // taper length scales with goal distance
@@ -220,6 +220,35 @@ function fitnessUpdateSuggestion(profile, runs) {
   return best;
 }
 
+// Load watch: bucket runs into rolling 7-day weeks back from today, compare
+// consecutive completed weeks, flag jumps over the threshold.
+function loadWatch(runs) {
+  const WEEKS = 5;            // how many weeks back to chart
+  const THRESHOLD = 0.10;     // 10% week-over-week is the classic flag line
+  const now = Date.now();
+  const DAY = 24 * 3600 * 1000;
+
+  // weeks[0] = most recent 7 days, weeks[1] = 7-14 days ago, etc.
+  const weeks = Array.from({ length: WEEKS }, () => 0);
+  runs.forEach((r) => {
+    const ageDays = (now - new Date(r.date).getTime()) / DAY;
+    if (ageDays < 0) return;
+    const bucket = Math.floor(ageDays / 7);
+    if (bucket < WEEKS) weeks[bucket] += parseFloat(r.distance) || 0;
+  });
+
+  // current week (weeks[0]) is partial — don't flag against it yet.
+  // compare last fully-elapsed week (weeks[1]) to the one before (weeks[2]).
+  const prev = weeks[2];
+  const last = weeks[1];
+  const jump = prev > 0 ? (last - prev) / prev : null;
+  const flagged = jump != null && jump > THRESHOLD;
+
+  return { weeks, jump, flagged, last, prev };
+}
+
+
+
 /* ---------- storage layer ---------- */
 
 const KEYS = {
@@ -251,8 +280,7 @@ function rowToProfile(row) {
     goalDistanceKm,
     goalTime,
     goalLabel,
-    raceDate: row.race_date || "",
-    currentWeeklyKm: row.current_weekly_km != null ? Number(row.current_weekly_km) : null,
+    goalDate: row.race_date || "",   // DB column stays race_date; app field is the general "goal date"    currentWeeklyKm: row.current_weekly_km != null ? Number(row.current_weekly_km) : null,
     daysPerWeek: row.days_per_week,
     benchDistKm: row.bench_dist_km != null ? Number(row.bench_dist_km) : null,
     benchTimeSec: row.bench_time_s,
@@ -271,8 +299,7 @@ function profileToRow(p, userId) {
     goal_type: p.goalType ?? null,
     goal_distance_km: p.goalDistanceKm ?? null,
     goal_time: p.goalTime ?? null,
-    race_date: p.raceDate ? p.raceDate : null,
-    current_weekly_km: p.currentWeeklyKm ?? null,
+    race_date: p.goalDate ? p.goalDate : null,    current_weekly_km: p.currentWeeklyKm ?? null,
     days_per_week: p.daysPerWeek ?? null,
     bench_dist_km: p.benchDistKm ?? null,
     bench_time_s: p.benchTimeSec ?? null,
@@ -809,7 +836,7 @@ useEffect(() => {
           ? <ActivityDetail activityId={selectedActivityId} profile={profile} onBack={() => setSelectedActivityId(null)} />
           : <Activity runs={runs} cross={cross} onDelRun={delRun} onAddCross={addCross} onReloadRuns={reloadRuns} onOpenRun={setSelectedActivityId} zones={zones} />)}        
         {tab === "fuel" && <FuelView fuel={fuel} onSave={addFuel} runs={runs} />}
-        {tab === "insights" && <Insights runs={runs} fuel={fuel} zones={zones} />}
+        {tab === "insights" && <Insights runs={runs} fuel={fuel} zones={zones} profile={profile} />}
         {tab === "setup" && <Setup profile={profile} onSave={saveProfile} zones={zones} runs={runs} />}      
       </main>
        {paceToast && (
@@ -1895,7 +1922,7 @@ function FuelView({ fuel, onSave, runs }) {
 
 /* ---------- INSIGHTS ---------- */
 
-function Insights({ runs, fuel, zones }) {
+function Insights({ runs, fuel, zones, profile }) {
   const scored = runs.filter((r) => r.score != null);
   if (scored.length < 3) return <Empty msg="Log or score a few runs and the patterns will show up here." />;
 
@@ -1912,6 +1939,8 @@ function Insights({ runs, fuel, zones }) {
   runs.forEach((r) => (r.pain || []).forEach((p) => (painTally[p] = (painTally[p] || 0) + 1)));
   const topPain = Object.entries(painTally).sort((a, b) => b[1] - a[1]);
 
+  const load = loadWatch(runs);
+
   // warm-up effect
   const warmedScores = scored.filter((r) => r.warmup).map((r) => r.score);
   const coldScores = scored.filter((r) => !r.warmup).map((r) => r.score);
@@ -1920,6 +1949,11 @@ function Insights({ runs, fuel, zones }) {
   // easy runs run too hard
   const easyRuns = runs.filter((r) => r.type === "easy" && zones);
   const tooFastEasy = easyRuns.filter((r) => paceOf(r) < zones.easy[1]);
+
+  // easy runs that ran hot on HR (needs LT1 + HR data; catches what pace misses)
+  const lt1 = profile?.lt1Hr ?? null;
+  const easyWithHr = runs.filter((r) => r.type === "easy" && r.avgHr);
+  const tooHotEasy = lt1 ? easyWithHr.filter((r) => r.avgHr > lt1) : [];
 
   // fuel correlation: low runs preceded by no carbs
   const fuelByDate = {};
@@ -1973,9 +2007,41 @@ function Insights({ runs, fuel, zones }) {
           <p>
             {tooFastEasy.length} of your {easyRuns.length} easy runs were faster than your easy
             zone ({fmtPace(zones.easy[1])} or slower). Running easy days too hard is the classic
-            reason every run feels mediocre — you never fully recover. Slow them down and your hard
+            reason every run feels mediocre. This impacts recovery. Slow them down and your hard
             days get better.
           </p>
+        </section>
+      )}
+
+      {lt1 && easyWithHr.length > 0 && tooHotEasy.length > 0 && (
+        <section className="card insight">
+          <h3>Easy runs running hot</h3>
+          <p>
+            {tooHotEasy.length} of your {easyWithHr.length} easy runs with HR data averaged above
+            your LT1 of {lt1} bpm. They drifted out of the easy zone even if the pace looked fine.
+            Heat, hills and fatigue all push HR up! On easy days, ease off enough to keep your
+            average under {lt1}.
+          </p>
+        </section>
+      )}
+
+      {load.prev > 0 && (
+        <section className="card insight">
+          <h3>📈 Load watch</h3>
+          <div className="row-item">
+            <span>Last full week</span>
+            <Pill tone={load.flagged ? "warn" : "base"}>{load.last.toFixed(1)}km</Pill>
+          </div>
+          <div className="row-item">
+            <span>Week before</span>
+            <Pill tone="base">{load.prev.toFixed(1)}km</Pill>
+          </div>
+          {load.flagged && (
+            <p className="muted small">
+              That's a {Math.round(load.jump * 100)}% jump week-on-week — past the ~10% mark that
+              tends to precede injury. Worth an easier week before pushing further.
+            </p>
+          )}
         </section>
       )}
 
@@ -2237,6 +2303,13 @@ function StyleBlock() {
       .card-head h3 { margin:0; }
       .clickable { cursor:pointer; }
       .empty { text-align:center; color:var(--muted); padding:34px 18px; }
+
+      .toast { position:fixed; left:50%; bottom:88px; transform:translateX(-50%); z-index:1000; display:flex; align-items:center; gap:12px; max-width:calc(100% - 32px); width:max-content; padding:12px 14px; background:var(--panel); border:1px solid rgba(202,255,94,0.35); border-radius:12px; box-shadow:0 8px 28px rgba(0,0,0,0.5); color:var(--ink); font-size:14px; line-height:1.4; animation:toast-in 0.25s ease-out; }
+      .toast span { flex:1; }
+      .toast .link-btn { flex-shrink:0; background:none; border:none; padding:0; color:var(--accent); font-size:14px; font-weight:600; cursor:pointer; white-space:nowrap; }
+      .toast .toast-close { flex-shrink:0; background:none; border:none; padding:0 2px; color:var(--muted); font-size:16px; line-height:1; cursor:pointer; }
+      .toast .toast-close:hover { color:var(--ink); }
+      @keyframes toast-in { from { opacity:0; transform:translate(-50%,8px); } to { opacity:1; transform:translate(-50%,0); } }
 
       .hero { background:linear-gradient(135deg, var(--panel-2), var(--panel)); }
       .hero-row { display:flex; gap:10px; flex-wrap:wrap; }
