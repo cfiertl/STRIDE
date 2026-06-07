@@ -911,7 +911,7 @@ useEffect(() => {
     <div className="wrap">
       <StyleBlock />
       <header className="topbar">
-        <div className="brand">
+        <div className="brand" role="button" tabIndex={0} onClick={() => { setTab("today"); setSelectedActivityId(null); }} style={{ cursor: "pointer" }}>
           <svg className="logo" viewBox="0 0 64 64" aria-label="Stride logo">
             <g fill="none" stroke="var(--accent)" strokeWidth="6.5" strokeLinecap="round">
               <path d="M16 24 L23 13" />
@@ -920,7 +920,6 @@ useEffect(() => {
             </g>
           </svg>
           <span className="brand-word">STRIDE<span className="brand-dot">.</span></span>
-          <span className="brand-sub">running planner</span>
         </div>
         {profile && profile.name ? <div className="hello">Hi, {profile.name}</div> : null}
       </header>
