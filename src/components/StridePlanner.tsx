@@ -118,7 +118,7 @@ function generatePlan(profile) {
   const days = Math.min(6, Math.max(2, daysPerWeek || 4));
 
   // taper length scales with goal distance
-  const taper = goalDistanceKm >= 30 ? 3 : goalDistanceKm >= 15 ? 2 : 1;
+  const taper = profile.goalMode === "fitness" ? 0 : (goalDistanceKm >= 30 ? 3 : goalDistanceKm >= 15 ? 2 : 1);
   const buildWeeks = Math.max(2, totalWeeks - taper);
 
   // peak weekly volume: progress ~ from current, 10%/wk, cutback every 4th
@@ -138,6 +138,7 @@ function generatePlan(profile) {
     const weekVol = Math.round(vol);
     weeks.push(buildWeek(w, totalWeeks, weekVol, goalDistanceKm, days, isTaper, cutback));
   }
+  console.log("generatePlan goalMode:", profile.goalMode, "taper:", taper);
   return weeks;
 }
 
@@ -280,7 +281,9 @@ function rowToProfile(row) {
     goalDistanceKm,
     goalTime,
     goalLabel,
-    goalDate: row.race_date || "",   // DB column stays race_date; app field is the general "goal date"    currentWeeklyKm: row.current_weekly_km != null ? Number(row.current_weekly_km) : null,
+    goalMode: row.goal_mode || "race",
+    goalDate: row.race_date || "",   // DB column stays race_date; app field is the general "goal date"    
+    currentWeeklyKm: row.current_weekly_km != null ? Number(row.current_weekly_km) : null,
     daysPerWeek: row.days_per_week,
     benchDistKm: row.bench_dist_km != null ? Number(row.bench_dist_km) : null,
     benchTimeSec: row.bench_time_s,
@@ -299,7 +302,9 @@ function profileToRow(p, userId) {
     goal_type: p.goalType ?? null,
     goal_distance_km: p.goalDistanceKm ?? null,
     goal_time: p.goalTime ?? null,
-    race_date: p.goalDate ? p.goalDate : null,    current_weekly_km: p.currentWeeklyKm ?? null,
+    goal_mode: p.goalMode || "race",
+    race_date: p.goalDate ? p.goalDate : null,    
+    current_weekly_km: p.currentWeeklyKm ?? null,
     days_per_week: p.daysPerWeek ?? null,
     bench_dist_km: p.benchDistKm ?? null,
     bench_time_s: p.benchTimeSec ?? null,
@@ -883,7 +888,7 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness }) {
       <section className="card hero">
         <div className="hero-row">
           <Stat label="Goal" value={profile.goalLabel || `${profile.goalDistanceKm}km`} accent />
-          <Stat label="Race day" value={profile.raceDate ? daysUntil(profile.raceDate) + "d" : "—"} />
+          <Stat label="Countdown" value={profile.goalDate ? daysUntil(profile.goalDate) + "d" : "—"} />          
           <Stat label="This week" value={`${weekKm.toFixed(1)}km`} />
         </div>
       </section>
@@ -1114,6 +1119,7 @@ function LogRun({ profile, zones, onSave, fuel }) {
       wrong: score <= 6 ? wrong : [],
       pain,
       notes,
+      goalMode,
     });
     setSaved(true);
     setTimeout(() => setSaved(false), 2200);
@@ -2075,13 +2081,14 @@ function Setup({ profile, onSave, zones, runs }) {
   const [goalType, setGoalType] = useState(profile?.goalType || "distance");
   const [goalDistanceKm, setGoalDistanceKm] = useState(profile?.goalDistanceKm || 21.1);
   const [goalTime, setGoalTime] = useState(profile?.goalTime || "");
-  const [raceDate, setRaceDate] = useState(profile?.raceDate || "");
+  const [goalDate, setGoalDate] = useState(profile?.goalDate || "");  
   const [currentWeeklyKm, setCurrentWeeklyKm] = useState(profile?.currentWeeklyKm || 25);
   const [daysPerWeek, setDaysPerWeek] = useState(profile?.daysPerWeek || 4);
   const [benchDist, setBenchDist] = useState(profile?.benchDistKm || 5);
   const [benchTime, setBenchTime] = useState(profile?.benchTimeSec ? fmtTime(profile.benchTimeSec) : "");
   const [easyPace, setEasyPace] = useState(profile?.easyPaceSec ? fmtTime(profile.easyPaceSec) : "");
   const [saved, setSaved] = useState(false);
+  const [goalMode, setGoalMode] = useState(profile?.goalMode || "race");
 
   const submit = () => {
     const goalLabel =
@@ -2093,7 +2100,7 @@ function Setup({ profile, onSave, zones, runs }) {
       goalDistanceKm: parseFloat(goalDistanceKm),
       goalTime,
       goalLabel,
-      raceDate,
+      goalDate,
       currentWeeklyKm: parseFloat(currentWeeklyKm),
       daysPerWeek: parseInt(daysPerWeek),
       benchDistKm: parseFloat(benchDist),
@@ -2125,6 +2132,10 @@ function Setup({ profile, onSave, zones, runs }) {
         </div>
         <div className="form-grid">
           <label className="field"><span>Distance (km)</span><input type="number" step="0.1" value={goalDistanceKm} onChange={(e) => setGoalDistanceKm(e.target.value)} /></label>
+        <div className="chips" style={{ marginBottom: 12 }}>
+          <button className={`chip ${goalMode === "race" ? "chip-on" : ""}`} onClick={() => setGoalMode("race")}>Training for a race</button>
+          <button className={`chip ${goalMode === "fitness" ? "chip-on" : ""}`} onClick={() => setGoalMode("fitness")}>General fitness</button>
+        </div>
           <label className="field"><span>Goal type</span>
             <select value={goalType} onChange={(e) => setGoalType(e.target.value)}>
               <option value="distance">Just finish the distance</option>
@@ -2134,7 +2145,7 @@ function Setup({ profile, onSave, zones, runs }) {
           {goalType === "time" && (
             <label className="field"><span>Target time (h:mm:ss)</span><input value={goalTime} onChange={(e) => setGoalTime(e.target.value)} placeholder="1:45:00" /></label>
           )}
-          <label className="field"><span>Race date</span><input type="date" value={raceDate} onChange={(e) => setRaceDate(e.target.value)} /></label>
+          <label className="field"><span>Goal date</span><input type="date" value={goalDate} onChange={(e) => setGoalDate(e.target.value)} /></label>
         </div>
       </section>
 
@@ -2236,9 +2247,9 @@ function paceOf(r) { return r.timeSec && r.distance ? r.timeSec / parseFloat(r.d
 function scoreColor(s) { return s >= 8 ? "var(--accent)" : s >= 5 ? "var(--amber)" : "var(--coral)"; }
 
 function currentWeek(profile, plan) {
-  if (!plan.length || !profile.raceDate) return plan[0];
+  if (!plan.length || !profile.goalDate) return plan[0];
   const total = plan.length;
-  const wksOut = weeksBetween(new Date().toISOString(), profile.raceDate);
+  const wksOut = weeksBetween(new Date().toISOString(), profile.goalDate);
   const idx = Math.min(total - 1, Math.max(0, total - wksOut - 1));
   return plan[idx];
 }
