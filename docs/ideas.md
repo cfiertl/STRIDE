@@ -157,3 +157,69 @@ the detail page may be fine without the added orchestration.
 **Status:** Idea / not scheduled. Revisit when Phase 8 (Spotify) is being built —
 this is a Phase 7 × Phase 8 interaction, so it can't be settled until the Spotify
 capture trigger exists.
+
+## UI overhaul: bottom nav + URL state
+
+A visual + navigation redesign. Does **not** change data shape or storage — the
+existing `setTab` / `selectedActivityId` state model survives. The one new
+architectural piece is lightweight URL state (see below).
+
+### Navigation (5-item bottom bar)
+
+Replace the 7 scrolling top tabs with a fixed bottom nav, five items:
+
+- Far left: **Plan**
+- Middle-left: **Activities** (currently "Activity")
+- **Center: Today** — the daily hub. Icon is the day-of-month as two digits
+  (06, 12, …), with an accent ring/fill when it's the active tab so it reads as
+  "today" not a random number. Keep it legible at small size.
+- Middle-right: **Fuel**
+- Far right: **Insights**
+
+Folded in / moved:
+
+- **Log Run** (manual entry) is baked into **Today** — no longer its own tab.
+- **Setup** moves to a small circle, top-right (reads as settings/profile by
+  convention; no label needed).
+
+### URL state (the one new architecture bit) — History API, NOT full routing
+
+Adopt `?activity=<uuid>` search-param state via `history.pushState` +
+a `popstate` listener, while keeping the single-component tab-state model.
+
+- Opening an activity detail → `pushState("?activity=<uuid>")`.
+- On load, read the param → `setSelectedActivityId(id); setTab("activity")`.
+- `popstate` (iOS back-swipe / back gesture) → close the detail, return to list.
+
+Why this level and not the alternatives:
+
+- **Pure tab state (today):** back-swipe does nothing useful, and the push
+  deep-link needs a throwaway SW-postMessage hack. Both are real UX gaps.
+- **Full Next.js App Router (route per tab, `/activity/[id]`):** the "correct"
+  abstraction, but a heavy refactor of the 1300-line `@ts-nocheck` single
+  component — all shared `profile`/`runs`/`zones` state would need lifting into
+  layouts or a store. High-risk foundational rewrite, YAGNI for a single user.
+- **History API search params (chosen):** ~1/10th the cost of full routing,
+  keeps the single-component architecture, and unlocks BOTH back-swipe and the
+  deep-link on a permanent foundation.
+
+### Riders that land on the URL-state foundation
+
+- **Notification deep-link to the activity** (deferred from Phase 7 for exactly
+  this reason): once `?activity=` exists, the webhook sends
+  `url: "/?activity=<activities.id>"` (the UUID `upserted.id`, already in scope
+  after the upsert — NOT the strava_id, since the detail view keys on the UUID),
+  and the app reads it on open. ~2 lines on top of the URL foundation instead of
+  a SW hack thrown away later.
+- **Custom pull-to-refresh** on Today + Activities. Native Safari
+  pull-to-refresh is gone in a standalone PWA, so build it: touchstart/move at
+  scrollTop 0, pull past a threshold → call `refreshAll()` (the foreground-
+  refresh function already exists). "Feel" work that shares scroll/layout
+  decisions with this redesign, hence bundled here rather than done standalone.
+
+### Sequencing note
+
+Foreground-refresh-on-visibility (the notification-staleness fix) ships
+independently and BEFORE this — it's invisible data-lifecycle plumbing a
+redesign won't touch. This overhaul is its own track; build the bottom nav +
+URL state together, then the two riders.
