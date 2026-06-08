@@ -815,23 +815,43 @@ export default function App() {
     setRuns(r);
   }, []);
 
+  // Re-pull everything (runs, profile, cross, fuel). Used on mount and whenever
+  // the app returns to the foreground, so a notification tap / app-switch shows
+  // fresh data without a full close-and-reopen. Returns the profile so the
+  // caller can decide on the first-load setup redirect.
+  const refreshAll = useCallback(async () => {
+    const [p, r, c, f] = await Promise.all([
+      loadKey(KEYS.profile, null),
+      loadRuns(),
+      loadCross(),
+      loadFuel(),
+    ]);
+    setProfile(p);
+    setPlan(p ? generatePlan(p) : []); // plan is derived from profile, not stored
+    setRuns(r);
+    setCross(c);
+    setFuel(f);
+    return p;
+  }, []);
+
   useEffect(() => {
     (async () => {
-      const [p, r, c, f] = await Promise.all([
-        loadKey(KEYS.profile, null),
-        loadRuns(),
-        loadCross(),
-        loadFuel(),
-      ]);
-      setProfile(p);
-      setPlan(p ? generatePlan(p) : []); // plan is derived from profile, not stored
-      setRuns(r);
-      setCross(c);
-      setFuel(f);
+      const p = await refreshAll();
       setLoaded(true);
       if (!p) setTab("setup");
     })();
-  }, []);
+  }, [refreshAll]);
+
+  // Refresh when the app comes back to the foreground — covers opening via a
+  // push notification (the SW focuses the existing window, so React never
+  // remounts on its own), plus returning from the app switcher or unlock.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === "visible") refreshAll();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [refreshAll]);
 
   const zones = computeZones(profile);
 
@@ -2448,7 +2468,6 @@ function Setup({ profile, onSave, zones, runs }) {
       </section>
       
       <PushToggle />
-
 
       <section className="card">
         <h3>Your current fitness <span className="muted">(sets your paces)</span></h3>
