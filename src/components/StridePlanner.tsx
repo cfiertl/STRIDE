@@ -6,6 +6,7 @@ import { createClient } from "@/utils/supabase/client";
 import { ComposedChart, Line, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
 import dynamic from "next/dynamic";
 import BodyMap from "@/components/BodyMap";
+import PushToggle from "@/components/PushToggle";
 const RouteMap = dynamic(() => import("@/components/RouteMap"), { ssr: false, loading: () => <div className="card muted small">Loading map…</div> });
 
 /* ============================================================
@@ -2445,6 +2446,9 @@ function Setup({ profile, onSave, zones, runs }) {
           <p className="muted small">On 2 days a week, both runs count: one long run (easy effort) and one quality session. That's a legit way to train — consistency beats volume.</p>
         )}
       </section>
+      
+      <PushToggle />
+
 
       <section className="card">
         <h3>Your current fitness <span className="muted">(sets your paces)</span></h3>
