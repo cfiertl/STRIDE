@@ -4,6 +4,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createAdminClient } from "@/utils/supabase/admin";
 import { getStravaAccessToken } from "@/utils/strava/token";
+import { sendPushToUser } from "@/utils/push/send";
 
 const STREAM_KEYS =
   "time,distance,latlng,altitude,velocity_smooth,heartrate,cadence,watts,temp,moving,grade_smooth";
@@ -113,6 +114,16 @@ export async function POST(request: NextRequest) {
       { activity_id: upserted.id, user_id: userId, streams, fetched_at: new Date().toISOString() },
       { onConflict: "activity_id" }
     );
+  }
+
+  // New activity only (not edits) → nudge the phone. sendPushToUser never
+  // throws, so a push failure can't break the 200 Strava needs.
+  if (event.aspect_type === "create") {
+    await sendPushToUser(userId, {
+      title: "STRIDE",
+      body: "New activity available to view",
+      url: "/",
+    });
   }
 
   return NextResponse.json({ ok: true });

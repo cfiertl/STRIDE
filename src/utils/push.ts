@@ -47,6 +47,9 @@ export async function subscribeToPush(): Promise<PushSubscriptionJSON> {
   const permission = await Notification.requestPermission();
   if (permission !== "granted") throw new Error("Notification permission denied");
 
+  const existing = await reg.pushManager.getSubscription();
+    if (existing) return existing.toJSON();
+    
   const sub = await reg.pushManager.subscribe({
     userVisibleOnly: true,
     applicationServerKey: urlBase64ToUint8Array(vapid),

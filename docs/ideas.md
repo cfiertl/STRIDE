@@ -124,3 +124,36 @@ completed week:**
 No schema impact — advisory only, reads `session_completions` + run scores. The
 plan stays derived from profile; rewriting it in place is the separate "movable
 sessions" idea below/above.
+
+## Push timing: delay activity-synced notification until Spotify capture completes
+
+**Context:** The "New run available to view in STRIDE" push (Phase 7) fires off the
+Strava webhook (Phase 6), which lands within ~a minute of finishing. But the
+Spotify soundtrack (Phase 8) arrives via a _separate_ scheduled poll of
+`recently-played`, not the webhook — so it's slower and not guaranteed to be in
+place when the run-available push fires. If the user taps the notification
+immediately, the soundtrack tile would be empty or partial.
+
+**Preferred direction:** hold the push until the run's Spotify capture has
+completed, then fire a single notification — so tapping in shows a fully-formed
+run (data + soundtrack) rather than something that fills in while you watch.
+
+**Tradeoffs / open questions:**
+
+- Adds coupling: the push trigger now waits on _two_ async sources (Strava
+  webhook + Spotify poll) instead of one. Need a clear "this run is fully
+  hydrated" signal to fire on.
+- Adds latency: notification arrives minutes later (gated on poll cadence), not
+  seconds. Acceptable for a soundtrack, but it's a deliberate UX choice.
+- Failure mode: if Spotify capture never completes (Premium lapsed, no music
+  played, poll failed), the push must still fire on a timeout/fallback so a run
+  is never silently un-notified.
+
+**Cheaper alternative if the above is fussy:** decouple entirely — fire
+run-available promptly off the webhook (soundtrack just populates later when the
+poll runs). The push doesn't _promise_ music, so a slightly-late soundtrack on
+the detail page may be fine without the added orchestration.
+
+**Status:** Idea / not scheduled. Revisit when Phase 8 (Spotify) is being built —
+this is a Phase 7 × Phase 8 interaction, so it can't be settled until the Spotify
+capture trigger exists.
