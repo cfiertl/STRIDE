@@ -50,7 +50,8 @@ export default function PushToggle() {
     setBusy(true);
     setMsg("");
     try {
-      const sub = await subscribeToPush(); // registers SW, asks permission, subscribes
+      const sub = await subscribeToPush();
+      setMsg("subscribed ok — saving…");   // ← was console.log 
       const supabase = createClient();
       const {
         data: { user },
@@ -70,6 +71,7 @@ export default function PushToggle() {
       if (error) throw error;
       setState("on");
     } catch (e: any) {
+        console.error("enable push failed:", e?.name, e?.message, e);
       if (typeof Notification !== "undefined" && Notification.permission === "denied") {
         setState("denied");
       }
