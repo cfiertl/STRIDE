@@ -1993,9 +1993,9 @@ function HRZoneHub({ profile, runs, onSaveHr }) {
 
   // candidate tests: have HR, ~22–45 min, hardest (highest avg HR) first
   const candidates = (runs || [])
-    .filter((r) => r.avgHr && r.timeSec >= 1320 && r.timeSec <= 2700)
-    .sort((a, b) => (b.avgHr || 0) - (a.avgHr || 0))
-    .slice(0, 12);
+  .filter((r) => r.avgHr && r.timeSec >= 1320 && r.timeSec <= 2700)
+  .sort((a, b) => new Date(b.date) - new Date(a.date))   // most recent first
+  .slice(0, 5);
 
   const linkActivity = async (r) => {
     setBusyId(r.id);

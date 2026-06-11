@@ -38,12 +38,13 @@ export async function captureSpotifyForActivity(userId: string, activity: any) {
   const data = await res.json();
   const items = Array.isArray(data.items) ? data.items : [];
 
-  const lo = startMs - WINDOW_BUFFER_MS;
-  const hi = endMs + WINDOW_BUFFER_MS;
   const rows = items
     .filter((it: any) => {
-      const t = new Date(it.played_at).getTime();
-      return t >= lo && t <= hi;
+      const endedAt = new Date(it.played_at).getTime();          // played_at = track END
+      const startedAt = endedAt - (it.track?.duration_ms ?? 0);
+      // keep if the track's play interval overlaps the run window
+      return startedAt < endMs + WINDOW_BUFFER_MS &&
+             endedAt > startMs - WINDOW_BUFFER_MS;
     })
     .map((it: any) => {
       const track = it.track || {};
