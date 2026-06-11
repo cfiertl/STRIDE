@@ -5,6 +5,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createAdminClient } from "@/utils/supabase/admin";
 import { getStravaAccessToken } from "@/utils/strava/token";
 import { sendPushToUser } from "@/utils/push/send";
+import { captureSpotifyForActivity } from "@/utils/spotify/capture";
 
 const STREAM_KEYS =
   "time,distance,latlng,altitude,velocity_smooth,heartrate,cadence,watts,temp,moving,grade_smooth";
@@ -121,9 +122,22 @@ export async function POST(request: NextRequest) {
   if (event.aspect_type === "create") {
     await sendPushToUser(userId, {
       title: "STRIDE",
-      body: "New activity available to view",
+      body: "New activity available to view in STRIDE",
       url: "/",
     });
+
+    // Capture the Spotify soundtrack for this run. Silent no-op if Spotify
+    // isn't connected or no music played. Non-fatal — wrapped so it can
+    // never break the 200 Strava needs.
+    try {
+      await captureSpotifyForActivity(userId, {
+        id: upserted.id,
+        start_date: d.start_date,
+        elapsed_time: d.elapsed_time,
+      });
+    } catch (e) {
+      console.error("spotify capture failed (non-fatal)", e);
+    }
   }
 
   return NextResponse.json({ ok: true });
