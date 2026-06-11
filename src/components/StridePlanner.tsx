@@ -961,7 +961,7 @@ useEffect(() => {
         {tab === "plan" && <PlanView plan={plan} zones={zones} profile={profile} />}
         {tab === "log" && <LogRun profile={profile} zones={zones} onSave={addRun} fuel={fuel} />}
         {tab === "activity" && (selectedActivityId
-          ? <ActivityDetail activityId={selectedActivityId} profile={profile} onBack={() => setSelectedActivityId(null)} />
+          ? <ActivityDetail activityId={selectedActivityId} profile={profile} onBack={() => setSelectedActivityId(null)} onScored={reloadRuns} />
           : <Activity runs={runs} cross={cross} onDelRun={delRun} onAddCross={addCross} onReloadRuns={reloadRuns} onOpenRun={setSelectedActivityId} zones={zones} />)}        
         {tab === "fuel" && <FuelView fuel={fuel} onSave={addFuel} runs={runs} />}
         {tab === "insights" && <Insights runs={runs} fuel={fuel} zones={zones} profile={profile} />}
@@ -1483,7 +1483,7 @@ function Activity({ runs, cross, onDelRun, onAddCross, onReloadRuns, onOpenRun, 
   );
 }
 
-function ActivityDetail({ activityId, onBack, profile }) {
+function ActivityDetail({ activityId, onBack, profile, onScored }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [streams, setStreams] = useState(null);
@@ -1618,7 +1618,7 @@ function ActivityDetail({ activityId, onBack, profile }) {
       )}
 
       <LinkSession activity={a} log={log} completion={completion} profile={profile} onSaved={() => setReloadTick((t) => t + 1)} />
-      <ScoreCard activity={a} log={log} onSaved={() => setReloadTick((t) => t + 1)} />
+      <ScoreCard activity={a} log={log} onSaved={() => { setReloadTick((t) => t + 1); onScored?.(); }} />
     </div>
   );
 }
