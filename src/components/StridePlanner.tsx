@@ -2425,7 +2425,7 @@ function Setup({ profile, onSave, zones, runs }) {
         <h3>Your profile</h3>
         <label className="field"><span>Name</span><input value={name} onChange={(e) => setName(e.target.value)} placeholder="Chris" /></label>
       </section>
-
+      <a className="btn" href="/api/spotify/authorize">Connect Spotify</a>
       <section className="card">
         <h3>Your goal</h3>
         <div className="chips">
