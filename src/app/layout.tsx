@@ -3,7 +3,7 @@ import { Figtree } from "next/font/google";
 import "./globals.css";
 
 export const viewport: Viewport = {
-  themeColor: "#e9e7e1",
+  themeColor: "#f6f7fb",
   width: "device-width",   // pin layout width to the actual screen
   initialScale: 1,         // render at 1:1, no zoom-to-fit
   viewportFit: "cover",    // safe-area support for the PWA later

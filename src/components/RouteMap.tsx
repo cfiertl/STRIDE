@@ -21,7 +21,7 @@ export default function RouteMap({ latlng }) {
         url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
         attribution='&copy; OpenStreetMap &copy; CARTO'
       />
-      <Polyline positions={latlng} pathOptions={{ color: "var(--ink)", weight: 2, opacity: 0.85 }} />
+      <Polyline positions={latlng} pathOptions={{ color: "var(--accent)", weight: 3, opacity: 0.9 }} />
     </MapContainer>
   );
 }

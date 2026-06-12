@@ -1744,7 +1744,7 @@ function ChartTip({ active, payload, label }) {
   return (
     <div className="chart-tip">
       <div className="chart-tip-t">{fmtTime(label)}</div>
-      {v.hr != null && <div><span style={{ color: "var(--coral)" }}>HR</span> {Math.round(v.hr)} bpm</div>}
+      {v.hr != null && <div><span style={{ color: "var(--viz-b)" }}>HR</span> {Math.round(v.hr)} bpm</div>}
       {v.pace != null && <div><span style={{ color: "var(--accent)" }}>Pace</span> {fmtPace(v.pace)}</div>}
       {v.elev != null && <div><span style={{ color: "var(--muted)" }}>Elev</span> {Math.round(v.elev)} m</div>}
       {v.cad != null && <div><span style={{ color: "var(--amber)" }}>Cadence</span> {v.cad} spm</div>}
@@ -1762,7 +1762,7 @@ function StreamChart({ streams }) {
   const ticks = [];
   for (let s = 0; s <= maxT; s += tickStep) ticks.push(s);
   const toggles = [
-    ["hr", "HR", "var(--coral)"], ["pace", "Pace", "var(--accent)"],
+    ["hr", "HR", "var(--viz-b)"], ["pace", "Pace", "var(--accent)"],
     ["elev", "Elevation", "var(--muted)"], ["cad", "Cadence", "var(--amber)"],
   ].filter(([k]) => has[k]);
 
@@ -1787,7 +1787,7 @@ function StreamChart({ streams }) {
             <Tooltip content={<ChartTip />} />
             {has.elev && show.elev && <Area yAxisId="elev" dataKey="elev" stroke="none" fill="var(--muted)" fillOpacity={0.18} isAnimationActive={false} connectNulls />}
             {has.pace && show.pace && <Line yAxisId="pace" dataKey="pace" stroke="var(--accent)" dot={false} strokeWidth={2} isAnimationActive={false} connectNulls />}
-            {has.hr && show.hr && <Line yAxisId="hr" dataKey="hr" stroke="var(--coral)" dot={false} strokeWidth={2} isAnimationActive={false} connectNulls />}
+            {has.hr && show.hr && <Line yAxisId="hr" dataKey="hr" stroke="var(--viz-b)" dot={false} strokeWidth={2} isAnimationActive={false} connectNulls />}
             {has.cad && show.cad && <Line yAxisId="cad" dataKey="cad" stroke="var(--amber)" dot={false} strokeWidth={1.5} isAnimationActive={false} connectNulls />}
           </ComposedChart>
         </ResponsiveContainer>
@@ -2373,7 +2373,7 @@ function Insights({ runs, fuel, zones, profile }) {
         <section className="card insight">
           <h3>🔥 Warm-up effect</h3>
           <p>
-            Runs where you warmed up score <strong style={{ color: "var(--accent)" }}>{avg(warmedScores)}/10</strong> on
+            Runs where you warmed up score <strong style={{ color: "var(--positive)" }}>{avg(warmedScores)}/10</strong> on
             average, vs <strong style={{ color: "var(--coral)" }}>{avg(coldScores)}/10</strong> when you didn't.
             {Number(avg(warmedScores)) > Number(avg(coldScores)) + 0.5
               ? " That gap is your 4–5km problem in numbers — warming up first is the cheapest win you have."
@@ -2641,7 +2641,7 @@ function Empty({ msg }) {
 
 function cap(s) { return s ? s[0].toUpperCase() + s.slice(1) : s; }
 function paceOf(r) { return r.timeSec && r.distance ? r.timeSec / parseFloat(r.distance) : 0; }
-function scoreColor(s) { return s >= 8 ? "var(--accent)" : s >= 5 ? "var(--amber)" : "var(--coral)"; }
+function scoreColor(s) { return s >= 8 ? "var(--positive)" : s >= 5 ? "var(--amber)" : "var(--coral)"; }
 
 function currentWeek(profile, plan) {
   if (!plan.length || !profile.goalDate) return plan[0];
@@ -2706,11 +2706,15 @@ function StyleBlock() {
     <style>{`
       * { box-sizing: border-box; }
       .wrap {
-        /* Fieldnote — calm-tech monochrome. Paper ground, ink as the accent;
-           colour appears only as information (amber caution, red pain). */
-        --bg: #e9e7e1; --panel: #f5f4ef; --panel-2:#dfdcd3; --line:#c8c4b8;
-        --ink:#21201c; --muted:#66635a; --accent:#21201c; --accent-dim:#57544b;
-        --coral:#b3402e; --amber:#8f5f14; --on-accent:#f5f4ef;
+        /* Court — energetic light. White ground, electric cobalt action
+           colour, tinted card fills, real depth. Cobalt = action/brand;
+           the semantic triad is --positive / --amber / --coral; --viz-b is
+           the second chart series (HR). Triad values run darker than the
+           fills so 11px text clears WCAG AA on white. */
+        --bg: #f6f7fb; --panel: #ffffff; --panel-2:#eef1fb; --line:#e3e7f2;
+        --ink:#15192b; --muted:#697086; --accent:#2451ff; --accent-dim:#1c40cc;
+        --coral:#dc2626; --amber:#b45309; --on-accent:#ffffff;
+        --positive:#15803d; --viz-b:#ff7d2e;
         /* Plainhand: one family everywhere; numeral classes keep their
            --font-mono hook but it resolves to the body face, and alignment
            comes from tabular figures below. */
@@ -2718,6 +2722,8 @@ function StyleBlock() {
         --font-mono: var(--font-body);
         font-family:var(--font-body), sans-serif;
         background: var(--bg);
+        background-image: radial-gradient(900px 480px at 80% -15%, color-mix(in srgb, var(--accent) 10%, transparent) 0%, transparent 60%);
+        background-repeat: no-repeat;
         color:var(--ink); min-height:100vh; min-height:100dvh; padding:0 0 calc(78px + env(safe-area-inset-bottom)); max-width:760px; margin:0 auto;
       }
       .mono, .stat-val, .pt-pace, .score-big, .run-meta { font-family:var(--font-mono), monospace; }
@@ -2740,11 +2746,13 @@ function StyleBlock() {
 
       .bottom-nav { position:fixed; left:50%; bottom:0; transform:translateX(-50%); width:100%; max-width:760px; z-index:20;
         display:flex; align-items:stretch; background:color-mix(in srgb, var(--panel) 92%, transparent); backdrop-filter:blur(10px);
-        border-top:1px solid var(--line); padding:6px 4px calc(6px + env(safe-area-inset-bottom)); }
+        border-top:1px solid var(--line); padding:6px 4px calc(6px + env(safe-area-inset-bottom));
+        box-shadow:0 -2px 14px rgba(21,25,43,0.05); }
       .nav-item { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:3px;
         background:none; border:none; padding:5px 2px 3px; color:var(--muted); font-family:inherit; cursor:pointer; transition:.15s; }
       .nav-item:hover { color:var(--ink); }
       .nav-item.nav-active { color:var(--accent); }
+      .nav-item.nav-active svg, .nav-item.nav-active .nav-date { filter:drop-shadow(0 0 6px color-mix(in srgb, var(--accent) 45%, transparent)); }
       .nav-label { font-size:10px; font-weight:600; letter-spacing:0.02em; }
       .nav-date { font-family:var(--font-mono),monospace; font-size:12px; font-weight:600; line-height:1;
         width:22px; height:22px; display:inline-flex; align-items:center; justify-content:center;
@@ -2753,7 +2761,7 @@ function StyleBlock() {
       .content { padding:6px 18px; }
       .stack { display:flex; flex-direction:column; gap:14px; }
 
-      .card { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:18px; }
+      .card { background:var(--panel); border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow:0 2px 14px rgba(21,25,43,0.07); }
       .card h3 { margin:0 0 10px; font-size:16px; font-weight:700; letter-spacing:-0.01em; }
       .card-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; }
       .card-head h3 { margin:0; }
@@ -2761,7 +2769,7 @@ function StyleBlock() {
       .empty { text-align:center; color:var(--muted); padding:34px 18px; }
 
       .review-card { border-left:3px solid var(--line); }
-      .review-accent { border-left-color:var(--accent); }
+      .review-accent { border-left-color:var(--positive); }
       .review-warn { border-left-color:var(--amber); }
       .review-base { border-left-color:var(--line); }
 
@@ -2780,7 +2788,7 @@ function StyleBlock() {
 
       .pill { font-size:11px; font-weight:600; padding:3px 9px; border-radius:999px; white-space:nowrap; }
       .pill-base { background:var(--panel-2); color:var(--muted); border:1px solid var(--line); }
-      .pill-accent { background:color-mix(in srgb, var(--accent) 9%, transparent); color:var(--accent); border:1px solid color-mix(in srgb, var(--accent) 30%, transparent); }
+      .pill-accent { background:color-mix(in srgb, var(--positive) 11%, transparent); color:var(--positive); border:1px solid color-mix(in srgb, var(--positive) 32%, transparent); }
       .pill-hard { background:color-mix(in srgb, var(--coral) 12%, transparent); color:var(--coral); border:1px solid color-mix(in srgb, var(--coral) 30%, transparent); }
       .pill-warn { background:color-mix(in srgb, var(--amber) 10%, transparent); color:var(--amber); border:1px solid color-mix(in srgb, var(--amber) 30%, transparent); }
 
@@ -2799,7 +2807,7 @@ function StyleBlock() {
 
       .week-card.week-current { border-color:var(--accent-dim); }
       .sess-mark { font-family:var(--font-mono),monospace; font-size:13px; font-weight:700; width:22px; height:22px; display:inline-flex; align-items:center; justify-content:center; border-radius:50%; flex-shrink:0; }
-      .sess-mark.done { color:var(--accent); background:color-mix(in srgb, var(--accent) 9%, transparent); border:1px solid color-mix(in srgb, var(--accent) 30%, transparent); }
+      .sess-mark.done { color:var(--positive); background:color-mix(in srgb, var(--positive) 11%, transparent); border:1px solid color-mix(in srgb, var(--positive) 32%, transparent); }
       .sess-mark.miss { color:var(--coral); background:color-mix(in srgb, var(--coral) 10%, transparent); border:1px solid color-mix(in srgb, var(--coral) 25%, transparent); }
 
       .warmup-card { border-color:color-mix(in srgb, var(--accent) 25%, transparent); }
@@ -2808,8 +2816,9 @@ function StyleBlock() {
       .muted { color:var(--muted); font-size:13.5px; line-height:1.55; }
       .small { font-size:12px; }
 
-      .btn-primary { background:var(--accent); color:var(--on-accent); border:none; border-radius:12px; padding:14px;
-        font-family:inherit; font-weight:700; font-size:15px; cursor:pointer; transition:.15s; }
+      .btn-primary { background:var(--accent); color:var(--on-accent); border:none; border-radius:13px; padding:14px;
+        font-family:inherit; font-weight:800; font-size:15px; cursor:pointer; transition:.15s;
+        box-shadow:0 8px 24px color-mix(in srgb, var(--accent) 35%, transparent); }
       .btn-primary:hover { background:color-mix(in srgb, var(--accent) 82%, white); }
       .btn-primary:disabled { opacity:.4; cursor:not-allowed; }
       .btn-ghost { background:transparent; border:1px solid var(--line); color:var(--ink); border-radius:10px;
@@ -2820,7 +2829,7 @@ function StyleBlock() {
       .span-2 { grid-column:1 / -1; }
 
       .fitness-banner { display:flex; align-items:center; gap:14px; justify-content:space-between;
-        background:linear-gradient(135deg, color-mix(in srgb, var(--accent) 8%, transparent), var(--panel)); border-color:color-mix(in srgb, var(--accent) 35%, transparent); flex-wrap:wrap; }
+        background:linear-gradient(135deg, color-mix(in srgb, var(--positive) 9%, transparent), var(--panel)); border-color:color-mix(in srgb, var(--positive) 35%, transparent); flex-wrap:wrap; }
       .fitness-banner p { margin:4px 0 0; }
       .fitness-banner strong { font-size:15px; }
       .fitness-banner .btn-primary { flex-shrink:0; }
@@ -2849,7 +2858,7 @@ function StyleBlock() {
       .warn { color:var(--amber); font-size:13px; }
 
       .slider { -webkit-appearance:none; width:100%; height:8px; border-radius:999px;
-        background:linear-gradient(90deg,var(--coral),var(--amber),var(--accent)); margin:8px 0 4px; }
+        background:linear-gradient(90deg,var(--coral),var(--amber),var(--positive)); margin:8px 0 4px; }
       .slider::-webkit-slider-thumb { -webkit-appearance:none; width:22px; height:22px; border-radius:50%;
         background:var(--panel); border:3px solid var(--ink); cursor:pointer; }
       .slider-ends { display:flex; justify-content:space-between; font-size:11px; color:var(--muted); }
