@@ -1,5 +1,5 @@
 import type { Metadata, Viewport } from "next";
-import { Space_Grotesk, Space_Mono } from "next/font/google";
+import { Figtree } from "next/font/google";
 import "./globals.css";
 
 export const viewport: Viewport = {
@@ -9,17 +9,11 @@ export const viewport: Viewport = {
   viewportFit: "cover",    // safe-area support for the PWA later
 };
 
-// Fieldnote type: Space Grotesk carries display + body (weight does the
-// hierarchy work), Space Mono carries every numeral. Exposed as CSS vars
-// consumed by the StyleBlock in StridePlanner.
-const fontBody = Space_Grotesk({
+// Plainhand type: Figtree carries everything — display, body and numerals.
+// Numbers align via tabular figures (font-variant-numeric in the StyleBlock)
+// rather than a mono face. Exposed as a CSS var consumed by StridePlanner.
+const fontBody = Figtree({
   variable: "--font-body",
-  subsets: ["latin"],
-});
-
-const fontMono = Space_Mono({
-  variable: "--font-mono",
-  weight: ["400", "700"],
   subsets: ["latin"],
 });
 
@@ -41,7 +35,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className={`${fontBody.variable} ${fontMono.variable}`}>
+    <html lang="en" className={fontBody.variable}>
       <body>{children}</body>
     </html>
   );

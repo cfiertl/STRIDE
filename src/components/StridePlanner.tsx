@@ -2711,12 +2711,18 @@ function StyleBlock() {
         --bg: #e9e7e1; --panel: #f5f4ef; --panel-2:#dfdcd3; --line:#c8c4b8;
         --ink:#21201c; --muted:#66635a; --accent:#21201c; --accent-dim:#57544b;
         --coral:#b3402e; --amber:#8f5f14; --on-accent:#f5f4ef;
+        /* Plainhand: one family everywhere; numeral classes keep their
+           --font-mono hook but it resolves to the body face, and alignment
+           comes from tabular figures below. */
         --font-display: var(--font-body);
+        --font-mono: var(--font-body);
         font-family:var(--font-body), sans-serif;
         background: var(--bg);
         color:var(--ink); min-height:100vh; min-height:100dvh; padding:0 0 calc(78px + env(safe-area-inset-bottom)); max-width:760px; margin:0 auto;
       }
       .mono, .stat-val, .pt-pace, .score-big, .run-meta { font-family:var(--font-mono), monospace; }
+      .mono, .stat-val, .pt-pace, .score-big, .run-meta, .session-day, .sess-mark,
+      .wu-time, .meal span, .bar-n, .nav-date, .srow { font-variant-numeric:tabular-nums; }
       .loading { padding:80px 24px; text-align:center; color:var(--muted); font-size:18px; }
 
       .topbar { display:flex; align-items:center; justify-content:space-between; padding:calc(22px + env(safe-area-inset-top)) 22px 8px; }
@@ -2769,7 +2775,7 @@ function StyleBlock() {
       .hero { background:linear-gradient(135deg, var(--panel-2), var(--panel)); }
       .hero-row { display:flex; gap:10px; flex-wrap:wrap; }
       .stat { flex:1; min-width:80px; background:var(--bg); border:1px solid var(--line); border-radius:12px; padding:12px; }
-      .stat-val { font-size:22px; font-weight:600; letter-spacing:-0.02em; }
+      .stat-val { font-size:24px; font-weight:600; letter-spacing:-0.02em; }
       .stat-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em; margin-top:4px; }
 
       .pill { font-size:11px; font-weight:600; padding:3px 9px; border-radius:999px; white-space:nowrap; }
