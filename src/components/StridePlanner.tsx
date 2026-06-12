@@ -791,15 +791,41 @@ const Pill = ({ children, tone }) => (
 
 /* ---------- main app ---------- */
 
-const TABS = [
-  ["today", "Today"],
+// Bottom-nav items, left to right. Today sits in the center; its icon is the
+// day-of-month tile rather than a glyph. `log` and `setup` are still valid tab
+// values — log is reached from Today, setup from the top-right avatar.
+const NAV_ITEMS = [
   ["plan", "Plan"],
-  ["log", "Log Run"],
-  ["activity", "Activity"],
+  ["activity", "Activities"],
+  ["today", "Today"],
   ["fuel", "Fuel"],
   ["insights", "Insights"],
-  ["setup", "Setup"],
 ];
+
+// Inline nav glyphs — stroke follows the item's text colour via currentColor.
+const NAV_ICONS = {
+  plan: (
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M8 6h12M8 12h12M8 18h12" />
+      <path d="M4 6h.01M4 12h.01M4 18h.01" />
+    </svg>
+  ),
+  activity: (
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M3 12h4l3-8 4 16 3-8h4" />
+    </svg>
+  ),
+  fuel: (
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M13 2 4 14h6l-1 8 9-12h-6l1-8z" />
+    </svg>
+  ),
+  insights: (
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M5 20V12M12 20V4M19 20v-6" />
+    </svg>
+  ),
+};
 
 export default function App() {
   const [loaded, setLoaded] = useState(false);
@@ -810,6 +836,54 @@ export default function App() {
   const [cross, setCross] = useState([]);
   const [fuel, setFuel] = useState([]);
   const [selectedActivityId, setSelectedActivityId] = useState(null);
+
+  /* --- URL <-> activity-detail sync (History API, see docs/UI_overhaul.md §2.4).
+     Only the activity-detail dimension lives in the URL: /?activity=<uuid>.
+     Tabs stay component state. --- */
+
+  const openActivity = useCallback((id) => {
+    setSelectedActivityId(id);
+    setTab("activity");
+    window.history.pushState({ strideActivity: id }, "", "/?activity=" + id);
+  }, []);
+
+  // In-app back from a detail. If we pushed the entry ourselves, pop it so the
+  // browser stack stays honest; on a deep-link/refresh entry there is nothing
+  // to pop, so just clean the URL in place.
+  const closeActivity = useCallback(() => {
+    if (window.history.state && window.history.state.strideActivity) {
+      window.history.back();
+    } else {
+      window.history.replaceState(null, "", "/");
+      setSelectedActivityId(null);
+    }
+  }, []);
+
+  // Leaving the activity context via the nav or brand: clear the selection and
+  // strip the param without growing the history stack.
+  const clearActivityParam = useCallback(() => {
+    setSelectedActivityId(null);
+    if (new URLSearchParams(window.location.search).get("activity")) {
+      window.history.replaceState(null, "", "/");
+    }
+  }, []);
+
+  // Deep link on load (refresh / notification URL) + back/forward gestures.
+  useEffect(() => {
+    const syncFromUrl = () => {
+      const id = new URLSearchParams(window.location.search).get("activity");
+      if (id) {
+        setSelectedActivityId(id);
+        setTab("activity");
+      } else {
+        setSelectedActivityId(null);
+      }
+    };
+    syncFromUrl();
+    window.addEventListener("popstate", syncFromUrl);
+    return () => window.removeEventListener("popstate", syncFromUrl);
+  }, []);
+
   const reloadRuns = useCallback(async () => {
     const r = await loadRuns();
     setRuns(r);
@@ -868,8 +942,7 @@ export default function App() {
         await saveCompletion(saved.id, run.plannedWeek, run.plannedDay);
       }
       setRuns((prev) => [saved, ...prev]);
-      setSelectedActivityId(saved.id);   // open the new run...
-      setTab("activity");                // ...on its detail page
+      openActivity(saved.id); // open the new run on its detail page
     } catch (e) {
       console.error("add run failed", e);
     }
@@ -932,7 +1005,7 @@ useEffect(() => {
     <div className="wrap">
       <StyleBlock />
       <header className="topbar">
-        <div className="brand" role="button" tabIndex={0} onClick={() => { setTab("today"); setSelectedActivityId(null); }} style={{ cursor: "pointer" }}>
+        <div className="brand" role="button" tabIndex={0} onClick={() => { setTab("today"); clearActivityParam(); }} style={{ cursor: "pointer" }}>
           <svg className="logo" viewBox="0 0 64 64" aria-label="Stride logo">
             <g fill="none" stroke="var(--accent)" strokeWidth="6.5" strokeLinecap="round">
               <path d="M16 24 L23 13" />
@@ -942,16 +1015,30 @@ useEffect(() => {
           </svg>
           <span className="brand-word">STRIDE<span className="brand-dot">.</span></span>
         </div>
-        {profile && profile.name ? <div className="hello">Hi, {profile.name}</div> : null}
+        <div className="top-right">
+          {profile && profile.name ? <div className="hello">Hi, {profile.name}</div> : null}
+          <button className="avatar-btn" aria-label="Setup" title="Setup" onClick={() => { setTab("setup"); clearActivityParam(); }}>
+            {profile && profile.name ? profile.name.trim()[0].toUpperCase() : (
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true">
+                <circle cx="12" cy="8" r="3.5" />
+                <path d="M5 20c1.2-3.2 3.8-5 7-5s5.8 1.8 7 5" />
+              </svg>
+            )}
+          </button>
+        </div>
       </header>
 
-      <nav className="tabs">
-        {TABS.map(([id, label]) => (
+      <nav className="bottom-nav" aria-label="Primary">
+        {NAV_ITEMS.map(([id, label]) => (
           <button
             key={id}
-            className={`tab ${tab === id ? "tab-active" : ""}`}
-            onClick={() => { setTab(id); setSelectedActivityId(null); }}          >
-            {label}
+            className={`nav-item ${tab === id ? "nav-active" : ""}`}
+            onClick={() => { setTab(id); clearActivityParam(); }}
+          >
+            {id === "today"
+              ? <span className="nav-date">{String(new Date().getDate()).padStart(2, "0")}</span>
+              : NAV_ICONS[id]}
+            <span className="nav-label">{label}</span>
           </button>
         ))}
       </nav>
@@ -959,10 +1046,15 @@ useEffect(() => {
       <main className="content">
         {tab === "today" && <Today profile={profile} plan={plan} runs={runs} zones={zones} go={setTab} onUpdateFitness={updateFitness} />}
         {tab === "plan" && <PlanView plan={plan} zones={zones} profile={profile} />}
-        {tab === "log" && <LogRun profile={profile} zones={zones} onSave={addRun} fuel={fuel} />}
+        {tab === "log" && (
+          <div className="stack">
+            <button className="btn-ghost back-btn" onClick={() => setTab("today")}>‹ Back to today</button>
+            <LogRun profile={profile} zones={zones} onSave={addRun} fuel={fuel} />
+          </div>
+        )}
         {tab === "activity" && (selectedActivityId
-          ? <ActivityDetail activityId={selectedActivityId} profile={profile} onBack={() => setSelectedActivityId(null)} onScored={reloadRuns} />
-          : <Activity runs={runs} cross={cross} onDelRun={delRun} onAddCross={addCross} onReloadRuns={reloadRuns} onOpenRun={setSelectedActivityId} zones={zones} />)}        
+          ? <ActivityDetail activityId={selectedActivityId} profile={profile} onBack={closeActivity} onScored={reloadRuns} />
+          : <Activity runs={runs} cross={cross} onDelRun={delRun} onAddCross={addCross} onReloadRuns={reloadRuns} onOpenRun={openActivity} zones={zones} />)}
         {tab === "fuel" && <FuelView fuel={fuel} onSave={addFuel} runs={runs} />}
         {tab === "insights" && <Insights runs={runs} fuel={fuel} zones={zones} profile={profile} />}
         {tab === "setup" && <Setup profile={profile} onSave={saveProfile} zones={zones} runs={runs} />}      
@@ -2620,26 +2712,35 @@ function StyleBlock() {
         --coral:#ff6b5e; --amber:#ffc24b;
         font-family:'Bricolage Grotesque', sans-serif;
         background: radial-gradient(1200px 600px at 80% -10%, #1a221b 0%, var(--bg) 55%);
-        color:var(--ink); min-height:100vh; min-height:100dvh; padding:0 0 calc(60px + env(safe-area-inset-bottom)); max-width:760px; margin:0 auto;
+        color:var(--ink); min-height:100vh; min-height:100dvh; padding:0 0 calc(78px + env(safe-area-inset-bottom)); max-width:760px; margin:0 auto;
       }
       .mono, .stat-val, .pt-pace, .score-big, .run-meta { font-family:'JetBrains Mono', monospace; }
       .loading { padding:80px 24px; text-align:center; color:var(--muted); font-size:18px; }
 
-      .topbar { display:flex; align-items:baseline; justify-content:space-between; padding:calc(22px + env(safe-area-inset-top)) 22px 8px; }
+      .topbar { display:flex; align-items:center; justify-content:space-between; padding:calc(22px + env(safe-area-inset-top)) 22px 8px; }
       .brand { font-weight:800; font-size:26px; letter-spacing:-0.04em; display:flex; align-items:center; gap:9px; }
       .logo { height:34px; width:34px; flex-shrink:0; filter:drop-shadow(0 0 10px rgba(202,255,94,0.25)); }
       .brand-word { line-height:1; }
       .brand-dot { color:var(--accent); }
       .brand-sub { font-weight:400; font-size:12px; color:var(--muted); margin-left:2px; letter-spacing:0.04em; text-transform:uppercase; align-self:flex-end; padding-bottom:3px; }
       .hello { color:var(--muted); font-size:14px; }
+      .top-right { display:flex; align-items:center; gap:10px; }
+      .avatar-btn { width:34px; height:34px; border-radius:50%; background:var(--panel); border:1px solid var(--line);
+        color:var(--ink); font-family:inherit; font-size:14px; font-weight:700; display:inline-flex; align-items:center;
+        justify-content:center; cursor:pointer; flex-shrink:0; transition:.15s; }
+      .avatar-btn:hover { border-color:var(--accent-dim); }
 
-      .tabs { display:flex; gap:6px; overflow-x:auto; padding:8px 18px 14px; position:sticky; top:0; z-index:5;
-        background:linear-gradient(var(--bg), rgba(13,15,14,0.85)); backdrop-filter:blur(8px); }
-      .tabs::-webkit-scrollbar { display:none; }
-      .tab { white-space:nowrap; border:1px solid var(--line); background:var(--panel); color:var(--muted);
-        padding:8px 14px; border-radius:999px; font-family:inherit; font-size:13px; font-weight:600; cursor:pointer; transition:.15s; }
-      .tab:hover { color:var(--ink); }
-      .tab-active { background:var(--accent); color:#10130d; border-color:var(--accent); }
+      .bottom-nav { position:fixed; left:50%; bottom:0; transform:translateX(-50%); width:100%; max-width:760px; z-index:20;
+        display:flex; align-items:stretch; background:rgba(22,26,24,0.92); backdrop-filter:blur(10px);
+        border-top:1px solid var(--line); padding:6px 4px calc(6px + env(safe-area-inset-bottom)); }
+      .nav-item { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:3px;
+        background:none; border:none; padding:5px 2px 3px; color:var(--muted); font-family:inherit; cursor:pointer; transition:.15s; }
+      .nav-item:hover { color:var(--ink); }
+      .nav-item.nav-active { color:var(--accent); }
+      .nav-label { font-size:10px; font-weight:600; letter-spacing:0.02em; }
+      .nav-date { font-family:'JetBrains Mono',monospace; font-size:12px; font-weight:600; line-height:1;
+        width:22px; height:22px; display:inline-flex; align-items:center; justify-content:center;
+        border:1.5px solid currentColor; border-radius:6px; }
 
       .content { padding:6px 18px; }
       .stack { display:flex; flex-direction:column; gap:14px; }
@@ -2656,7 +2757,7 @@ function StyleBlock() {
       .review-warn { border-left-color:var(--amber); }
       .review-base { border-left-color:var(--line); }
 
-      .toast { position:fixed; left:50%; bottom:88px; transform:translateX(-50%); z-index:1000; display:flex; align-items:center; gap:12px; max-width:calc(100% - 32px); width:max-content; padding:12px 14px; background:var(--panel); border:1px solid rgba(202,255,94,0.35); border-radius:12px; box-shadow:0 8px 28px rgba(0,0,0,0.5); color:var(--ink); font-size:14px; line-height:1.4; animation:toast-in 0.25s ease-out; }
+      .toast { position:fixed; left:50%; bottom:calc(78px + env(safe-area-inset-bottom)); transform:translateX(-50%); z-index:1000; display:flex; align-items:center; gap:12px; max-width:calc(100% - 32px); width:max-content; padding:12px 14px; background:var(--panel); border:1px solid rgba(202,255,94,0.35); border-radius:12px; box-shadow:0 8px 28px rgba(0,0,0,0.5); color:var(--ink); font-size:14px; line-height:1.4; animation:toast-in 0.25s ease-out; }
       .toast span { flex:1; }
       .toast .link-btn { flex-shrink:0; background:none; border:none; padding:0; color:var(--accent); font-size:14px; font-weight:600; cursor:pointer; white-space:nowrap; }
       .toast .toast-close { flex-shrink:0; background:none; border:none; padding:0 2px; color:var(--muted); font-size:16px; line-height:1; cursor:pointer; }
