@@ -1,21 +1,25 @@
 import type { Metadata, Viewport } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Space_Grotesk, Space_Mono } from "next/font/google";
 import "./globals.css";
 
 export const viewport: Viewport = {
-  themeColor: "#0d0f0e",
+  themeColor: "#e9e7e1",
   width: "device-width",   // pin layout width to the actual screen
   initialScale: 1,         // render at 1:1, no zoom-to-fit
   viewportFit: "cover",    // safe-area support for the PWA later
 };
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
+// Fieldnote type: Space Grotesk carries display + body (weight does the
+// hierarchy work), Space Mono carries every numeral. Exposed as CSS vars
+// consumed by the StyleBlock in StridePlanner.
+const fontBody = Space_Grotesk({
+  variable: "--font-body",
   subsets: ["latin"],
 });
 
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
+const fontMono = Space_Mono({
+  variable: "--font-mono",
+  weight: ["400", "700"],
   subsets: ["latin"],
 });
 
@@ -37,7 +41,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className={`${geistSans.variable} ${geistMono.variable}`}>
+    <html lang="en" className={`${fontBody.variable} ${fontMono.variable}`}>
       <body>{children}</body>
     </html>
   );

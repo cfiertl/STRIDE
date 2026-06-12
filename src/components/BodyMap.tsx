@@ -36,7 +36,7 @@ const SIL_PATH =
   "C150,489 151,490 150,492 L122,492 C120,492 120,488 120,484 C120,478 121,470 122,460 " +
   "C124,440 125,420 125,400 C125,384 124,366 123,348 C122,326 121,304 120,288 Z";
 
-const SIL = "#6e766c";
+const SIL = "var(--line)";
 const VB_W = 430;
 
 type Side = "L" | "R";
@@ -174,21 +174,21 @@ export default function BodyMap({
     const top = active.y - 30;
     return (
       <g pointerEvents="none">
-        <rect x={cx - w / 2} y={top} width={w} height={22} rx={6} fill="#0d0f0e" style={{ stroke: "var(--accent, #caff5e)" }} strokeOpacity={0.6} />
-        <text x={cx} y={top + 15} fill="#e8efe6" fontSize={13} textAnchor="middle">{active.label}</text>
+        <rect x={cx - w / 2} y={top} width={w} height={22} rx={6} fill="var(--ink)" style={{ stroke: "var(--accent)" }} strokeOpacity={0.6} />
+        <text x={cx} y={top + 15} fill="var(--bg)" fontSize={13} textAnchor="middle">{active.label}</text>
       </g>
     );
   })();
 
   const styleTag = (
     <style>{`
-        .bm-e { fill: transparent; stroke: #8b958d; stroke-opacity: .28; stroke-width: 1.2; cursor: pointer; transition: fill .12s, stroke .12s; outline: none; }
-        .bm-e:focus-visible { stroke: var(--accent, #caff5e); stroke-opacity: .9; }
+        .bm-e { fill: transparent; stroke: var(--muted); stroke-opacity: .35; stroke-width: 1.2; cursor: pointer; transition: fill .12s, stroke .12s; outline: none; }
+        .bm-e:focus-visible { stroke: var(--accent); stroke-opacity: .9; }
         @media (hover: hover) {
-          .bm-e:hover { stroke: var(--accent, #caff5e); stroke-opacity: .85; fill: var(--accent, #caff5e); fill-opacity: .10; }
+          .bm-e:hover { stroke: var(--accent); stroke-opacity: .85; fill: var(--accent); fill-opacity: .10; }
         }
-        .bm-e.on { fill: #ff6b5e; fill-opacity: .55; stroke: #ff6b5e; stroke-opacity: .95; }
-        .bm-mark { fill: #8b958d; opacity: .6; font-size: 13px; font-weight: 500; text-anchor: middle; pointer-events: none; }
+        .bm-e.on { fill: var(--coral); fill-opacity: .55; stroke: var(--coral); stroke-opacity: .95; }
+        .bm-mark { fill: var(--muted); opacity: .6; font-size: 13px; font-weight: 500; text-anchor: middle; pointer-events: none; }
         .bm-head:hover { opacity: .85; }
       `}</style>
   );
@@ -197,8 +197,8 @@ export default function BodyMap({
     <svg viewBox={`0 0 ${VB_W} 520`} xmlns="http://www.w3.org/2000/svg" style={{ width: "100%", height: "auto", display: "block", maxWidth: VB_W }}>
       <Figure regions={FRONT_REGIONS} offset={{ x: 8, y: 6 }} leftMark="R" rightMark="L" selected={selected} onEnter={onEnter} onLeave={onLeave} onDown={onDown} onActivate={onActivate} />
       <Figure regions={BACK_REGIONS} offset={{ x: 210, y: 6 }} leftMark="L" rightMark="R" selected={selected} onEnter={onEnter} onLeave={onLeave} onDown={onDown} onActivate={onActivate} />
-      <text x={128} y={514} fill="#8b958d" fontSize={13} textAnchor="middle">front</text>
-      <text x={338} y={514} fill="#8b958d" fontSize={13} textAnchor="middle">back</text>
+      <text x={128} y={514} fill="var(--muted)" fontSize={13} textAnchor="middle">front</text>
+      <text x={338} y={514} fill="var(--muted)" fontSize={13} textAnchor="middle">back</text>
       {tip}
     </svg>
   );
@@ -206,19 +206,19 @@ export default function BodyMap({
   const chipsEl = (
     <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 14, minHeight: 30 }}>
       {selected.length === 0 ? (
-        <span style={{ color: "#8b958d", fontSize: 13 }}>No areas selected</span>
+        <span style={{ color: "var(--muted)", fontSize: 13 }}>No areas selected</span>
       ) : (
         selected.map((a) => (
           <span
             key={a}
-            style={{ display: "inline-flex", alignItems: "center", gap: 6, background: "rgba(255,107,94,.15)", color: "#ff6b5e", border: "1px solid rgba(255,107,94,.5)", borderRadius: 999, padding: "5px 6px 5px 12px", fontSize: 13 }}
+            style={{ display: "inline-flex", alignItems: "center", gap: 6, background: "color-mix(in srgb, var(--coral) 12%, transparent)", color: "var(--coral)", border: "1px solid color-mix(in srgb, var(--coral) 50%, transparent)", borderRadius: 999, padding: "5px 6px 5px 12px", fontSize: 13 }}
           >
             {a}
             <button
               type="button"
               aria-label={"Remove " + a}
               onClick={() => onToggle(a)}
-              style={{ all: "unset", cursor: "pointer", display: "inline-flex", width: 18, height: 18, alignItems: "center", justifyContent: "center", borderRadius: "50%", color: "#ff6b5e", fontSize: 14, lineHeight: 1 }}
+              style={{ all: "unset", cursor: "pointer", display: "inline-flex", width: 18, height: 18, alignItems: "center", justifyContent: "center", borderRadius: "50%", color: "var(--coral)", fontSize: 14, lineHeight: 1 }}
             >
               ×
             </button>
@@ -240,14 +240,14 @@ export default function BodyMap({
           style={{ display: "flex", width: "100%", alignItems: "center", justifyContent: "space-between", background: "transparent", border: "none", padding: "4px 0", cursor: "pointer", color: "inherit", font: "inherit", textAlign: "left" }}
         >
           <span style={{ fontSize: 15, fontWeight: 500 }}>{label}</span>
-          <span style={{ display: "inline-flex", alignItems: "center", gap: 8, color: "#8b958d", fontSize: 13 }}>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 8, color: "var(--muted)", fontSize: 13 }}>
             {!open && selected.length > 0 && (
               <span>{selected.length} area{selected.length > 1 ? "s" : ""}</span>
             )}
             <span style={{ display: "inline-block", fontSize: 16, transform: open ? "rotate(90deg)" : "none", transition: "transform .15s" }}>›</span>
           </span>
         </button>
-        {open && note && <p style={{ color: "#8b958d", fontSize: 13, margin: "6px 0 0" }}>{note}</p>}
+        {open && note && <p style={{ color: "var(--muted)", fontSize: 13, margin: "6px 0 0" }}>{note}</p>}
         {open && svgEl}
         {(open || selected.length > 0) && chipsEl}
       </div>

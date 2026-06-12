@@ -3,13 +3,6 @@
   --foreground: #171717;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
 /* was: html { height: 100% }  — that + overflow-x:hidden made <html> a
    fixed viewport-height scroll box, clipping the app on mobile. Gone. */
 
@@ -24,7 +17,7 @@ body {
   min-height: 100dvh;        /* dvh tracks the real visible area incl. iOS toolbars */
   /* removed: display:flex; flex-direction:column — let the app own its layout */
   color: var(--foreground);
-  background: #0d0f0e;        /* match app bg so iOS overscroll bounce isn't a white flash */
+  background: #e9e7e1;        /* match app bg so iOS overscroll bounce isn't a flash */
   font-family: Arial, Helvetica, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -41,8 +34,8 @@ a {
   text-decoration: none;
 }
 
-@media (prefers-color-scheme: dark) {
-  html {
-    color-scheme: dark;
-  }
+/* The app theme is light regardless of OS preference; keep form controls,
+   scrollbars and UA chrome light to match. */
+html {
+  color-scheme: light;
 }
