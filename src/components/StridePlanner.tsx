@@ -7,6 +7,7 @@ import { ComposedChart, Line, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, 
 import dynamic from "next/dynamic";
 import BodyMap from "@/components/BodyMap";
 import PushToggle from "@/components/PushToggle";
+import SignOutButton from "@/components/SignOutButton";
 const RouteMap = dynamic(() => import("@/components/RouteMap"), { ssr: false, loading: () => <div className="card muted small">Loading map…</div> });
 
 /* ============================================================
@@ -134,6 +135,13 @@ function addDays(iso, n) {
 }
 function dowName(iso) { return DOW[new Date(`${iso}T12:00:00`).getDay()]; }
 
+// The Monday on or before `iso`. Plan weeks are Monday→Sunday calendar weeks,
+// so the first week can be partial (only the run days from the start date on).
+function mondayOf(iso) {
+  const dow = new Date(`${iso}T12:00:00`).getDay(); // Sun=0..Sat=6
+  return addDays(iso, -((dow + 6) % 7));
+}
+
 // Given a 7-day block starting at weekStartISO, the date of weekday `day`
 // (e.g. "Tue") that falls inside [weekStart, weekStart+6].
 function dateForDayInWeek(weekStartISO, day) {
@@ -161,7 +169,11 @@ function generatePlan(profile) {
   const { goalDistanceKm, goalDate, currentWeeklyKm, daysPerWeek } = profile;
   if (!goalDistanceKm || !goalDate || !currentWeeklyKm) return [];
   const start = profile.planStartDate || todayISO();
-  const totalWeeks = Math.min(24, Math.max(4, weeksBetween(start, goalDate)));
+  // Plan weeks are Monday→Sunday calendar weeks. Week 1 begins on the start
+  // date but only spans to that week's Sunday, so it can be partial.
+  const firstMonday = mondayOf(start);
+  const spanDays = Math.round((new Date(`${goalDate}T12:00:00`) - new Date(`${firstMonday}T12:00:00`)) / DAY_MS);
+  const totalWeeks = Math.min(24, Math.max(4, Math.ceil(spanDays / 7)));
   const days = Math.min(6, Math.max(2, daysPerWeek || 4));
 
   // which weekdays the runner uses + which is the long run
@@ -187,8 +199,8 @@ function generatePlan(profile) {
       vol = vol * 1.10;
     }
     const weekVol = Math.round(vol);
-    const weekStart = addDays(start, w * 7);
-    weeks.push(buildWeek(w, totalWeeks, weekVol, goalDistanceKm, days, isTaper, cutback, sched, weekStart, overrides));
+    const weekStart = addDays(firstMonday, w * 7);
+    weeks.push(buildWeek(w, totalWeeks, weekVol, goalDistanceKm, days, isTaper, cutback, sched, weekStart, overrides, start, w === 0));
   }
   return weeks;
 }
@@ -222,7 +234,7 @@ function peakVol(start, buildWeeks) {
   return v;
 }
 
-function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, weekStart, overrides) {
+function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, weekStart, overrides, start, isFirst) {
   // long run grows toward ~ goalKm (capped for safety) but eased in taper
   const longCap = goalKm <= 10 ? goalKm * 1.0 : goalKm <= 21.1 ? goalKm * 0.95 : goalKm * 0.80;
   const progress = Math.min(1, (idx + 1) / Math.max(1, total - 2));
@@ -249,7 +261,7 @@ function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, w
   // user override (a moved date, or "skipped"). origDay is the generated day —
   // the stable key overrides are stored against.
   const week = idx + 1;
-  const sessions = slots.map((s) => {
+  let sessions = slots.map((s) => {
     const origDay = s.day;
     const ov = overrides[`${week}:${origDay}`];
     let date = dateForDayInWeek(weekStart, origDay);
@@ -258,12 +270,21 @@ function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, w
     else if (typeof ov === "string" && ov) date = ov;
     return { ...s, origDay, day: dowName(date), date, skipped };
   });
+
+  // First (partial) week: drop any run day that falls before the start date,
+  // and scale the volume target to the days that actually remain.
+  let volume = weekVol;
+  if (isFirst) {
+    const full = sessions.length;
+    sessions = sessions.filter((s) => s.date >= start);
+    if (full > 0 && sessions.length < full) volume = Math.round(weekVol * sessions.length / full);
+  }
   sessions.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 
   return {
     week,
     weekStart,
-    volume: weekVol,
+    volume,
     label: isTaper ? "Taper" : cutback ? "Recovery week" : idx === 0 ? "Base" : "Build",
     sessions,
   };
@@ -274,11 +295,11 @@ function sessionDescription(s, zones) {
   const paceStr = pz ? `${fmtPace(pz[0])}–${fmtPace(pz[1])}` : "by feel";
   if (s.type === "tempo") {
     const tp = zones && zones.tempo;
-    return { title: "Tempo / Threshold", detail: `15min easy w/u → 20–25min @ ${tp ? fmtPace(tp[1]) + "–" + fmtPace(tp[0]) : "comfortably hard"} → 10min easy c/d` };
+    return { title: "Tempo / Threshold", detail: `15min easy warm-up, then 20–25min @ ${tp ? fmtPace(tp[1]) + "–" + fmtPace(tp[0]) : "comfortably hard"}, then 10min easy cool-down.` };
   }
   if (s.type === "interval") {
     const ip = zones && zones.interval;
-    return { title: "Intervals (VO2)", detail: `15min easy w/u + strides → 5 × 3min @ ${ip ? fmtPace(ip[1]) : "hard"} w/ 90s jog → 10min easy c/d` };
+    return { title: "Intervals (VO2)", detail: `15min easy warm-up with strides, then 5 × 3min @ ${ip ? fmtPace(ip[1]) : "hard"} with 90s jog between, then 10min easy cool-down.` };
   }
   if (s.type === "long") {
     const lp = zones && zones.long;
@@ -754,6 +775,17 @@ async function deleteCompletion(activityId) {
   if (error) throw error;
 }
 
+// Unlink every run from the (old) plan. Used when a new plan is generated —
+// the old week/day slots no longer line up, so the linkages are wiped. The runs
+// themselves (activities + run_logs) are untouched; only the plan linkage goes.
+async function clearCompletions() {
+  const supabase = sb();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return;
+  const { error } = await supabase.from("session_completions").delete().eq("user_id", user.id);
+  if (error) console.error("clear completions failed", error);
+}
+
 // delete one run by activity id; run_log cascades via activity_id FK.
 async function deleteRun(id) {
   const supabase = sb();
@@ -1194,7 +1226,7 @@ useEffect(() => {
           : <Activity runs={runs} cross={cross} onDelRun={delRun} onAddCross={addCross} onReloadRuns={reloadRuns} onOpenRun={openActivity} zones={zones} />)}
         {tab === "fuel" && <FuelView fuel={fuel} onSave={addFuel} runs={runs} />}
         {tab === "insights" && <Insights runs={runs} fuel={fuel} zones={zones} profile={profile} />}
-        {tab === "setup" && <Setup profile={profile} onSave={saveProfile} zones={zones} runs={runs} />}      
+        {tab === "setup" && <Setup profile={profile} onSave={saveProfile} zones={zones} runs={runs} onPlanReset={async () => { await clearCompletions(); reloadRuns(); }} />}
       </main>
        {paceToast && (
         <div className="toast" role="status">
@@ -1306,7 +1338,7 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness }) {
                       <div className="session-title">{d.title}</div>
                       <div className="session-detail">{d.detail}</div>
                     </div>
-                    {s.skipped ? <Pill tone="base">skipped</Pill> : s.quality && <Pill tone="hard">quality</Pill>}
+                    {s.skipped && <Pill tone="base">skipped</Pill>}
                     {isDone && <span className="sess-mark done">✓</span>}
                   </div>
                 );
@@ -1432,7 +1464,7 @@ function WarmupTimer() {
 /* ---------- PLAN ---------- */
 
 function PlanView({ plan, zones, profile, onReschedule }) {
-  const [open, setOpen] = useState(null);
+  const [openOverride, setOpenOverride] = useState({}); // month key -> open?
   const [editing, setEditing] = useState(null); // "week:origDay" of the session being moved/skipped
   const [done, setDone] = useState(() => new Set());
 
@@ -1447,8 +1479,36 @@ function PlanView({ plan, zones, profile, onReschedule }) {
   if (!profile) return <Empty msg="Set your goal in Setup to generate a plan." />;
   if (!plan.length) return <Empty msg="No plan yet — check your goal date in Setup." />;
 
+  const planStart = profile.planStartDate || todayISO();
   const cur = currentWeek(profile, plan);
   const curNum = cur ? cur.week : 1;
+  const now = new Date();
+  const todayKey = `${now.getFullYear()}-${now.getMonth()}`;
+  const nowYear = now.getFullYear();
+
+  // Flatten the dated sessions and group them by calendar month — same
+  // expandable month-group styling as the Activities tab.
+  const months = [];
+  plan.forEach((w) => {
+    w.sessions.forEach((s) => {
+      const dt = new Date(`${s.date}T12:00:00`);
+      const key = `${dt.getFullYear()}-${dt.getMonth()}`;
+      let g = months.find((m) => m.key === key);
+      if (!g) {
+        const label = dt.toLocaleDateString(undefined, { month: "long" }) + (dt.getFullYear() !== nowYear ? ` ${dt.getFullYear()}` : "");
+        g = { key, label, items: [], km: 0, count: 0 };
+        months.push(g);
+      }
+      g.items.push({ s, w });
+      if (!s.skipped) { g.count += 1; g.km += s.km || 6; } // quality runs ~6km
+    });
+  });
+  months.sort((a, b) => (a.key < b.key ? -1 : 1));
+
+  // Open the current month by default, or the first month if the plan is all future.
+  const defaultOpenKey = months.some((m) => m.key === todayKey) ? todayKey : (months[0] && months[0].key);
+  const isMonthOpen = (key) => (key in openOverride ? openOverride[key] : key === defaultOpenKey);
+  const toggleMonth = (key) => setOpenOverride((o) => ({ ...o, [key]: !isMonthOpen(key) }));
 
   return (
     <div className="stack">
@@ -1456,12 +1516,12 @@ function PlanView({ plan, zones, profile, onReschedule }) {
         <h3>{profile.goalLabel || `${profile.goalDistanceKm}km`} · {plan.length}-week plan</h3>
         <p className="muted">
           Built on the 80/20 principle: most running easy, a controlled dose of hard. Volume rises
-          ~10%/week with a recovery week every 4th, then a taper. Tap a week for sessions.
+          ~10%/week with a recovery week every 4th, then a taper. Tap a month, then a run to move or skip it.
         </p>
       </section>
 
       <section className="card warmup-card">
-        <h3>🔑 Warm-up — do this before every quality session & race</h3>
+        <h3>🔑 Warm-up — do this before every hard session & race</h3>
         <p className="muted">
           That "takes 4–5km to feel decent" thing is your body warming up. So don't spend race day
           or a hard session doing it at speed — warm up first and start <strong>already warm</strong>.
@@ -1470,95 +1530,95 @@ function PlanView({ plan, zones, profile, onReschedule }) {
         <WarmupTimer />
       </section>
 
-      {plan.map((w) => {
-        const active = w.sessions.filter((s) => !s.skipped);
-        const total = active.length;
-        const doneCount = active.filter((s) => done.has(`${w.week}:${s.day}`)).length;
-        const isPast = w.week < curNum;
-        const showCount = (isPast || w.week === curNum) && doneCount > 0;
-        const range = `${fmtShortDate(w.weekStart)} – ${fmtShortDate(addDays(w.weekStart, 6))}`;
-        const blockDays = Array.from({ length: 7 }, (_, k) => addDays(w.weekStart, k));
-        return (
-          <section key={w.week} className={`card week-card ${w.week === curNum ? "week-current" : ""}`}>
-            <div className="card-head clickable" onClick={() => setOpen(open === w.week ? null : w.week)}>
-              <div className="wk-head-l">
-                <h3>Week {w.week} <span className="muted">· {w.label}</span></h3>
-                <div className="muted small wk-range">{range}</div>
-              </div>
-              <div className="row-gap">
-                <Pill tone="accent">{w.volume}km</Pill>
-                {showCount && <Pill tone="base">{doneCount}/{total} done</Pill>}
-                <span className="chev">{open === w.week ? "▾" : "▸"}</span>
-              </div>
-            </div>
-            {open === w.week && (
-              <div className="sessions">
-                {w.sessions.map((s, i) => {
-                  const d = sessionDescription(s, zones);
-                  const isDone = !s.skipped && done.has(`${w.week}:${s.day}`);
-                  const isMissed = !s.skipped && isPast && !isDone;
-                  const key = `${w.week}:${s.origDay}`;
-                  const isEditing = editing === key;
-                  return (
-                    <div key={i} className="session-wrap">
-                      <div
-                        className={`session clickable ${s.skipped ? "session-skipped" : ""}`}
-                        onClick={() => setEditing(isEditing ? null : key)}
-                      >
-                        <div className="session-day">
-                          <span className="sd-dow">{dowName(s.date)}</span>
-                          <span className="sd-num">{Number(s.date.slice(8, 10))}</span>
-                        </div>
-                        <div className="session-body">
-                          <div className="session-title">{d.title}</div>
-                          <div className="session-detail">{d.detail}</div>
-                        </div>
-                        {s.skipped ? <Pill tone="base">skipped</Pill> : s.quality && <Pill tone="hard">quality</Pill>}
-                        {isDone && <span className="sess-mark done">✓</span>}
-                        {isMissed && <span className="sess-mark miss">✕</span>}
-                        <span className="sess-edit">{isEditing ? "▾" : "⋯"}</span>
-                      </div>
-                      {isEditing && (
-                        <div className="sess-editor">
-                          {s.skipped ? (
-                            <p className="muted small" style={{ margin: "0 0 8px" }}>This run is skipped — it won't count toward your week.</p>
-                          ) : (
-                            <>
-                              <div className="sess-editor-lbl">Move to</div>
-                              <div className="day-picker">
-                                {blockDays.map((iso) => (
-                                  <button
-                                    key={iso}
-                                    className={`day-chip ${iso === s.date ? "on" : ""}`}
-                                    onClick={() => { onReschedule(w.week, s.origDay, iso); setEditing(null); }}
-                                  >
-                                    <span className="dc-dow">{dowName(iso)}</span>
-                                    <span className="dc-num">{Number(iso.slice(8, 10))}</span>
-                                  </button>
-                                ))}
-                              </div>
-                            </>
-                          )}
-                          <div className="sess-editor-actions">
-                            {s.skipped ? (
-                              <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, null); setEditing(null); }}>Un-skip</button>
-                            ) : (
-                              <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, "skipped"); setEditing(null); }}>Skip this run</button>
-                            )}
-                            {(s.date !== dateForDayInWeek(w.weekStart, s.origDay) || s.skipped) && (
-                              <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, null); setEditing(null); }}>Reset</button>
-                            )}
+      <section className="card">
+        <h3>Schedule</h3>
+        {months.map((g) => {
+          const open = isMonthOpen(g.key);
+          return (
+            <div key={g.key} className="run-group">
+              <button className="run-group-head" onClick={() => toggleMonth(g.key)}>
+                <span className="run-group-chev">{open ? "▾" : "▸"}</span>
+                <span className="run-group-label">{g.label}</span>
+                <span className="run-group-meta muted small">{g.count} {g.count === 1 ? "run" : "runs"}{g.km > 0 ? ` · ${g.km.toFixed(0)}km` : ""}</span>
+              </button>
+              {open && (
+                <div className="sessions" style={{ marginTop: 8 }}>
+                  {g.items.map(({ s, w }, i) => {
+                    const showWeekHead = i === 0 || g.items[i - 1].w.week !== w.week;
+                    const range = `${fmtShortDate(w.weekStart)} – ${fmtShortDate(addDays(w.weekStart, 6))}`;
+                    const blockDays = Array.from({ length: 7 }, (_, k) => addDays(w.weekStart, k)).filter((iso) => iso >= planStart);
+                    const d = sessionDescription(s, zones);
+                    const isDone = !s.skipped && done.has(`${w.week}:${s.day}`);
+                    const isMissed = !s.skipped && w.week < curNum && !isDone;
+                    const key = `${w.week}:${s.origDay}`;
+                    const isEditing = editing === key;
+                    return (
+                      <React.Fragment key={key + i}>
+                        {showWeekHead && (
+                          <div className="plan-week-head">Week {w.week} <span className="muted">· {w.label} · {range}</span></div>
+                        )}
+                        <div className="session-wrap">
+                          <div
+                            className={`session clickable ${s.skipped ? "session-skipped" : ""}`}
+                            onClick={() => setEditing(isEditing ? null : key)}
+                          >
+                            <div className="session-day">
+                              <span className="sd-dow">{dowName(s.date)}</span>
+                              <span className="sd-num">{Number(s.date.slice(8, 10))}</span>
+                              <span className="sd-mon">{MONTHS[new Date(`${s.date}T12:00:00`).getMonth()]}</span>
+                            </div>
+                            <div className="session-body">
+                              <div className="session-title">{d.title}</div>
+                              <div className="session-detail">{d.detail}</div>
+                            </div>
+                            {s.skipped && <Pill tone="base">skipped</Pill>}
+                            {isDone && <span className="sess-mark done">✓</span>}
+                            {isMissed && <span className="sess-mark miss">✕</span>}
+                            <span className="sess-edit">{isEditing ? "▾" : "⋯"}</span>
                           </div>
+                          {isEditing && (
+                            <div className="sess-editor">
+                              {s.skipped ? (
+                                <p className="muted small" style={{ margin: "0 0 8px" }}>This run is skipped — it won't count toward your week.</p>
+                              ) : (
+                                <>
+                                  <div className="sess-editor-lbl">Move to</div>
+                                  <div className="day-picker">
+                                    {blockDays.map((iso) => (
+                                      <button
+                                        key={iso}
+                                        className={`day-chip ${iso === s.date ? "on" : ""}`}
+                                        onClick={() => { onReschedule(w.week, s.origDay, iso); setEditing(null); }}
+                                      >
+                                        <span className="dc-dow">{dowName(iso)}</span>
+                                        <span className="dc-num">{Number(iso.slice(8, 10))}</span>
+                                      </button>
+                                    ))}
+                                  </div>
+                                </>
+                              )}
+                              <div className="sess-editor-actions">
+                                {s.skipped ? (
+                                  <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, null); setEditing(null); }}>Un-skip</button>
+                                ) : (
+                                  <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, "skipped"); setEditing(null); }}>Skip this run</button>
+                                )}
+                                {(s.date !== dateForDayInWeek(w.weekStart, s.origDay) || s.skipped) && (
+                                  <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, null); setEditing(null); }}>Reset</button>
+                                )}
+                              </div>
+                            </div>
+                          )}
                         </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </section>
-        );
-      })}
+                      </React.Fragment>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </section>
     </div>
   );
 }
@@ -2707,7 +2767,7 @@ function defaultLong(days) {
   return days.includes("Sun") ? "Sun" : days.includes("Sat") ? "Sat" : days[days.length - 1] || "";
 }
 
-function Setup({ profile, onSave, zones, runs }) {
+function Setup({ profile, onSave, zones, runs, onPlanReset }) {
   const [name, setName] = useState(profile?.name || "");
   const [goalType, setGoalType] = useState(profile?.goalType || "distance");
   const [goalDistanceKm, setGoalDistanceKm] = useState(profile?.goalDistanceKm || 21.1);
@@ -2781,6 +2841,9 @@ function Setup({ profile, onSave, zones, runs }) {
       lt2SourceActivity: profile?.lt2SourceActivity ?? null,
       hrTestedAt: profile?.hrTestedAt ?? null,
     });
+    // A new/changed plan invalidates the old plan→run linkages; wipe them so
+    // stale "done" ticks don't carry over onto the regenerated schedule.
+    if (scheduleChanged && onPlanReset) onPlanReset();
     setSaved(true); setTimeout(() => setSaved(false), 2200);
   };
 
@@ -2897,6 +2960,11 @@ function Setup({ profile, onSave, zones, runs }) {
 
       <HRZoneHub profile={profile} runs={runs} onSaveHr={(fields) => onSave({ ...profile, ...fields })} />
       <button className="btn-primary" onClick={submit} disabled={!daysValid || ((!benchTime || parseTime(benchTime) <= 0) && (!easyPace || parseTime(easyPace) <= 0))}>{saved ? "✓ Saved — check the Plan tab" : "Save & generate plan"}</button>
+
+      <section className="card">
+        <h3>Account</h3>
+        <SignOutButton className="btn-ghost wide" />
+      </section>
     </div>
   );
 }
@@ -3117,6 +3185,9 @@ function StyleBlock() {
       .session-day { display:flex; flex-direction:column; align-items:center; justify-content:center; width:38px; flex-shrink:0; line-height:1.05; }
       .session-day .sd-dow { font-size:10px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:0.04em; }
       .session-day .sd-num { font-size:17px; font-weight:800; color:var(--accent); font-variant-numeric:tabular-nums; }
+      .session-day .sd-mon { font-size:9.5px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:0.04em; }
+      .plan-week-head { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color:var(--ink); padding:10px 2px 2px; }
+      .plan-week-head .muted { font-weight:600; letter-spacing:0; text-transform:none; }
       .session-body { flex:1; }
       .session-wrap { display:flex; flex-direction:column; }
       .session-skipped { opacity:0.5; }

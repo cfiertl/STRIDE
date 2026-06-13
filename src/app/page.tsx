@@ -1,6 +1,5 @@
 import Link from "next/link";
 import { createClient } from "@/utils/supabase/server";
-import SignOutButton from "@/components/SignOutButton";
 import StridePlanner from "@/components/StridePlanner";
 
 export default async function Home() {
@@ -21,14 +20,6 @@ export default async function Home() {
     );
   }
 
-  // Logged in: the real app. Floating sign-out is temporary scaffolding
-  // for testing — it moves into the Setup tab during piece 3.
-  return (
-    <>
-      <StridePlanner />
-      <div style={{ position: "fixed", top: 8, right: 8, zIndex: 50 }}>
-        <SignOutButton />
-      </div>
-    </>
-  );
+  // Logged in: the real app. Sign-out lives in Setup now.
+  return <StridePlanner />;
 }
