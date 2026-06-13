@@ -112,11 +112,61 @@ function weeksBetween(fromISO, toISO) {
   return Math.max(0, Math.round(ms / (7 * 24 * 3600 * 1000)));
 }
 
+/* ---------- calendar helpers (start-date-anchored plans) ---------- */
+
+const DAY_MS = 24 * 3600 * 1000;
+// DOW (Sun..Sat) is declared lower in the file; these helpers only run at
+// render time, by which point the const is initialised.
+
+// local YYYY-MM-DD for a Date (or now). Avoids UTC drift from toISOString().
+function isoDate(d) {
+  const x = d ? new Date(d) : new Date();
+  return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, "0")}-${String(x.getDate()).padStart(2, "0")}`;
+}
+function todayISO() { return isoDate(); }
+
+// add n whole days to a YYYY-MM-DD and return YYYY-MM-DD (parsed as local noon
+// so DST never nudges the calendar day).
+function addDays(iso, n) {
+  const d = new Date(`${iso}T12:00:00`);
+  d.setDate(d.getDate() + n);
+  return isoDate(d);
+}
+function dowName(iso) { return DOW[new Date(`${iso}T12:00:00`).getDay()]; }
+
+// Given a 7-day block starting at weekStartISO, the date of weekday `day`
+// (e.g. "Tue") that falls inside [weekStart, weekStart+6].
+function dateForDayInWeek(weekStartISO, day) {
+  const startDow = new Date(`${weekStartISO}T12:00:00`).getDay();
+  const targetDow = DOW.indexOf(day);
+  if (targetDow < 0) return weekStartISO;
+  return addDays(weekStartISO, (targetDow - startDow + 7) % 7);
+}
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+// "Tue 17 Jun"
+function fmtDayDate(iso) {
+  if (!iso) return "";
+  const d = new Date(`${iso}T12:00:00`);
+  return `${DOW[d.getDay()]} ${d.getDate()} ${MONTHS[d.getMonth()]}`;
+}
+// "17 Jun" (no weekday) — for week ranges
+function fmtShortDate(iso) {
+  if (!iso) return "";
+  const d = new Date(`${iso}T12:00:00`);
+  return `${d.getDate()} ${MONTHS[d.getMonth()]}`;
+}
+
 function generatePlan(profile) {
   const { goalDistanceKm, goalDate, currentWeeklyKm, daysPerWeek } = profile;
   if (!goalDistanceKm || !goalDate || !currentWeeklyKm) return [];
-  const totalWeeks = Math.min(24, Math.max(4, weeksBetween(new Date().toISOString(), goalDate)));  
+  const start = profile.planStartDate || todayISO();
+  const totalWeeks = Math.min(24, Math.max(4, weeksBetween(start, goalDate)));
   const days = Math.min(6, Math.max(2, daysPerWeek || 4));
+
+  // which weekdays the runner uses + which is the long run
+  const sched = resolveSchedule(profile, days);
+  const overrides = profile.scheduleOverrides || {};
 
   // taper length scales with goal distance
   const taper = profile.goalMode === "fitness" ? 0 : (goalDistanceKm >= 30 ? 3 : goalDistanceKm >= 15 ? 2 : 1);
@@ -137,9 +187,29 @@ function generatePlan(profile) {
       vol = vol * 1.10;
     }
     const weekVol = Math.round(vol);
-    weeks.push(buildWeek(w, totalWeeks, weekVol, goalDistanceKm, days, isTaper, cutback));
+    const weekStart = addDays(start, w * 7);
+    weeks.push(buildWeek(w, totalWeeks, weekVol, goalDistanceKm, days, isTaper, cutback, sched, weekStart, overrides));
   }
   return weeks;
+}
+
+// Decide which weekdays carry the long run / quality / easy sessions. Uses the
+// runner's chosen preferred days + long day; falls back to the historical
+// hardcoded pattern when those aren't set (legacy profiles, pre-resave).
+function resolveSchedule(profile, days) {
+  let pref = Array.isArray(profile.preferredDays) ? profile.preferredDays.filter((d) => DOW.includes(d)) : [];
+  let longDay = profile.longDay && pref.includes(profile.longDay) ? profile.longDay : null;
+  if (pref.length !== days || !longDay) {
+    const legacyOrder = ["Sun", "Tue", "Thu", "Mon", "Wed", "Fri", "Sat"];
+    pref = legacyOrder.slice(0, days);
+    longDay = pref.includes("Sun") ? "Sun" : pref[0];
+  }
+  // non-long days, ordered by circular weekday separation from the long run
+  // (descending) so quality lands furthest from the long run.
+  const li = DOW.indexOf(longDay);
+  const sep = (d) => { const k = Math.abs(DOW.indexOf(d) - li); return Math.min(k, 7 - k); };
+  const rest = pref.filter((d) => d !== longDay).sort((a, b) => sep(b) - sep(a));
+  return { longDay, rest };
 }
 
 function peakVol(start, buildWeeks) {
@@ -152,33 +222,47 @@ function peakVol(start, buildWeeks) {
   return v;
 }
 
-function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback) {
+function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, weekStart, overrides) {
   // long run grows toward ~ goalKm (capped for safety) but eased in taper
   const longCap = goalKm <= 10 ? goalKm * 1.0 : goalKm <= 21.1 ? goalKm * 0.95 : goalKm * 0.80;
   const progress = Math.min(1, (idx + 1) / Math.max(1, total - 2));
   let longKm = Math.round(Math.min(longCap, Math.max(goalKm * 0.35, longCap * progress)));
   if (isTaper) longKm = Math.round(longKm * 0.7);
 
-  const sessions = [];
-  // 1 long
-  sessions.push({ day: "Sun", type: "long", km: longKm });
+  const slots = [];
+  // 1 long, on the chosen long day
+  slots.push({ day: sched.longDay, type: "long", km: longKm });
   // quality sessions: alternate tempo / interval. fewer during taper/cutback
   const qualityCount = isTaper || cutback ? 1 : days >= 5 ? 2 : 1;
-  if (qualityCount >= 1) sessions.push({ day: "Tue", type: idx % 2 === 0 ? "tempo" : "interval", quality: true });
-  if (qualityCount >= 2) sessions.push({ day: "Thu", type: idx % 2 === 0 ? "interval" : "tempo", quality: true });
+  const qualityDays = sched.rest.slice(0, qualityCount);
+  qualityDays.forEach((day, i) => {
+    slots.push({ day, type: (idx + i) % 2 === 0 ? "tempo" : "interval", quality: true });
+  });
 
-  // fill remaining days with easy/zone2 runs to hit volume
-  const usedDays = sessions.length;
-  const easyDays = Math.max(0, days - usedDays);
+  // fill remaining preferred days with easy/zone2 runs to hit volume
+  const easyD = sched.rest.slice(qualityCount);
   const remaining = Math.max(0, weekVol - longKm - qualityCount * 6); // assume ~6km per quality incl w/u
-  const perEasy = easyDays > 0 ? Math.max(4, Math.round(remaining / easyDays)) : 0;
-  const easyLabels = ["Mon", "Wed", "Fri", "Sat"];
-  for (let i = 0; i < easyDays; i++) {
-    sessions.push({ day: easyLabels[i] || `Day${i}`, type: "easy", km: perEasy });
-  }
+  const perEasy = easyD.length > 0 ? Math.max(4, Math.round(remaining / easyD.length)) : 0;
+  easyD.forEach((day) => slots.push({ day, type: "easy", km: perEasy }));
+
+  // resolve each slot onto a real date in this week's 7-day block, applying any
+  // user override (a moved date, or "skipped"). origDay is the generated day —
+  // the stable key overrides are stored against.
+  const week = idx + 1;
+  const sessions = slots.map((s) => {
+    const origDay = s.day;
+    const ov = overrides[`${week}:${origDay}`];
+    let date = dateForDayInWeek(weekStart, origDay);
+    let skipped = false;
+    if (ov === "skipped") skipped = true;
+    else if (typeof ov === "string" && ov) date = ov;
+    return { ...s, origDay, day: dowName(date), date, skipped };
+  });
+  sessions.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 
   return {
-    week: idx + 1,
+    week,
+    weekStart,
     volume: weekVol,
     label: isTaper ? "Taper" : cutback ? "Recovery week" : idx === 0 ? "Base" : "Build",
     sessions,
@@ -266,7 +350,7 @@ function weekReview(plan, profile, runs, completions) {
   );
   if (doneDays.size === 0) return null; // weren't tracking that week — stay quiet
 
-  const sessions = lastWk.sessions;
+  const sessions = lastWk.sessions.filter((s) => !s.skipped); // skipped = deliberate, not missed
   const total = sessions.length;
   const doneCount = sessions.filter((s) => doneDays.has(s.day)).length;
   const keySessions = sessions.filter((s) => s.type === "long" || s.quality);
@@ -332,6 +416,10 @@ function rowToProfile(row) {
     goalDate: row.race_date || "",   // DB column stays race_date; app field is the general "goal date"    
     currentWeeklyKm: row.current_weekly_km != null ? Number(row.current_weekly_km) : null,
     daysPerWeek: row.days_per_week,
+    planStartDate: row.plan_start_date || "",
+    preferredDays: Array.isArray(row.preferred_days) ? row.preferred_days : [],
+    longDay: row.long_day || "",
+    scheduleOverrides: row.schedule_overrides && typeof row.schedule_overrides === "object" ? row.schedule_overrides : {},
     benchDistKm: row.bench_dist_km != null ? Number(row.bench_dist_km) : null,
     benchTimeSec: row.bench_time_s,
     easyPaceSec: row.easy_pace_s,
@@ -353,6 +441,10 @@ function profileToRow(p, userId) {
     race_date: p.goalDate ? p.goalDate : null,    
     current_weekly_km: p.currentWeeklyKm ?? null,
     days_per_week: p.daysPerWeek ?? null,
+    plan_start_date: p.planStartDate ? p.planStartDate : null,
+    preferred_days: p.preferredDays && p.preferredDays.length ? p.preferredDays : null,
+    long_day: p.longDay ? p.longDay : null,
+    schedule_overrides: p.scheduleOverrides ?? {},
     bench_dist_km: p.benchDistKm ?? null,
     bench_time_s: p.benchTimeSec ?? null,
     easy_pace_s: p.easyPaceSec ?? null,
@@ -967,6 +1059,19 @@ export default function App() {
     setPlan(generatePlan(p)); // derived, no longer persisted
   }, []);
 
+  // Reschedule or skip a single planned session. value: an in-block ISO date
+  // (moved), "skipped", or null (clear the override / un-skip). Stored on the
+  // profile's scheduleOverrides map and persisted via saveProfile, which
+  // regenerates the dated plan. See docs/ideas.md "Plan: flexibility".
+  const setSessionSchedule = (week, origDay, value) => {
+    if (!profile) return;
+    const overrides = { ...(profile.scheduleOverrides || {}) };
+    const key = `${week}:${origDay}`;
+    if (value == null) delete overrides[key];
+    else overrides[key] = value;
+    saveProfile({ ...profile, scheduleOverrides: overrides });
+  };
+
   const addRun = async (run) => {
     try {
       const saved = await insertRun(run);
@@ -1077,7 +1182,7 @@ useEffect(() => {
 
       <main className="content">
         {tab === "today" && <Today profile={profile} plan={plan} runs={runs} zones={zones} go={setTab} onUpdateFitness={updateFitness} />}
-        {tab === "plan" && <PlanView plan={plan} zones={zones} profile={profile} />}
+        {tab === "plan" && <PlanView plan={plan} zones={zones} profile={profile} onReschedule={setSessionSchedule} />}
         {tab === "log" && (
           <div className="stack">
             <button className="btn-ghost back-btn" onClick={() => setTab("today")}>‹ Back to today</button>
@@ -1128,7 +1233,8 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness }) {
   const weekPct = target ? weekKm / target : 0;
   const weekRemain = target ? Math.max(0, target - weekKm) : 0;
   const doneSet = new Set(completions.map((c) => `${c.planned_week}:${c.planned_day}`));
-  const wkDone = wk ? wk.sessions.filter((s) => doneSet.has(`${wk.week}:${s.day}`)).length : 0;
+  const wkSessions = wk ? wk.sessions.filter((s) => !s.skipped) : []; // skipped don't count toward the week
+  const wkDone = wkSessions.filter((s) => doneSet.has(`${wk.week}:${s.day}`)).length;
 
   return (
     <div className="stack">
@@ -1176,7 +1282,7 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness }) {
                 <span className="wh-lbl">of weekly target</span>
               </div>
               <div className="wh-stat">
-                <span className="wh-num">{wkDone}/{wk.sessions.length}</span>
+                <span className="wh-num">{wkDone}/{wkSessions.length}</span>
                 <span className="wh-lbl">sessions done</span>
               </div>
               <div className="wh-stat">
@@ -1189,15 +1295,18 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness }) {
             <div className="sessions">
               {wk.sessions.map((s, i) => {
                 const d = sessionDescription(s, zones);
-                const isDone = doneSet.has(`${wk.week}:${s.day}`);
+                const isDone = !s.skipped && doneSet.has(`${wk.week}:${s.day}`);
                 return (
-                  <div key={i} className="session">
-                    <div className="session-day">{s.day}</div>
+                  <div key={i} className={`session ${s.skipped ? "session-skipped" : ""}`}>
+                    <div className="session-day">
+                      <span className="sd-dow">{dowName(s.date)}</span>
+                      <span className="sd-num">{Number(s.date.slice(8, 10))}</span>
+                    </div>
                     <div className="session-body">
                       <div className="session-title">{d.title}</div>
                       <div className="session-detail">{d.detail}</div>
                     </div>
-                    {s.quality && <Pill tone="hard">quality</Pill>}
+                    {s.skipped ? <Pill tone="base">skipped</Pill> : s.quality && <Pill tone="hard">quality</Pill>}
                     {isDone && <span className="sess-mark done">✓</span>}
                   </div>
                 );
@@ -1322,8 +1431,9 @@ function WarmupTimer() {
 
 /* ---------- PLAN ---------- */
 
-function PlanView({ plan, zones, profile }) {
+function PlanView({ plan, zones, profile, onReschedule }) {
   const [open, setOpen] = useState(null);
+  const [editing, setEditing] = useState(null); // "week:origDay" of the session being moved/skipped
   const [done, setDone] = useState(() => new Set());
 
   useEffect(() => {
@@ -1361,14 +1471,20 @@ function PlanView({ plan, zones, profile }) {
       </section>
 
       {plan.map((w) => {
-        const total = w.sessions.length;
-        const doneCount = w.sessions.filter((s) => done.has(`${w.week}:${s.day}`)).length;
+        const active = w.sessions.filter((s) => !s.skipped);
+        const total = active.length;
+        const doneCount = active.filter((s) => done.has(`${w.week}:${s.day}`)).length;
         const isPast = w.week < curNum;
         const showCount = (isPast || w.week === curNum) && doneCount > 0;
+        const range = `${fmtShortDate(w.weekStart)} – ${fmtShortDate(addDays(w.weekStart, 6))}`;
+        const blockDays = Array.from({ length: 7 }, (_, k) => addDays(w.weekStart, k));
         return (
           <section key={w.week} className={`card week-card ${w.week === curNum ? "week-current" : ""}`}>
             <div className="card-head clickable" onClick={() => setOpen(open === w.week ? null : w.week)}>
-              <h3>Week {w.week} <span className="muted">· {w.label}</span></h3>
+              <div className="wk-head-l">
+                <h3>Week {w.week} <span className="muted">· {w.label}</span></h3>
+                <div className="muted small wk-range">{range}</div>
+              </div>
               <div className="row-gap">
                 <Pill tone="accent">{w.volume}km</Pill>
                 {showCount && <Pill tone="base">{doneCount}/{total} done</Pill>}
@@ -1379,18 +1495,62 @@ function PlanView({ plan, zones, profile }) {
               <div className="sessions">
                 {w.sessions.map((s, i) => {
                   const d = sessionDescription(s, zones);
-                  const isDone = done.has(`${w.week}:${s.day}`);
-                  const isMissed = isPast && !isDone;
+                  const isDone = !s.skipped && done.has(`${w.week}:${s.day}`);
+                  const isMissed = !s.skipped && isPast && !isDone;
+                  const key = `${w.week}:${s.origDay}`;
+                  const isEditing = editing === key;
                   return (
-                    <div key={i} className="session">
-                      <div className="session-day">{s.day}</div>
-                      <div className="session-body">
-                        <div className="session-title">{d.title}</div>
-                        <div className="session-detail">{d.detail}</div>
+                    <div key={i} className="session-wrap">
+                      <div
+                        className={`session clickable ${s.skipped ? "session-skipped" : ""}`}
+                        onClick={() => setEditing(isEditing ? null : key)}
+                      >
+                        <div className="session-day">
+                          <span className="sd-dow">{dowName(s.date)}</span>
+                          <span className="sd-num">{Number(s.date.slice(8, 10))}</span>
+                        </div>
+                        <div className="session-body">
+                          <div className="session-title">{d.title}</div>
+                          <div className="session-detail">{d.detail}</div>
+                        </div>
+                        {s.skipped ? <Pill tone="base">skipped</Pill> : s.quality && <Pill tone="hard">quality</Pill>}
+                        {isDone && <span className="sess-mark done">✓</span>}
+                        {isMissed && <span className="sess-mark miss">✕</span>}
+                        <span className="sess-edit">{isEditing ? "▾" : "⋯"}</span>
                       </div>
-                      {s.quality && <Pill tone="hard">quality</Pill>}
-                      {isDone && <span className="sess-mark done">✓</span>}
-                      {isMissed && <span className="sess-mark miss">✕</span>}
+                      {isEditing && (
+                        <div className="sess-editor">
+                          {s.skipped ? (
+                            <p className="muted small" style={{ margin: "0 0 8px" }}>This run is skipped — it won't count toward your week.</p>
+                          ) : (
+                            <>
+                              <div className="sess-editor-lbl">Move to</div>
+                              <div className="day-picker">
+                                {blockDays.map((iso) => (
+                                  <button
+                                    key={iso}
+                                    className={`day-chip ${iso === s.date ? "on" : ""}`}
+                                    onClick={() => { onReschedule(w.week, s.origDay, iso); setEditing(null); }}
+                                  >
+                                    <span className="dc-dow">{dowName(iso)}</span>
+                                    <span className="dc-num">{Number(iso.slice(8, 10))}</span>
+                                  </button>
+                                ))}
+                              </div>
+                            </>
+                          )}
+                          <div className="sess-editor-actions">
+                            {s.skipped ? (
+                              <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, null); setEditing(null); }}>Un-skip</button>
+                            ) : (
+                              <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, "skipped"); setEditing(null); }}>Skip this run</button>
+                            )}
+                            {(s.date !== dateForDayInWeek(w.weekStart, s.origDay) || s.skipped) && (
+                              <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, null); setEditing(null); }}>Reset</button>
+                            )}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -1433,7 +1593,7 @@ function LogRun({ profile, zones, onSave, fuel }) {
   // plan-linking on the log page: map the entered date to its plan week and
   // offer that week's sessions, with the same smart suggestion as the detail view.
   const plan = profile ? generatePlan(profile) : [];
-  const wk = planWeekForDate(plan, profile?.goalDate, date);
+  const wk = planWeekForDate(plan, date);
   const suggestedIdx = !selectedDay && wk
     ? suggestSessionIdx(wk.sessions, { date: `${date}T12:00:00`, distance_km: distance ? parseFloat(distance) : null })
     : -1;
@@ -1971,7 +2131,7 @@ function LinkSession({ activity, log, completion, profile, onSaved }) {
   const [saving, setSaving] = useState(false);
 
   const plan = profile ? generatePlan(profile) : [];
-  const wk = planWeekForDate(plan, profile?.goalDate, activity.date);
+  const wk = planWeekForDate(plan, activity.date);
 
   const link = async (s) => {
     setSaving(true);
@@ -2535,6 +2695,18 @@ function Insights({ runs, fuel, zones, profile }) {
 
 /* ---------- SETUP ---------- */
 
+// Weekday chips render Mon-first (calendar habit); plan internals use DOW (Sun-first).
+const DAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+// A spread-out default set of N run days (reuses the legacy long/quality/easy
+// ordering, then sorts to weekday order for display).
+function defaultPreferred(n) {
+  const legacy = ["Sun", "Tue", "Thu", "Mon", "Wed", "Fri", "Sat"].slice(0, n);
+  return DAY_ORDER.filter((d) => legacy.includes(d));
+}
+function defaultLong(days) {
+  return days.includes("Sun") ? "Sun" : days.includes("Sat") ? "Sat" : days[days.length - 1] || "";
+}
+
 function Setup({ profile, onSave, zones, runs }) {
   const [name, setName] = useState(profile?.name || "");
   const [goalType, setGoalType] = useState(profile?.goalType || "distance");
@@ -2542,20 +2714,53 @@ function Setup({ profile, onSave, zones, runs }) {
   const [goalTime, setGoalTime] = useState(profile?.goalTime || "");
   const [goalDate, setGoalDate] = useState(profile?.goalDate || "");  
   const [currentWeeklyKm, setCurrentWeeklyKm] = useState(profile?.currentWeeklyKm || 25);
-  const [daysPerWeek, setDaysPerWeek] = useState(profile?.daysPerWeek || 4);
+  const initDays = profile?.daysPerWeek || 4;
+  const initPref = profile?.preferredDays && profile.preferredDays.length === initDays
+    ? DAY_ORDER.filter((d) => profile.preferredDays.includes(d))
+    : defaultPreferred(initDays);
+  const [daysPerWeek, setDaysPerWeek] = useState(initDays);
+  const [planStartDate, setPlanStartDate] = useState(profile?.planStartDate || todayISO());
+  const [preferredDays, setPreferredDays] = useState(initPref);
+  const [longDay, setLongDay] = useState(profile?.longDay && initPref.includes(profile.longDay) ? profile.longDay : defaultLong(initPref));
   const [benchDist, setBenchDist] = useState(profile?.benchDistKm || 5);
   const [benchTime, setBenchTime] = useState(profile?.benchTimeSec ? fmtTime(profile.benchTimeSec) : "");
   const [easyPace, setEasyPace] = useState(profile?.easyPaceSec ? fmtTime(profile.easyPaceSec) : "");
   const [saved, setSaved] = useState(false);
   const [goalMode, setGoalMode] = useState(profile?.goalMode || "race");
 
+  // Number of run days drives the day picker — reseed to a sensible spread.
+  const changeDays = (v) => {
+    const n = parseInt(v);
+    setDaysPerWeek(n);
+    const pref = defaultPreferred(n);
+    setPreferredDays(pref);
+    setLongDay(defaultLong(pref));
+  };
+  const toggleDay = (d) => {
+    const next = preferredDays.includes(d)
+      ? preferredDays.filter((x) => x !== d)
+      : DAY_ORDER.filter((x) => preferredDays.includes(x) || x === d);
+    setPreferredDays(next);
+    if (!next.includes(longDay)) setLongDay(defaultLong(next));
+  };
+  const daysValid = preferredDays.length === parseInt(daysPerWeek) && !!longDay;
+
   const submit = () => {
     const goalLabel =
       goalType === "time" && goalTime
         ? `${goalDistanceKm}km in ${goalTime}`
         : `${goalDistanceKm}km`;
+    // Reschedules/skips are tweaks on top of a specific generated plan. If a
+    // schedule-structural field changes, those overrides no longer line up, so
+    // drop them; pace/name/bench edits leave them intact.
+    const scheduleChanged =
+      planStartDate !== (profile?.planStartDate || "") ||
+      goalDate !== (profile?.goalDate || "") ||
+      parseInt(daysPerWeek) !== (profile?.daysPerWeek ?? null) ||
+      longDay !== (profile?.longDay || "") ||
+      JSON.stringify(preferredDays) !== JSON.stringify(profile?.preferredDays || []);
     onSave({
-      name, 
+      name,
       goalType,
       goalMode,
       goalDistanceKm: parseFloat(goalDistanceKm),
@@ -2564,6 +2769,10 @@ function Setup({ profile, onSave, zones, runs }) {
       goalDate,
       currentWeeklyKm: parseFloat(currentWeeklyKm),
       daysPerWeek: parseInt(daysPerWeek),
+      planStartDate,
+      preferredDays,
+      longDay,
+      scheduleOverrides: scheduleChanged ? {} : (profile?.scheduleOverrides || {}),
       benchDistKm: parseFloat(benchDist),
       benchTimeSec: parseTime(benchTime),
       easyPaceSec: easyPace && parseTime(easyPace) > 0 ? parseTime(easyPace) : null,
@@ -2615,13 +2824,41 @@ function Setup({ profile, onSave, zones, runs }) {
         <div className="form-grid">
           <label className="field"><span>Current weekly km</span><input type="number" value={currentWeeklyKm} onChange={(e) => setCurrentWeeklyKm(e.target.value)} /></label>
           <label className="field"><span>Days/week you'll run</span>
-            <select value={daysPerWeek} onChange={(e) => setDaysPerWeek(e.target.value)}>
+            <select value={daysPerWeek} onChange={(e) => changeDays(e.target.value)}>
               {[2, 3, 4, 5, 6].map((d) => <option key={d} value={d}>{d}</option>)}
             </select>
           </label>
+          <label className="field"><span>Plan start date</span><input type="date" value={planStartDate} onChange={(e) => setPlanStartDate(e.target.value)} /></label>
         </div>
         {parseInt(daysPerWeek) === 2 && (
           <p className="muted small">On 2 days a week, both runs count: one long run (easy effort) and one quality session. That's a legit way to train — consistency beats volume.</p>
+        )}
+
+        <label className="field" style={{ marginTop: 4 }}>
+          <span>Which days do you run? <span className="muted">· pick {parseInt(daysPerWeek)}</span></span>
+        </label>
+        <div className="chips">
+          {DAY_ORDER.map((d) => (
+            <button key={d} type="button" className={`chip ${preferredDays.includes(d) ? "chip-on" : ""}`} onClick={() => toggleDay(d)}>{d}</button>
+          ))}
+        </div>
+        {!daysValid && (
+          <p className="warn small" style={{ marginTop: 8 }}>
+            Pick exactly {parseInt(daysPerWeek)} day{parseInt(daysPerWeek) === 1 ? "" : "s"} ({preferredDays.length} selected).
+          </p>
+        )}
+
+        {preferredDays.length > 0 && (
+          <>
+            <label className="field" style={{ marginTop: 12 }}>
+              <span>Long run day</span>
+            </label>
+            <div className="chips">
+              {DAY_ORDER.filter((d) => preferredDays.includes(d)).map((d) => (
+                <button key={d} type="button" className={`chip ${longDay === d ? "chip-on" : ""}`} onClick={() => setLongDay(d)}>{d}</button>
+              ))}
+            </div>
+          </>
         )}
       </section>
       
@@ -2659,7 +2896,7 @@ function Setup({ profile, onSave, zones, runs }) {
       </section>
 
       <HRZoneHub profile={profile} runs={runs} onSaveHr={(fields) => onSave({ ...profile, ...fields })} />
-      <button className="btn-primary" onClick={submit} disabled={(!benchTime || parseTime(benchTime) <= 0) && (!easyPace || parseTime(easyPace) <= 0)}>{saved ? "✓ Saved — check the Plan tab" : "Save & generate plan"}</button>
+      <button className="btn-primary" onClick={submit} disabled={!daysValid || ((!benchTime || parseTime(benchTime) <= 0) && (!easyPace || parseTime(easyPace) <= 0))}>{saved ? "✓ Saved — check the Plan tab" : "Save & generate plan"}</button>
     </div>
   );
 }
@@ -2709,21 +2946,28 @@ function cap(s) { return s ? s[0].toUpperCase() + s.slice(1) : s; }
 function paceOf(r) { return r.timeSec && r.distance ? r.timeSec / parseFloat(r.distance) : 0; }
 function scoreColor(s) { return s >= 8 ? "var(--positive)" : s >= 5 ? "var(--amber)" : "var(--coral)"; }
 
-function currentWeek(profile, plan) {
-  if (!plan.length || !profile.goalDate) return plan[0];
-  const total = plan.length;
-  const wksOut = weeksBetween(new Date().toISOString(), profile.goalDate);
-  const idx = Math.min(total - 1, Math.max(0, total - wksOut - 1));
-  return plan[idx];
+// Find the plan week whose 7-day block [weekStart, weekStart+7) contains `iso`,
+// clamping to the first/last week outside the plan's span. weekStart is stamped
+// on every week by buildWeek, so this stays consistent with the displayed dates.
+function weekForDate(plan, iso) {
+  if (!plan.length || !iso) return null;
+  for (const w of plan) {
+    if (w.weekStart && iso >= w.weekStart && iso < addDays(w.weekStart, 7)) return w;
+  }
+  // before the plan starts -> week 1; after it ends -> last week
+  if (plan[0].weekStart && iso < plan[0].weekStart) return plan[0];
+  return plan[plan.length - 1];
 }
 
-// Map a run's date to its plan week, using the same numbering currentWeek relies on.
-function planWeekForDate(plan, goalDate, dateIso) {
-  if (!plan.length || !goalDate || !dateIso) return null;
-  const total = plan.length;
-  const wksOut = weeksBetween(dateIso, goalDate);
-  const idx = Math.min(total - 1, Math.max(0, total - wksOut - 1));
-  return plan[idx];
+function currentWeek(profile, plan) {
+  if (!plan.length) return null;
+  return weekForDate(plan, todayISO()) || plan[0];
+}
+
+// Map a run's date to its plan week (used when linking a logged run to a slot).
+function planWeekForDate(plan, dateIso) {
+  if (!plan.length || !dateIso) return null;
+  return weekForDate(plan, isoDate(dateIso));
 }
 
 const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -2870,8 +3114,30 @@ function StyleBlock() {
 
       .sessions { display:flex; flex-direction:column; gap:8px; }
       .session { display:flex; align-items:center; gap:12px; background:var(--bg); border:1px solid var(--line); border-radius:12px; padding:12px; }
-      .session-day { font-family:var(--font-mono),monospace; font-size:12px; color:var(--accent); width:34px; font-weight:600; }
+      .session-day { display:flex; flex-direction:column; align-items:center; justify-content:center; width:38px; flex-shrink:0; line-height:1.05; }
+      .session-day .sd-dow { font-size:10px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:0.04em; }
+      .session-day .sd-num { font-size:17px; font-weight:800; color:var(--accent); font-variant-numeric:tabular-nums; }
       .session-body { flex:1; }
+      .session-wrap { display:flex; flex-direction:column; }
+      .session-skipped { opacity:0.5; }
+      .session-skipped .session-title { text-decoration:line-through; }
+      .sess-edit { color:var(--muted); font-size:15px; flex-shrink:0; }
+      .session.clickable:hover .sess-edit { color:var(--accent); }
+
+      .sess-editor { background:var(--panel-2); border:1px solid var(--line); border-top:none;
+        border-radius:0 0 12px 12px; margin:-6px 0 0; padding:14px 12px 12px; }
+      .sess-editor-lbl { font-size:11px; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); font-weight:600; margin-bottom:8px; }
+      .day-picker { display:flex; gap:6px; flex-wrap:wrap; }
+      .day-chip { display:flex; flex-direction:column; align-items:center; gap:1px; width:42px; padding:7px 0; border-radius:10px;
+        border:1px solid var(--line); background:var(--bg); color:var(--ink); font-family:inherit; cursor:pointer; transition:.12s; }
+      .day-chip:hover { border-color:var(--accent-dim); }
+      .day-chip.on { background:var(--accent); border-color:var(--accent); color:var(--on-accent); }
+      .day-chip .dc-dow { font-size:9.5px; font-weight:700; text-transform:uppercase; letter-spacing:0.03em; }
+      .day-chip .dc-num { font-size:14px; font-weight:800; font-variant-numeric:tabular-nums; }
+      .sess-editor-actions { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
+
+      .wk-head-l { display:flex; flex-direction:column; gap:2px; }
+      .wk-range { margin-top:1px; }
       .session-title { font-weight:700; font-size:14px; }
       .session-detail { font-size:12.5px; color:var(--muted); margin-top:3px; line-height:1.45; }
 
