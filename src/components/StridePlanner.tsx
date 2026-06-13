@@ -789,6 +789,38 @@ const Pill = ({ children, tone }) => (
   <span className={`pill pill-${tone || "base"}`}>{children}</span>
 );
 
+// Circular progress ring (Apple-Activity style). Fills with how much of a
+// target has been done; the arc is cobalt and turns positive-green once the
+// target is hit. value/sub render stacked in the middle.
+function ProgressRing({ pct, value, sub, size = 128, stroke = 13 }) {
+  const p = Math.max(0, Math.min(1, pct || 0));
+  const done = (pct || 0) >= 1;
+  const cx = size / 2;
+  const r = (size - stroke) / 2;
+  const circ = 2 * Math.PI * r;
+  const gid = done ? "ringDone" : "ringMain";
+  const main = done ? "var(--positive)" : "var(--accent)";
+  return (
+    <svg className="ring" width={size} height={size} viewBox={`0 0 ${size} ${size}`} role="img" aria-label={`${Math.round(p * 100)}% of weekly target`}>
+      <defs>
+        <linearGradient id={gid} x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" style={{ stopColor: done ? "color-mix(in srgb, var(--positive) 55%, white)" : "color-mix(in srgb, var(--accent) 48%, white)" }} />
+          <stop offset="100%" style={{ stopColor: main }} />
+        </linearGradient>
+      </defs>
+      <circle cx={cx} cy={cx} r={r} fill="none" stroke="var(--line)" strokeWidth={stroke} />
+      <circle
+        cx={cx} cy={cx} r={r} fill="none" stroke={`url(#${gid})`} strokeWidth={stroke}
+        strokeLinecap="round" strokeDasharray={`${(circ * p).toFixed(2)} ${circ.toFixed(2)}`}
+        transform={`rotate(-90 ${cx} ${cx})`}
+        style={{ filter: `drop-shadow(0 0 6px color-mix(in srgb, ${main} 50%, transparent))`, transition: "stroke-dasharray .6s cubic-bezier(.2,.8,.2,1)" }}
+      />
+      <text className="ring-val" x={cx} y={cx - 2} textAnchor="middle">{value}</text>
+      <text className="ring-sub" x={cx} y={cx + 16} textAnchor="middle">{sub}</text>
+    </svg>
+  );
+}
+
 /* ---------- main app ---------- */
 
 // Bottom-nav items, left to right. Today sits in the center; its icon is the
@@ -1091,6 +1123,13 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness }) {
     .reduce((a, r) => a + (parseFloat(r.distance) || 0), 0);
   const fitness = fitnessUpdateSuggestion(profile, runs);
 
+  // Weekly-target progress for the hub ring.
+  const target = wk ? wk.volume : 0;
+  const weekPct = target ? weekKm / target : 0;
+  const weekRemain = target ? Math.max(0, target - weekKm) : 0;
+  const doneSet = new Set(completions.map((c) => `${c.planned_week}:${c.planned_day}`));
+  const wkDone = wk ? wk.sessions.filter((s) => doneSet.has(`${wk.week}:${s.day}`)).length : 0;
+
   return (
     <div className="stack">
       {review && (
@@ -1119,44 +1158,60 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness }) {
       <section className="card hero">
         <div className="hero-row">
           <Stat label="Goal" value={profile.goalLabel || `${profile.goalDistanceKm}km`} accent />
-          <Stat label={profile.goalMode === "fitness" ? "Target" : "Race day"} value={profile.goalDate ? daysUntil(profile.goalDate) + "d" : "—"} />          
-          <Stat label="This week" value={`${weekKm.toFixed(1)}km`} />
+          <Stat label={profile.goalMode === "fitness" ? "Target" : "Race day"} value={profile.goalDate ? daysUntil(profile.goalDate) + "d" : "—"} />
         </div>
       </section>
 
-      {wk && (
-        <section className="card">
+      {wk ? (
+        <section className="card week-hub">
           <div className="card-head">
-            <h3>Week {wk.week} · {wk.label}</h3>
-            <Pill tone="accent">{wk.volume}km planned</Pill>
+            <h3>This week</h3>
+            <Pill tone="accent">Week {wk.week} · {wk.label}</Pill>
           </div>
-          <div className="sessions">
-            {wk.sessions.map((s, i) => {
-              const d = sessionDescription(s, zones);
-              return (
-                <div key={i} className="session">
-                  <div className="session-day">{s.day}</div>
-                  <div className="session-body">
-                    <div className="session-title">{d.title}</div>
-                    <div className="session-detail">{d.detail}</div>
+          <div className="week-hub-row">
+            <ProgressRing pct={weekPct} value={weekKm.toFixed(1)} sub={`of ${wk.volume} km`} />
+            <div className="week-hub-side">
+              <div className="wh-stat">
+                <span className="wh-num" style={{ color: weekPct >= 1 ? "var(--positive)" : "var(--accent)" }}>{Math.round(weekPct * 100)}%</span>
+                <span className="wh-lbl">of weekly target</span>
+              </div>
+              <div className="wh-stat">
+                <span className="wh-num">{wkDone}/{wk.sessions.length}</span>
+                <span className="wh-lbl">sessions done</span>
+              </div>
+              <div className="wh-stat">
+                <span className="wh-num">{weekRemain > 0 ? `${weekRemain.toFixed(1)}km` : "Done"}</span>
+                <span className="wh-lbl">{weekRemain > 0 ? "still to run" : "target hit 🎉"}</span>
+              </div>
+            </div>
+          </div>
+          <div className="week-sessions">
+            <div className="sessions">
+              {wk.sessions.map((s, i) => {
+                const d = sessionDescription(s, zones);
+                const isDone = doneSet.has(`${wk.week}:${s.day}`);
+                return (
+                  <div key={i} className="session">
+                    <div className="session-day">{s.day}</div>
+                    <div className="session-body">
+                      <div className="session-title">{d.title}</div>
+                      <div className="session-detail">{d.detail}</div>
+                    </div>
+                    {s.quality && <Pill tone="hard">quality</Pill>}
+                    {isDone && <span className="sess-mark done">✓</span>}
                   </div>
-                  {s.quality && <Pill tone="hard">quality</Pill>}
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
+          </div>
+        </section>
+      ) : (
+        <section className="card hero">
+          <div className="hero-row">
+            <Stat label="This week" value={`${weekKm.toFixed(1)}km`} accent />
           </div>
         </section>
       )}
-
-      <section className="card warmup-card">
-        <h3>🔑 Warm-up — do this before every quality session & race</h3>
-        <p className="muted">
-          That "takes 4–5km to feel decent" thing is your body warming up. So don't spend race day
-          or a hard session doing it at speed — warm up first and start <strong>already warm</strong>.
-          Tap start and follow along:
-        </p>
-        <WarmupTimer />
-      </section>
 
       {last && (
         <section className="card">
@@ -1164,8 +1219,8 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness }) {
           <div className="hero-row">
             <Stat label="Type" value={ZONE_META[last.type] ? ZONE_META[last.type].name.split(" ")[0] : last.type} />
             <Stat label="Distance" value={`${last.distance}km`} />
-            <Stat label="Pace" value={fmtPace(paceOf(last))} />
-            <Stat label="Score" value={last.score != null ? `${last.score}/10` : "—"} accent />          
+            <Stat label="Pace" value={fmtPaceBare(paceOf(last))} accent />
+            <Stat label="Score" value={last.score != null ? `${last.score}/10` : "—"} accent />
           </div>
         </section>
       )}
@@ -1294,6 +1349,17 @@ function PlanView({ plan, zones, profile }) {
           ~10%/week with a recovery week every 4th, then a taper. Tap a week for sessions.
         </p>
       </section>
+
+      <section className="card warmup-card">
+        <h3>🔑 Warm-up — do this before every quality session & race</h3>
+        <p className="muted">
+          That "takes 4–5km to feel decent" thing is your body warming up. So don't spend race day
+          or a hard session doing it at speed — warm up first and start <strong>already warm</strong>.
+          Tap start and follow along:
+        </p>
+        <WarmupTimer />
+      </section>
+
       {plan.map((w) => {
         const total = w.sessions.length;
         const doneCount = w.sessions.filter((s) => done.has(`${w.week}:${s.day}`)).length;
@@ -2785,6 +2851,16 @@ function StyleBlock() {
       .stat { flex:1; min-width:80px; background:var(--bg); border:1px solid var(--line); border-radius:12px; padding:12px; }
       .stat-val { font-size:24px; font-weight:600; letter-spacing:-0.02em; }
       .stat-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em; margin-top:4px; }
+
+      .week-hub-row { display:flex; align-items:center; gap:20px; }
+      .ring { flex-shrink:0; }
+      .ring-val { fill:var(--ink); font-size:27px; font-weight:800; letter-spacing:-0.02em; font-variant-numeric:tabular-nums; }
+      .ring-sub { fill:var(--muted); font-size:10.5px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; }
+      .week-hub-side { flex:1; display:flex; flex-direction:column; gap:13px; min-width:0; }
+      .wh-stat { display:flex; flex-direction:column; gap:1px; }
+      .wh-num { font-size:20px; font-weight:800; letter-spacing:-0.02em; font-variant-numeric:tabular-nums; }
+      .wh-lbl { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.05em; }
+      .week-sessions { margin-top:16px; padding-top:14px; border-top:1px solid var(--line); }
 
       .pill { font-size:11px; font-weight:600; padding:3px 9px; border-radius:999px; white-space:nowrap; }
       .pill-base { background:var(--panel-2); color:var(--muted); border:1px solid var(--line); }
