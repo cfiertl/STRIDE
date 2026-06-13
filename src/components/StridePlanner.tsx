@@ -1464,7 +1464,7 @@ function WarmupTimer() {
 /* ---------- PLAN ---------- */
 
 function PlanView({ plan, zones, profile, onReschedule }) {
-  const [openOverride, setOpenOverride] = useState({}); // month key -> open?
+  const [open, setOpen] = useState(null); // which week is expanded
   const [editing, setEditing] = useState(null); // "week:origDay" of the session being moved/skipped
   const [done, setDone] = useState(() => new Set());
 
@@ -1482,33 +1482,6 @@ function PlanView({ plan, zones, profile, onReschedule }) {
   const planStart = profile.planStartDate || todayISO();
   const cur = currentWeek(profile, plan);
   const curNum = cur ? cur.week : 1;
-  const now = new Date();
-  const todayKey = `${now.getFullYear()}-${now.getMonth()}`;
-  const nowYear = now.getFullYear();
-
-  // Flatten the dated sessions and group them by calendar month — same
-  // expandable month-group styling as the Activities tab.
-  const months = [];
-  plan.forEach((w) => {
-    w.sessions.forEach((s) => {
-      const dt = new Date(`${s.date}T12:00:00`);
-      const key = `${dt.getFullYear()}-${dt.getMonth()}`;
-      let g = months.find((m) => m.key === key);
-      if (!g) {
-        const label = dt.toLocaleDateString(undefined, { month: "long" }) + (dt.getFullYear() !== nowYear ? ` ${dt.getFullYear()}` : "");
-        g = { key, label, items: [], km: 0, count: 0 };
-        months.push(g);
-      }
-      g.items.push({ s, w });
-      if (!s.skipped) { g.count += 1; g.km += s.km || 6; } // quality runs ~6km
-    });
-  });
-  months.sort((a, b) => (a.key < b.key ? -1 : 1));
-
-  // Open the current month by default, or the first month if the plan is all future.
-  const defaultOpenKey = months.some((m) => m.key === todayKey) ? todayKey : (months[0] && months[0].key);
-  const isMonthOpen = (key) => (key in openOverride ? openOverride[key] : key === defaultOpenKey);
-  const toggleMonth = (key) => setOpenOverride((o) => ({ ...o, [key]: !isMonthOpen(key) }));
 
   return (
     <div className="stack">
@@ -1516,7 +1489,7 @@ function PlanView({ plan, zones, profile, onReschedule }) {
         <h3>{profile.goalLabel || `${profile.goalDistanceKm}km`} · {plan.length}-week plan</h3>
         <p className="muted">
           Built on the 80/20 principle: most running easy, a controlled dose of hard. Volume rises
-          ~10%/week with a recovery week every 4th, then a taper. Tap a month, then a run to move or skip it.
+          ~10%/week with a recovery week every 4th, then a taper. Tap a week, then a run to move or skip it.
         </p>
       </section>
 
@@ -1530,95 +1503,95 @@ function PlanView({ plan, zones, profile, onReschedule }) {
         <WarmupTimer />
       </section>
 
-      <section className="card">
-        <h3>Schedule</h3>
-        {months.map((g) => {
-          const open = isMonthOpen(g.key);
-          return (
-            <div key={g.key} className="run-group">
-              <button className="run-group-head" onClick={() => toggleMonth(g.key)}>
-                <span className="run-group-chev">{open ? "▾" : "▸"}</span>
-                <span className="run-group-label">{g.label}</span>
-                <span className="run-group-meta muted small">{g.count} {g.count === 1 ? "run" : "runs"}{g.km > 0 ? ` · ${g.km.toFixed(0)}km` : ""}</span>
-              </button>
-              {open && (
-                <div className="sessions" style={{ marginTop: 8 }}>
-                  {g.items.map(({ s, w }, i) => {
-                    const showWeekHead = i === 0 || g.items[i - 1].w.week !== w.week;
-                    const range = `${fmtShortDate(w.weekStart)} – ${fmtShortDate(addDays(w.weekStart, 6))}`;
-                    const blockDays = Array.from({ length: 7 }, (_, k) => addDays(w.weekStart, k)).filter((iso) => iso >= planStart);
-                    const d = sessionDescription(s, zones);
-                    const isDone = !s.skipped && done.has(`${w.week}:${s.day}`);
-                    const isMissed = !s.skipped && w.week < curNum && !isDone;
-                    const key = `${w.week}:${s.origDay}`;
-                    const isEditing = editing === key;
-                    return (
-                      <React.Fragment key={key + i}>
-                        {showWeekHead && (
-                          <div className="plan-week-head">Week {w.week} <span className="muted">· {w.label} · {range}</span></div>
-                        )}
-                        <div className="session-wrap">
-                          <div
-                            className={`session clickable ${s.skipped ? "session-skipped" : ""}`}
-                            onClick={() => setEditing(isEditing ? null : key)}
-                          >
-                            <div className="session-day">
-                              <span className="sd-dow">{dowName(s.date)}</span>
-                              <span className="sd-num">{Number(s.date.slice(8, 10))}</span>
-                              <span className="sd-mon">{MONTHS[new Date(`${s.date}T12:00:00`).getMonth()]}</span>
-                            </div>
-                            <div className="session-body">
-                              <div className="session-title">{d.title}</div>
-                              <div className="session-detail">{d.detail}</div>
-                            </div>
-                            {s.skipped && <Pill tone="base">skipped</Pill>}
-                            {isDone && <span className="sess-mark done">✓</span>}
-                            {isMissed && <span className="sess-mark miss">✕</span>}
-                            <span className="sess-edit">{isEditing ? "▾" : "⋯"}</span>
-                          </div>
-                          {isEditing && (
-                            <div className="sess-editor">
-                              {s.skipped ? (
-                                <p className="muted small" style={{ margin: "0 0 8px" }}>This run is skipped — it won't count toward your week.</p>
-                              ) : (
-                                <>
-                                  <div className="sess-editor-lbl">Move to</div>
-                                  <div className="day-picker">
-                                    {blockDays.map((iso) => (
-                                      <button
-                                        key={iso}
-                                        className={`day-chip ${iso === s.date ? "on" : ""}`}
-                                        onClick={() => { onReschedule(w.week, s.origDay, iso); setEditing(null); }}
-                                      >
-                                        <span className="dc-dow">{dowName(iso)}</span>
-                                        <span className="dc-num">{Number(iso.slice(8, 10))}</span>
-                                      </button>
-                                    ))}
-                                  </div>
-                                </>
-                              )}
-                              <div className="sess-editor-actions">
-                                {s.skipped ? (
-                                  <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, null); setEditing(null); }}>Un-skip</button>
-                                ) : (
-                                  <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, "skipped"); setEditing(null); }}>Skip this run</button>
-                                )}
-                                {(s.date !== dateForDayInWeek(w.weekStart, s.origDay) || s.skipped) && (
-                                  <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, null); setEditing(null); }}>Reset</button>
-                                )}
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      </React.Fragment>
-                    );
-                  })}
-                </div>
-              )}
+      {plan.map((w) => {
+        const active = w.sessions.filter((s) => !s.skipped);
+        const total = active.length;
+        const doneCount = active.filter((s) => done.has(`${w.week}:${s.day}`)).length;
+        const isPast = w.week < curNum;
+        const showCount = (isPast || w.week === curNum) && doneCount > 0;
+        const range = `${fmtShortDate(w.weekStart)} – ${fmtShortDate(addDays(w.weekStart, 6))}`;
+        const blockDays = Array.from({ length: 7 }, (_, k) => addDays(w.weekStart, k)).filter((iso) => iso >= planStart);
+        return (
+          <section key={w.week} className={`card week-card ${w.week === curNum ? "week-current" : ""}`}>
+            <div className="card-head clickable" onClick={() => setOpen(open === w.week ? null : w.week)}>
+              <div className="wk-head-l">
+                <h3>Week {w.week} <span className="muted">· {w.label}</span></h3>
+                <div className="muted small wk-range">{range}</div>
+              </div>
+              <div className="row-gap">
+                {showCount && <Pill tone="base">{doneCount}/{total} done</Pill>}
+                <span className="chev">{open === w.week ? "▾" : "▸"}</span>
+              </div>
             </div>
-          );
-        })}
-      </section>
+            {open === w.week && (
+              <div className="sessions">
+                {w.sessions.map((s, i) => {
+                  const d = sessionDescription(s, zones);
+                  const isDone = !s.skipped && done.has(`${w.week}:${s.day}`);
+                  const isMissed = !s.skipped && isPast && !isDone;
+                  const key = `${w.week}:${s.origDay}`;
+                  const isEditing = editing === key;
+                  return (
+                    <div key={i} className="session-wrap">
+                      <div
+                        className={`session clickable ${s.skipped ? "session-skipped" : ""}`}
+                        onClick={() => setEditing(isEditing ? null : key)}
+                      >
+                        <div className="session-day">
+                          <span className="sd-dow">{dowName(s.date)}</span>
+                          <span className="sd-num">{Number(s.date.slice(8, 10))}</span>
+                          <span className="sd-mon">{MONTHS[new Date(`${s.date}T12:00:00`).getMonth()]}</span>
+                        </div>
+                        <div className="session-body">
+                          <div className="session-title">{d.title}</div>
+                          <div className="session-detail">{d.detail}</div>
+                        </div>
+                        {s.skipped && <Pill tone="base">skipped</Pill>}
+                        {isDone && <span className="sess-mark done">✓</span>}
+                        {isMissed && <span className="sess-mark miss">✕</span>}
+                        <span className="sess-edit">{isEditing ? "▾" : "⋯"}</span>
+                      </div>
+                      {isEditing && (
+                        <div className="sess-editor">
+                          {s.skipped ? (
+                            <p className="muted small" style={{ margin: "0 0 8px" }}>This run is skipped — it won't count toward your week.</p>
+                          ) : (
+                            <>
+                              <div className="sess-editor-lbl">Move to</div>
+                              <div className="day-picker">
+                                {blockDays.map((iso) => (
+                                  <button
+                                    key={iso}
+                                    className={`day-chip ${iso === s.date ? "on" : ""}`}
+                                    onClick={() => { onReschedule(w.week, s.origDay, iso); setEditing(null); }}
+                                  >
+                                    <span className="dc-dow">{dowName(iso)}</span>
+                                    <span className="dc-num">{Number(iso.slice(8, 10))}</span>
+                                  </button>
+                                ))}
+                              </div>
+                            </>
+                          )}
+                          <div className="sess-editor-actions">
+                            {s.skipped ? (
+                              <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, null); setEditing(null); }}>Un-skip</button>
+                            ) : (
+                              <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, "skipped"); setEditing(null); }}>Skip this run</button>
+                            )}
+                            {(s.date !== dateForDayInWeek(w.weekStart, s.origDay) || s.skipped) && (
+                              <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, null); setEditing(null); }}>Reset</button>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        );
+      })}
     </div>
   );
 }
@@ -1830,29 +1803,45 @@ function Activity({ runs, cross, onDelRun, onAddCross, onReloadRuns, onOpenRun, 
                 <span className="run-group-label">{g.label}</span>
                 <span className="run-group-meta muted small">{g.runs.length} {g.runs.length === 1 ? "activity" : "activities"}{g.km > 0 ? ` · ${g.km.toFixed(0)}km` : ""}</span>
               </button>
-              {open && g.runs.map((r) => (
-                <div key={r.id} className="run-item">
-                  <div className="run-main clickable" onClick={() => onOpenRun(r.id)}>
-                    <span className="run-type">{ZONE_META[r.type] ? ZONE_META[r.type].name : cap(r.type)}</span>
-                    <span className="run-meta">{parseFloat(r.distance) > 0 ? `${r.distance}km · ${fmtTime(r.timeSec)} · ${fmtPace(paceOf(r))}` : fmtTime(r.timeSec)}</span>
-                    {r.warmup && <Pill tone="accent">warmed up</Pill>}
+              {open && g.runs.map((r) => {
+                const di = isoDate(r.date);
+                const hasDist = parseFloat(r.distance) > 0;
+                const hasFeel = (r.wrong && r.wrong.length > 0) || (r.pain && r.pain.length > 0);
+                return (
+                  <div key={r.id} className="run-card">
+                    <div className="session run-row clickable" onClick={() => onOpenRun(r.id)}>
+                      <div className="session-day">
+                        <span className="sd-dow">{dowName(di)}</span>
+                        <span className="sd-num">{Number(di.slice(8, 10))}</span>
+                        <span className="sd-mon">{MONTHS[new Date(`${di}T12:00:00`).getMonth()]}</span>
+                      </div>
+                      <div className="session-body">
+                        <div className="run-title-row">
+                          <span className="session-title">{ZONE_META[r.type] ? ZONE_META[r.type].name : cap(r.type)}</span>
+                          {r.warmup && <Pill tone="accent">warmed up</Pill>}
+                        </div>
+                        <div className="run-meta">{hasDist ? `${r.distance}km · ${fmtTime(r.timeSec)} · ${fmtPace(paceOf(r))}` : fmtTime(r.timeSec)}</div>
+                        {hasFeel && (
+                          <div className="run-feel">
+                            {r.wrong && r.wrong.length > 0 && <span className="muted small">{r.wrong.join(", ")}</span>}
+                            {r.pain && r.pain.length > 0 && <span className="pain-tag">{r.wrong && r.wrong.length > 0 ? " · " : ""}🩹 {r.pain.join(", ")}</span>}
+                          </div>
+                        )}
+                        {r.notes && <div className="run-notes">"{r.notes}"</div>}
+                      </div>
+                      <div className="run-score-cell">
+                        {r.score != null
+                          ? <span className="run-score" style={{ color: scoreColor(r.score) }}>{r.score}/10</span>
+                          : <span className="muted small">score</span>}
+                        <span className="sess-edit">›</span>
+                      </div>
+                    </div>
+                    <div className="run-foot">
+                      <button className="del" onClick={() => onDelRun(r.id)}>delete</button>
+                    </div>
                   </div>
-                  <div className="run-feel">
-                    {r.score != null ? (
-                      <span style={{ color: scoreColor(r.score) }}>{r.score}/10</span>
-                    ) : (
-                      <span className="muted small">— tap to score</span>
-                    )}
-                    {r.wrong && r.wrong.length > 0 && <span className="muted small"> · {r.wrong.join(", ")}</span>}
-                    {r.pain && r.pain.length > 0 && <span className="pain-tag"> · 🩹 {r.pain.join(", ")}</span>}
-                  </div>
-                  {r.notes && <div className="run-notes">"{r.notes}"</div>}
-                  <div className="run-foot">
-                    <span className="muted small">{relDate(r.date)}</span>
-                    <button className="del" onClick={() => onDelRun(r.id)}>delete</button>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           );
         })}
@@ -3296,11 +3285,20 @@ function StyleBlock() {
       .run-item:first-of-type { border-top:none; }
       .run-main { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
       .run-type { font-weight:700; font-size:14px; }
-      .run-meta { font-size:12.5px; color:var(--muted); }
+      .run-meta { font-size:12.5px; color:var(--muted); margin-top:2px; }
       .run-feel { margin-top:5px; font-weight:600; font-size:13px; }
       .pain-tag { color:var(--coral); }
       .run-notes { font-style:italic; color:var(--muted); font-size:13px; margin-top:5px; }
       .run-foot { display:flex; justify-content:space-between; align-items:center; margin-top:6px; }
+
+      /* Activities run rows — share the polished Plan session-card styling. */
+      .run-card { margin-top:8px; }
+      .run-card:first-of-type { margin-top:10px; }
+      .run-row { align-items:flex-start; }
+      .run-title-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+      .run-score-cell { display:flex; flex-direction:column; align-items:flex-end; gap:3px; flex-shrink:0; }
+      .run-score { font-weight:800; font-size:14px; font-variant-numeric:tabular-nums; }
+      .run-card .run-foot { justify-content:flex-end; margin-top:4px; }
       .del { background:none; border:none; color:var(--coral); font-size:12px; cursor:pointer; font-family:inherit; opacity:.7; }
       .del:hover { opacity:1; }
 
