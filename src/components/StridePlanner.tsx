@@ -1222,8 +1222,8 @@ useEffect(() => {
           </div>
         )}
         {tab === "activity" && (selectedActivityId
-          ? <ActivityDetail activityId={selectedActivityId} profile={profile} onBack={closeActivity} onScored={reloadRuns} />
-          : <Activity runs={runs} cross={cross} onDelRun={delRun} onAddCross={addCross} onReloadRuns={reloadRuns} onOpenRun={openActivity} zones={zones} />)}
+          ? <ActivityDetail activityId={selectedActivityId} profile={profile} onBack={closeActivity} onScored={reloadRuns} onDelete={async (id) => { await delRun(id); closeActivity(); }} />
+          : <Activity runs={runs} cross={cross} onAddCross={addCross} onReloadRuns={reloadRuns} onOpenRun={openActivity} zones={zones} />)}
         {tab === "fuel" && <FuelView fuel={fuel} onSave={addFuel} runs={runs} />}
         {tab === "insights" && <Insights runs={runs} fuel={fuel} zones={zones} profile={profile} />}
         {tab === "setup" && <Setup profile={profile} onSave={saveProfile} zones={zones} runs={runs} onPlanReset={async () => { await clearCompletions(); reloadRuns(); }} />}
@@ -1747,25 +1747,41 @@ function LogRun({ profile, zones, onSave, fuel }) {
 
 /* ---------- ACTIVITY (runs + cross-training) ---------- */
 
-function Activity({ runs, cross, onDelRun, onAddCross, onReloadRuns, onOpenRun, zones }) {
+function Activity({ runs, cross, onAddCross, onReloadRuns, onOpenRun, zones }) {
   const [showCross, setShowCross] = useState(false);
   const [openOverride, setOpenOverride] = useState({});
-  const isOpen = (key, idx) => (key in openOverride ? openOverride[key] : idx < 2); // first month open by default
-  const toggleGroup = (key, idx) => setOpenOverride((o) => ({ ...o, [key]: !isOpen(key, idx) }));
   const nowYear = new Date().getFullYear();
+  const now = new Date();
+  const curKey = `${now.getFullYear()}-${now.getMonth()}`;
+
+  // Merge runs and cross-training into one dated stream, newest first, then
+  // group by month — mirroring the Plan tab's week cards.
+  const items = [
+    ...runs.map((r) => ({ kind: "run", date: r.date, t: new Date(r.date).getTime(), data: r })),
+    ...cross.map((c) => ({ kind: "cross", date: c.date, t: new Date(c.date).getTime(), data: c })),
+  ].sort((a, b) => b.t - a.t);
+
   const groups = [];
-  runs.forEach((r) => {
-    const dt = new Date(r.date);
+  items.forEach((it) => {
+    const dt = new Date(it.date);
     const key = `${dt.getFullYear()}-${dt.getMonth()}`;
     let g = groups.find((x) => x.key === key);
     if (!g) {
       const label = dt.toLocaleDateString(undefined, { month: "long" }) + (dt.getFullYear() !== nowYear ? ` ${dt.getFullYear()}` : "");
-      g = { key, label, runs: [], km: 0 };
+      g = { key, label, items: [], km: 0 };
       groups.push(g);
     }
-    g.runs.push(r);
-    if (parseFloat(r.distance) > 0) g.km += parseFloat(r.distance);
+    g.items.push(it);
+    if (it.kind === "run" && parseFloat(it.data.distance) > 0) g.km += parseFloat(it.data.distance);
   });
+
+  // Default-open the current month; if there's nothing logged this month yet,
+  // fall back to the most recent group so the tab never opens fully collapsed.
+  const hasCur = groups.some((g) => g.key === curKey);
+  const defaultOpenKey = hasCur ? curKey : (groups[0] && groups[0].key);
+  const isOpen = (key) => (key in openOverride ? openOverride[key] : key === defaultOpenKey);
+  const toggleGroup = (key) => setOpenOverride((o) => ({ ...o, [key]: !isOpen(key) }));
+
   return (
     <div className="stack">
       <section className="card">
@@ -1781,45 +1797,67 @@ function Activity({ runs, cross, onDelRun, onAddCross, onReloadRuns, onOpenRun, 
           <h3>Cross-training</h3>
           <button className="btn-ghost" onClick={() => setShowCross(!showCross)}>{showCross ? "Close" : "＋ Add"}</button>
         </div>
-        {showCross && <CrossForm onAdd={(x) => { onAddCross(x); setShowCross(false); }} />}
-        {cross.length === 0 && !showCross && <p className="muted">No cross-training logged. Pilates, swimming, cycling, strength — it all counts.</p>}
-        {cross.map((c) => (
-          <div key={c.id} className="row-item">
-            <div><strong>{cap(c.activity)}</strong> · {c.minutes}min · {c.intensity}</div>
-            <span className="muted">{relDate(c.date)}</span>
-          </div>
-        ))}
+        {showCross
+          ? <CrossForm onAdd={(x) => { onAddCross(x); setShowCross(false); }} />
+          : <p className="muted small">Pilates, swimming, cycling, strength — it all counts. Added sessions show in the monthly list below.</p>}
       </section>
 
-      <section className="card">
-        <h3>Run history</h3>
-        {runs.length === 0 && <p className="muted">No runs yet.</p>}
-        {groups.map((g, gi) => {
-          const open = isOpen(g.key, gi);
-          return (
-            <div key={g.key} className="run-group">
-              <button className="run-group-head" onClick={() => toggleGroup(g.key, gi)}>
-                <span className="run-group-chev">{open ? "▾" : "▸"}</span>
-                <span className="run-group-label">{g.label}</span>
-                <span className="run-group-meta muted small">{g.runs.length} {g.runs.length === 1 ? "activity" : "activities"}{g.km > 0 ? ` · ${g.km.toFixed(0)}km` : ""}</span>
-              </button>
-              {open && g.runs.map((r) => {
-                const di = isoDate(r.date);
-                const hasDist = parseFloat(r.distance) > 0;
-                const hasFeel = (r.wrong && r.wrong.length > 0) || (r.pain && r.pain.length > 0);
-                return (
-                  <div key={r.id} className="run-card">
-                    <div className="session run-row clickable" onClick={() => onOpenRun(r.id)}>
+      {groups.length === 0 && <Empty msg="No activities yet — sync Strava or add a cross-training session." />}
+
+      {groups.map((g) => {
+        const open = isOpen(g.key);
+        const isCur = g.key === curKey;
+        return (
+          <section key={g.key} className={`card week-card ${isCur ? "week-current" : ""}`}>
+            <div className="card-head clickable" onClick={() => toggleGroup(g.key)}>
+              <div className="wk-head-l">
+                <h3>{g.label}</h3>
+              </div>
+              <div className="row-gap">
+                <span className="muted small">{g.items.length} {g.items.length === 1 ? "activity" : "activities"}{g.km > 0 ? ` · ${g.km.toFixed(0)}km` : ""}</span>
+                <span className="chev">{open ? "▾" : "▸"}</span>
+              </div>
+            </div>
+            {open && (
+              <div className="sessions">
+                {g.items.map((it) => {
+                  if (it.kind === "cross") {
+                    const c = it.data;
+                    const di = isoDate(c.date);
+                    return (
+                      <div key={`c${c.id}`} className="session">
+                        <div className="session-day">
+                          <span className="sd-dow">{dowName(di)}</span>
+                          <span className="sd-num">{Number(di.slice(8, 10))}</span>
+                          <span className="sd-mon">{MONTHS[new Date(`${di}T12:00:00`).getMonth()]}</span>
+                        </div>
+                        <div className="session-body">
+                          <div className="run-title-row">
+                            <span className="session-title">{cap(c.activity)}</span>
+                            <Pill tone="base">cross</Pill>
+                          </div>
+                          <div className="run-meta">{c.minutes}min · {c.intensity}</div>
+                        </div>
+                      </div>
+                    );
+                  }
+                  const r = it.data;
+                  const di = isoDate(r.date);
+                  const hasDist = parseFloat(r.distance) > 0;
+                  const hasFeel = (r.wrong && r.wrong.length > 0) || (r.pain && r.pain.length > 0);
+                  return (
+                    <div
+                      key={`r${r.id}`}
+                      className="session run-row clickable"
+                      onClick={() => onOpenRun(r.id)}
+                    >
                       <div className="session-day">
                         <span className="sd-dow">{dowName(di)}</span>
                         <span className="sd-num">{Number(di.slice(8, 10))}</span>
                         <span className="sd-mon">{MONTHS[new Date(`${di}T12:00:00`).getMonth()]}</span>
                       </div>
                       <div className="session-body">
-                        <div className="run-title-row">
-                          <span className="session-title">{ZONE_META[r.type] ? ZONE_META[r.type].name : cap(r.type)}</span>
-                          {r.warmup && <Pill tone="accent">warmed up</Pill>}
-                        </div>
+                        <div className="session-title">{ZONE_META[r.type] ? ZONE_META[r.type].name : cap(r.type)}</div>
                         <div className="run-meta">{hasDist ? `${r.distance}km · ${fmtTime(r.timeSec)} · ${fmtPace(paceOf(r))}` : fmtTime(r.timeSec)}</div>
                         {hasFeel && (
                           <div className="run-feel">
@@ -1836,21 +1874,18 @@ function Activity({ runs, cross, onDelRun, onAddCross, onReloadRuns, onOpenRun, 
                         <span className="sess-edit">›</span>
                       </div>
                     </div>
-                    <div className="run-foot">
-                      <button className="del" onClick={() => onDelRun(r.id)}>delete</button>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          );
-        })}
-      </section>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        );
+      })}
     </div>
   );
 }
 
-function ActivityDetail({ activityId, onBack, profile, onScored }) {
+function ActivityDetail({ activityId, onBack, profile, onScored, onDelete }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [streams, setStreams] = useState(null);
@@ -1986,6 +2021,14 @@ function ActivityDetail({ activityId, onBack, profile, onScored }) {
 
       <LinkSession activity={a} log={log} completion={completion} profile={profile} onSaved={() => setReloadTick((t) => t + 1)} />
       <ScoreCard activity={a} log={log} onSaved={() => { setReloadTick((t) => t + 1); onScored?.(); }} />
+
+      {onDelete && (
+        <section className="card">
+          <div className="run-foot">
+            <button className="del" onClick={() => { if (window.confirm("Delete this activity? This can't be undone.")) onDelete(activityId); }}>Delete activity</button>
+          </div>
+        </section>
+      )}
     </div>
   );
 }
