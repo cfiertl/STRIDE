@@ -290,22 +290,57 @@ function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, w
   };
 }
 
+// Estimated duration band (seconds) for a session. Distance runs come from
+// km × the pace band; structured quality sessions are summed from their
+// prescription (warm-up + work + cool-down).
+function sessionDurationRange(s, zones) {
+  if ((s.type === "easy" || s.type === "long") && s.km > 0) {
+    const pz = zones && zones[s.type];
+    if (!pz) return null;
+    return [Math.round(s.km * pz[0]), Math.round(s.km * pz[1])]; // pz[0] faster → shorter time
+  }
+  if (s.type === "tempo") return [45 * 60, 50 * 60];     // 15 wu + 20–25 work + 10 cd
+  if (s.type === "interval") return [45 * 60, 50 * 60];  // 15 wu + ~22.5 work + 10 cd
+  return null;
+}
+
+function fmtMins(sec) {
+  const m = Math.round(sec / 60);
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60), mm = m % 60;
+  return mm ? `${h}h ${mm}m` : `${h}h`;
+}
+
+function fmtDurRange(range) {
+  if (!range) return "";
+  const [a, b] = range;
+  const ma = Math.round(a / 60), mb = Math.round(b / 60);
+  if (ma === mb) return `~${fmtMins(a)}`;
+  if (ma < 60 && mb < 60) return `~${ma}–${mb} min`;
+  return `~${fmtMins(a)}–${fmtMins(b)}`;
+}
+
 function sessionDescription(s, zones) {
   const pz = zones && zones[s.type];
   const paceStr = pz ? `${fmtPace(pz[0])}–${fmtPace(pz[1])}` : "by feel";
+  const dur = sessionDurationRange(s, zones);
+  const timeStr = dur ? ` Expected ${fmtDurRange(dur)}.` : "";
+  const fuelStr = dur && dur[1] >= 90 * 60
+    ? " Long enough to fuel — aim ~30–60g carbs/hour (a gel every ~30–40 min)."
+    : "";
   if (s.type === "tempo") {
     const tp = zones && zones.tempo;
-    return { title: "Tempo / Threshold", detail: `15min easy warm-up, then 20–25min @ ${tp ? fmtPace(tp[1]) + "–" + fmtPace(tp[0]) : "comfortably hard"}, then 10min easy cool-down.` };
+    return { title: "Tempo / Threshold", detail: `15min easy warm-up, then 20–25min @ ${tp ? fmtPace(tp[1]) + "–" + fmtPace(tp[0]) : "comfortably hard"}, then 10min easy cool-down.${timeStr}` };
   }
   if (s.type === "interval") {
     const ip = zones && zones.interval;
-    return { title: "Intervals (VO2)", detail: `15min easy warm-up with strides, then 5 × 3min @ ${ip ? fmtPace(ip[1]) : "hard"} with 90s jog between, then 10min easy cool-down.` };
+    return { title: "Intervals (VO2)", detail: `15min easy warm-up with strides, then 5 × 3min @ ${ip ? fmtPace(ip[1]) : "hard"} with 90s jog between, then 10min easy cool-down.${timeStr}` };
   }
   if (s.type === "long") {
     const lp = zones && zones.long;
-    return { title: `Long run · ${s.km}km`, detail: `Steady & easy @ ${lp ? fmtPace(lp[0]) + "–" + fmtPace(lp[1]) : "conversational"}. Practice fuelling on anything over 90min.` };
+    return { title: `Long run · ${s.km}km`, detail: `Steady & easy @ ${lp ? fmtPace(lp[0]) + "–" + fmtPace(lp[1]) : "conversational"}.${timeStr}${fuelStr}` };
   }
-  return { title: `Easy / Zone 2 · ${s.km}km`, detail: `Truly easy @ ${paceStr}. If you can't talk in full sentences, slow down.` };
+  return { title: `Easy / Zone 2 · ${s.km}km`, detail: `Truly easy @ ${paceStr}. If you can't talk in full sentences, slow down.${timeStr}${fuelStr}` };
 }
 
 /* ---------- adaptive fitness ---------- */
@@ -1476,6 +1511,14 @@ function PlanView({ plan, zones, profile, onReschedule }) {
     return () => { alive = false; };
   }, []);
 
+  // Auto-expand the current week when the plan loads (plan identity is stable
+  // between renders, so this fires on load/regeneration — not on user toggles).
+  useEffect(() => {
+    if (!profile || !plan.length) return;
+    const c = currentWeek(profile, plan);
+    if (c) setOpen(c.week);
+  }, [profile, plan]);
+
   if (!profile) return <Empty msg="Set your goal in Setup to generate a plan." />;
   if (!plan.length) return <Empty msg="No plan yet — check your goal date in Setup." />;
 
@@ -1495,11 +1538,6 @@ function PlanView({ plan, zones, profile, onReschedule }) {
 
       <section className="card warmup-card">
         <h3>🔑 Warm-up — do this before every hard session & race</h3>
-        <p className="muted">
-          That "takes 4–5km to feel decent" thing is your body warming up. So don't spend race day
-          or a hard session doing it at speed — warm up first and start <strong>already warm</strong>.
-          Tap start and follow along:
-        </p>
         <WarmupTimer />
       </section>
 
