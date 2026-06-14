@@ -1,9 +1,9 @@
 // @ts-nocheck
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { createClient } from "@/utils/supabase/client";
-import { ComposedChart, Line, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
+import { ComposedChart, Line, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, ReferenceLine } from "recharts";
 import dynamic from "next/dynamic";
 import BodyMap from "@/components/BodyMap";
 import PushToggle from "@/components/PushToggle";
@@ -324,7 +324,7 @@ function sessionDescription(s, zones) {
   const pz = zones && zones[s.type];
   const paceStr = pz ? `${fmtPace(pz[0])}–${fmtPace(pz[1])}` : "by feel";
   const dur = sessionDurationRange(s, zones);
-  const timeStr = dur ? ` Expected ${fmtDurRange(dur)}.` : "";
+  const timeStr = dur ? `                 ${fmtDurRange(dur)}.` : "";
   const fuelStr = dur && dur[1] >= 90 * 60
     ? " Long enough to fuel — aim ~30–60g carbs/hour (a gel every ~30–40 min)."
     : "";
@@ -639,6 +639,102 @@ async function loadActivityStreams(activityId) {
     console.error("load streams failed", e);
     return null;
   }
+}
+
+// Tracks played during one activity, oldest play first.
+async function loadActivitySpotify(activityId) {
+  try {
+    const supabase = sb();
+    const { data, error } = await supabase
+      .from("spotify_plays")
+      .select("*")
+      .eq("activity_id", activityId)
+      .order("played_at", { ascending: true });
+    if (error) throw error;
+    return data || [];
+  } catch (e) {
+    console.error("load activity spotify failed", e);
+    return [];
+  }
+}
+
+// All plays for the user + the start date of each activity that has music, plus
+// the cached streams for the most recent `cap` of those activities (so the
+// per-moment HR/pace correlation has bounded payload). Returns null if signed
+// out; { plays:[] } when there's simply no music yet.
+async function loadSpotifyHistory(cap = 40) {
+  try {
+    const supabase = sb();
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return null;
+    const { data: plays, error } = await supabase
+      .from("spotify_plays")
+      .select("*")
+      .order("played_at", { ascending: false });
+    if (error) throw error;
+    if (!plays || !plays.length) return { plays: [], dateById: {}, streamsById: {} };
+
+    const ids = [...new Set(plays.map((p) => p.activity_id))];
+    const { data: acts } = await supabase.from("activities").select("id,date").in("id", ids);
+    const dateById = {};
+    (acts || []).forEach((a) => { dateById[a.id] = a.date; });
+
+    const recentIds = ids
+      .filter((id) => dateById[id])
+      .sort((a, b) => new Date(dateById[b]) - new Date(dateById[a]))
+      .slice(0, cap);
+    const { data: streamRows } = await supabase
+      .from("activity_streams")
+      .select("activity_id,streams")
+      .in("activity_id", recentIds);
+    const streamsById = {};
+    (streamRows || []).forEach((s) => { streamsById[s.activity_id] = s.streams; });
+
+    return { plays, dateById, streamsById };
+  } catch (e) {
+    console.error("load spotify history failed", e);
+    return null;
+  }
+}
+
+// --- music helpers (shared by the activity chart, setlist and insights) -----
+
+// Place each play on the run's seconds-from-start axis. played_at is the track
+// END, so start = end - duration. Sorted by start; sorted oldest→newest.
+function buildSongSegs(plays, activityStartMs) {
+  return (plays || [])
+    .map((p) => {
+      const endSec = (new Date(p.played_at).getTime() - activityStartMs) / 1000;
+      const startSec = endSec - (p.duration_ms || 0) / 1000;
+      return {
+        id: p.track_id || p.played_at,
+        name: p.track_name,
+        artists: Array.isArray(p.artists) ? p.artists : [],
+        art: p.album_art_url || null,
+        uri: p.track_uri || null,
+        startSec,
+        endSec,
+      };
+    })
+    .sort((a, b) => a.startSec - b.startSec);
+}
+
+// The track playing at time t (seconds): the segment covering t, else the most
+// recently started one (covers small gaps between tracks).
+function songAt(segs, t) {
+  if (!segs || !segs.length || t == null) return null;
+  let cur = null;
+  for (const s of segs) {
+    if (t >= s.startSec && t <= s.endSec) return s;
+    if (s.startSec <= t) cur = s;
+  }
+  return cur;
+}
+
+function spotifyUrl(uri) {
+  if (!uri) return null;
+  const id = String(uri).split(":").pop();
+  return id ? `https://open.spotify.com/track/${id}` : null;
 }
 
 // Estimate LT2 / LTHR from a 30-min test activity: average HR over the final 20 minutes
@@ -1928,17 +2024,19 @@ function ActivityDetail({ activityId, onBack, profile, onScored, onDelete }) {
   const [loading, setLoading] = useState(true);
   const [streams, setStreams] = useState(null);
   const [completion, setCompletion] = useState(null);
+  const [plays, setPlays] = useState([]);
+  const [focusT, setFocusT] = useState(null); // chart time pinned from the setlist
   const [reloadTick, setReloadTick] = useState(0);
-  
+  const chartRef = useRef(null);
 
   useEffect(() => {
     let alive = true;
     setLoading(true);
-    Promise.all([loadActivityDetail(activityId), loadActivityStreams(activityId), loadCompletion(activityId)])
-      .then(([d, s, c]) => {
+    setFocusT(null);
+    Promise.all([loadActivityDetail(activityId), loadActivityStreams(activityId), loadCompletion(activityId), loadActivitySpotify(activityId)])
+      .then(([d, s, c, p]) => {
         if (alive) {
-          console.log("ActivityDetail loaded — id:", activityId, "completion:", c);
-          setData(d); setStreams(s); setCompletion(c); setLoading(false);
+          setData(d); setStreams(s); setCompletion(c); setPlays(p || []); setLoading(false);
         }
       });
     return () => { alive = false; };
@@ -1964,6 +2062,13 @@ function ActivityDetail({ activityId, onBack, profile, onScored, onDelete }) {
   const dateStr = a.date
     ? new Date(a.date).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" })
     : "";
+
+  const activityStartMs = a.date ? new Date(a.date).getTime() : 0;
+  const songSegs = activityStartMs ? buildSongSegs(plays, activityStartMs) : [];
+  const jumpToSong = (seg) => {
+    setFocusT(Math.max(0, seg.startSec));
+    if (chartRef.current) chartRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
 
   return (
     <div className="stack">
@@ -1993,7 +2098,11 @@ function ActivityDetail({ activityId, onBack, profile, onScored, onDelete }) {
         {a.description && <p className="muted small" style={{ marginTop: 10 }}>"{a.description}"</p>}
       </section>
 
-      <StreamChart streams={streams} />
+      <div ref={chartRef}>
+        <StreamChart streams={streams} songSegs={songSegs} focusT={focusT} onClearFocus={() => setFocusT(null)} />
+      </div>
+
+      <Setlist segs={songSegs} onJump={jumpToSong} />
 
       {streams && (() => {
         const ll = streams.latlng && (Array.isArray(streams.latlng) ? streams.latlng : streams.latlng.data);
@@ -2093,26 +2202,52 @@ function buildSeries(streams) {
   return { points, has: { hr: !!hr, pace: !!vel, elev: !!alt, cad: !!cad } };
 }
 
-function ChartTip({ active, payload, label }) {
-  if (!active || !payload || !payload.length) return null;
-  const v = {};
-  payload.forEach((p) => { v[p.dataKey] = p.value; });
+// Album art + title + artist, reused in the tooltip, the focus pin and the setlist.
+function SongCell({ seg, sub }) {
+  if (!seg) return null;
   return (
-    <div className="chart-tip">
-      <div className="chart-tip-t">{fmtTime(label)}</div>
-      {v.hr != null && <div><span style={{ color: "var(--viz-b)" }}>HR</span> {Math.round(v.hr)} bpm</div>}
-      {v.pace != null && <div><span style={{ color: "var(--accent)" }}>Pace</span> {fmtPace(v.pace)}</div>}
-      {v.elev != null && <div><span style={{ color: "var(--muted)" }}>Elev</span> {Math.round(v.elev)} m</div>}
-      {v.cad != null && <div><span style={{ color: "var(--amber)" }}>Cadence</span> {v.cad} spm</div>}
+    <div className="song-cell">
+      {seg.art
+        ? <img className="song-art" src={seg.art} alt="" />
+        : <div className="song-art song-art-ph">♪</div>}
+      <div className="song-meta">
+        <div className="song-title">{seg.name}</div>
+        <div className="song-artist muted small">{seg.artists.join(", ")}{sub ? ` · ${sub}` : ""}</div>
+      </div>
     </div>
   );
 }
 
-function StreamChart({ streams }) {
+function ChartTip({ active, payload, label, songSegs }) {
+  if (!active || !payload || !payload.length) return null;
+  const v = {};
+  payload.forEach((p) => { v[p.dataKey] = p.value; });
+  const song = songSegs ? songAt(songSegs, label) : null;
+  return (
+    <div className="chart-tip-wrap">
+      <div className="chart-tip">
+        <div className="chart-tip-t">{fmtTime(label)}</div>
+        {v.hr != null && <div><span style={{ color: "var(--viz-b)" }}>HR</span> {Math.round(v.hr)} bpm</div>}
+        {v.pace != null && <div><span style={{ color: "var(--accent)" }}>Pace</span> {fmtPace(v.pace)}</div>}
+        {v.elev != null && <div><span style={{ color: "var(--muted)" }}>Elev</span> {Math.round(v.elev)} m</div>}
+        {v.cad != null && <div><span style={{ color: "var(--amber)" }}>Cadence</span> {v.cad} spm</div>}
+      </div>
+      {songSegs && (
+        <div className="chart-tip chart-tip-song">
+          {song ? <SongCell seg={song} /> : <span className="muted small">No track here</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StreamChart({ streams, songSegs, focusT, onClearFocus }) {
   const series = buildSeries(streams);
   const [show, setShow] = useState({ hr: true, pace: true, elev: true, cad: false });
+  const [tunes, setTunes] = useState(false);
   if (!series || series.points.length < 2) return null;
   const { points, has } = series;
+  const hasTunes = songSegs && songSegs.length > 0;
   const maxT = points.length ? points[points.length - 1].t : 0;
   const tickStep = maxT > 5400 ? 1200 : maxT > 2400 ? 600 : 300; // >90min→20m, >40min→10m, else 5m
   const ticks = [];
@@ -2121,6 +2256,11 @@ function StreamChart({ streams }) {
     ["hr", "HR", "var(--viz-b)"], ["pace", "Pace", "var(--accent)"],
     ["elev", "Elevation", "var(--muted)"], ["cad", "Cadence", "var(--amber)"],
   ].filter(([k]) => has[k]);
+
+  const focusSong = focusT != null && hasTunes ? songAt(songSegs, focusT) : null;
+  const focusPt = focusT != null
+    ? points.reduce((best, p) => (best == null || Math.abs(p.t - focusT) < Math.abs(best.t - focusT) ? p : best), null)
+    : null;
 
   return (
     <section className="card">
@@ -2131,6 +2271,11 @@ function StreamChart({ streams }) {
             <span className="dot" style={{ background: color }} />{label}
           </button>
         ))}
+        {hasTunes && (
+          <button className={`chip ${tunes ? "chip-on" : ""}`} onClick={() => setTunes((t) => !t)}>
+            <span className="dot" style={{ background: "var(--positive)" }} />Tunes
+          </button>
+        )}
       </div>
       <div style={{ width: "100%", height: 260 }}>
         <ResponsiveContainer>
@@ -2140,13 +2285,53 @@ function StreamChart({ streams }) {
             <YAxis yAxisId="pace" reversed domain={["auto", "auto"]} hide />
             <YAxis yAxisId="elev" domain={["auto", "auto"]} hide />
             <YAxis yAxisId="cad" domain={["auto", "auto"]} hide />
-            <Tooltip content={<ChartTip />} />
+            <Tooltip content={(p) => <ChartTip {...p} songSegs={tunes && hasTunes ? songSegs : null} />} />
+            {focusT != null && <ReferenceLine yAxisId="hr" x={focusT} stroke="var(--accent)" strokeDasharray="4 3" />}
             {has.elev && show.elev && <Area yAxisId="elev" dataKey="elev" stroke="none" fill="var(--muted)" fillOpacity={0.18} isAnimationActive={false} connectNulls />}
             {has.pace && show.pace && <Line yAxisId="pace" dataKey="pace" stroke="var(--accent)" dot={false} strokeWidth={2} isAnimationActive={false} connectNulls />}
             {has.hr && show.hr && <Line yAxisId="hr" dataKey="hr" stroke="var(--viz-b)" dot={false} strokeWidth={2} isAnimationActive={false} connectNulls />}
             {has.cad && show.cad && <Line yAxisId="cad" dataKey="cad" stroke="var(--amber)" dot={false} strokeWidth={1.5} isAnimationActive={false} connectNulls />}
           </ComposedChart>
         </ResponsiveContainer>
+      </div>
+      {focusT != null && (
+        <div className="chart-pin">
+          <div className="chart-pin-data">
+            <strong className="mono">{fmtTime(focusT)}</strong>
+            {focusPt && focusPt.hr != null && <span><span style={{ color: "var(--viz-b)" }}>HR</span> {Math.round(focusPt.hr)}</span>}
+            {focusPt && focusPt.pace != null && <span><span style={{ color: "var(--accent)" }}>Pace</span> {fmtPace(focusPt.pace)}</span>}
+            <button className="pin-close" onClick={onClearFocus} aria-label="Clear">✕</button>
+          </div>
+          {focusSong && <SongCell seg={focusSong} />}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// The run's tracks in order, with their time into the run. Tap to jump the
+// chart to that moment; the icon opens the track in Spotify.
+function Setlist({ segs, onJump }) {
+  if (!segs || !segs.length) return null;
+  return (
+    <section className="card">
+      <h3>Soundtrack <span className="muted small">· {segs.length} {segs.length === 1 ? "track" : "tracks"}</span></h3>
+      <p className="muted small">In order of play. Tap a track to jump to that point on the chart.</p>
+      <div className="setlist">
+        {segs.map((s, i) => {
+          const url = spotifyUrl(s.uri);
+          return (
+            <div key={i} className="setlist-row">
+              <button className="setlist-main" onClick={() => onJump(s)}>
+                <span className="setlist-time mono">{fmtTime(Math.max(0, Math.round(s.startSec)))}</span>
+                <SongCell seg={s} />
+              </button>
+              {url && (
+                <a className="setlist-spotify" href={url} target="_blank" rel="noreferrer" title="Open in Spotify">Spotify ↗</a>
+              )}
+            </div>
+          );
+        })}
       </div>
     </section>
   );
@@ -2602,8 +2787,35 @@ function CrossForm({ onAdd }) {
 
 /* ---------- FUEL ---------- */
 
-const CARB_HINTS = ["rice", "pasta", "bread", "toast", "oat", "potato", "banana", "cereal", "noodle", "bagel", "honey", "fruit", "wrap", "rolled", "muesli", "porridge"];
-const PROTEIN_HINTS = ["egg", "chicken", "beef", "fish", "salmon", "tofu", "yoghurt", "yogurt", "protein", "beans", "lentil", "cheese", "milk", "tuna", "pork", "lamb"];
+const CARB_HINTS = ["rice", "pasta", "bread", "toast", "oat", "oatmeal", "potato", "banana", "cereal", "noodle", "bagel", "honey", "fruit", "wrap", "tortilla", "muesli", "porridge", "granola", "quinoa", "couscous", "gnocchi", "pancake", "pizza", "crumpet", "apple", "mango", "raisin", "date", "jam", "maple", "chips", "fries", "sushi", "bun", "roll", "cracker", "biscuit", "smoothie", "juice"];
+const PROTEIN_HINTS = ["egg", "chicken", "beef", "fish", "salmon", "tofu", "yoghurt", "yogurt", "protein", "beans", "lentil", "cheese", "milk", "tuna", "pork", "lamb", "turkey", "steak", "mince", "prawn", "shrimp", "nuts", "peanut", "almond", "whey", "ham", "sausage", "bacon", "chickpea", "edamame"];
+
+// Whole-word fuel detection. Splits free text into words and adds a light
+// singular form ("oats"→"oat", "potatoes"→"potato"), then matches whole tokens
+// against the hint list — so "goat cheese" no longer reads as oats, while
+// "rice cakes" / "two bananas" still register. Crude but reliable yes/no.
+function hasFuelWord(text, hints) {
+  const tokens = String(text || "").toLowerCase().match(/[a-z]+/g) || [];
+  const set = new Set();
+  tokens.forEach((t) => {
+    set.add(t);
+    if (t.length > 4 && t.endsWith("es")) set.add(t.slice(0, -2));
+    else if (t.length > 3 && t.endsWith("s")) set.add(t.slice(0, -1));
+  });
+  return hints.some((h) => set.has(h));
+}
+
+// Did the runner have carbs logged ahead of this run? Looks at the day before
+// (any meal) plus the run-day breakfast (covers morning runs). Returns
+// true / false / null (nothing logged → unknown). Shared by Insights + Fuel.
+function carbsLoggedBeforeRun(r, fuelByDate) {
+  const before = fuelByDate[addDays(r.date, -1)];
+  const same = fuelByDate[r.date];
+  if (!before && !same) return null;
+  const beforeText = before ? [before.breakfast, before.lunch, before.dinner, before.snacks].join(" ") : "";
+  const amText = same ? same.breakfast || "" : "";
+  return hasFuelWord(`${beforeText} ${amText}`, CARB_HINTS);
+}
 
 function FuelView({ fuel, onSave, runs }) {
   const today = new Date().toISOString().slice(0, 10);
@@ -2620,6 +2832,12 @@ function FuelView({ fuel, onSave, runs }) {
     setSaved(true); setTimeout(() => setSaved(false), 2000);
     setBreakfast(""); setLunch(""); setDinner(""); setSnacks(""); setWater("");
   };
+
+  // Recent long runs (linked long, or any 75min+ effort) + whether carbs were
+  // logged ahead of each — the link that feeds the Insights fuelling card.
+  const fuelByDate = {};
+  fuel.forEach((f) => (fuelByDate[f.date] = f));
+  const longRuns = runs.filter((r) => r.type === "long" || r.timeSec >= 75 * 60).slice(0, 6);
 
   return (
     <div className="stack">
@@ -2641,9 +2859,9 @@ function FuelView({ fuel, onSave, runs }) {
         <h3>Fuel log</h3>
         {fuel.length === 0 && <p className="muted">Nothing logged yet.</p>}
         {fuel.map((f) => {
-          const text = [f.breakfast, f.lunch, f.dinner, f.snacks].join(" ").toLowerCase();
-          const hasCarb = CARB_HINTS.some((h) => text.includes(h));
-          const hasProtein = PROTEIN_HINTS.some((h) => text.includes(h));
+          const text = [f.breakfast, f.lunch, f.dinner, f.snacks].join(" ");
+          const hasCarb = hasFuelWord(text, CARB_HINTS);
+          const hasProtein = hasFuelWord(text, PROTEIN_HINTS);
           return (
             <div key={f.id} className="row-item col">
               <div className="fuel-head">
@@ -2663,6 +2881,24 @@ function FuelView({ fuel, onSave, runs }) {
         })}
       </section>
 
+      {longRuns.length > 0 && (
+        <section className="card">
+          <h3>Before your long runs</h3>
+          <p className="muted small">Whether you had carbs logged the day before (or breakfast on the day). This feeds the fuelling insight.</p>
+          {longRuns.map((r) => {
+            const c = carbsLoggedBeforeRun(r, fuelByDate);
+            return (
+              <div key={r.id} className="row-item">
+                <span>{relDate(r.date)} · {r.distance}km</span>
+                <Pill tone={c === true ? "accent" : c === false ? "warn" : "base"}>
+                  {c === true ? "carbs ✓" : c === false ? "low carbs?" : "not logged"}
+                </Pill>
+              </div>
+            );
+          })}
+        </section>
+      )}
+
       <section className="card note-card">
         <p className="muted small">
           This is a simple fuelling check for energy and recovery, not a diet tool. The general
@@ -2677,57 +2913,178 @@ function FuelView({ fuel, onSave, runs }) {
 
 /* ---------- INSIGHTS ---------- */
 
+// Classify a run's overall intensity for the easy/hard balance. Prefer HR vs
+// LT1 (your aerobic ceiling); fall back to pace vs the easy zone when HR is
+// missing. Returns "easy" | "hard" | null (can't tell). Avoids the stored
+// `type`, which defaults to "easy" on unlinked synced runs.
+function runIntensity(r, zones, lt1) {
+  if (r.avgHr && lt1) return r.avgHr <= lt1 ? "easy" : "hard";
+  const p = paceOf(r);
+  if (p && zones && zones.easy) return p >= zones.easy[1] ? "easy" : "hard";
+  return null;
+}
+
+// km totalled into rolling 7-day buckets, oldest → newest. Last entry is the
+// current (partial) week.
+function weeklyVolumeSeries(runs, n) {
+  const now = Date.now(), DAY = 864e5;
+  const weeks = Array.from({ length: n }, () => 0);
+  runs.forEach((r) => {
+    const age = (now - new Date(r.date).getTime()) / DAY;
+    if (age < 0 || age >= n * 7) return;
+    weeks[Math.floor(age / 7)] += parseFloat(r.distance) || 0;
+  });
+  return weeks.reverse();
+}
+
 function Insights({ runs, fuel, zones, profile }) {
+  if (runs.length < 3) return <Empty msg="Sync or log a few runs and the patterns will show up here." />;
+
+  const lt1 = profile?.lt1Hr ?? null;
+  const avg = (a) => (a.length ? (a.reduce((x, y) => x + y, 0) / a.length).toFixed(1) : null);
+  const ageDays = (d) => (Date.now() - new Date(d).getTime()) / 864e5;
+
+  // ---- objective: synced data ----
+  const vol = weeklyVolumeSeries(runs, 8);
+  const volMax = Math.max(1, ...vol);
+  const load = loadWatch(runs);
+
+  // easy/hard balance over the last 28 days, by moving time
+  const recent = runs.filter((r) => ageDays(r.date) < 28);
+  let easySec = 0, hardSec = 0, classified = 0;
+  recent.forEach((r) => {
+    const cls = runIntensity(r, zones, lt1);
+    if (!cls) return;
+    classified += 1;
+    if (cls === "easy") easySec += r.timeSec || 0; else hardSec += r.timeSec || 0;
+  });
+  const balTotal = easySec + hardSec;
+  const easyPct = balTotal ? Math.round((easySec / balTotal) * 100) : null;
+
+  // aerobic fitness: avg easy-pace this 28d vs the 28d before (easy-classified)
+  const easyWindow = (lo, hi) => {
+    const rs = runs.filter((r) => {
+      const a = ageDays(r.date);
+      return a >= lo && a < hi && runIntensity(r, zones, lt1) === "easy" && paceOf(r) > 0;
+    });
+    const hrs = rs.filter((r) => r.avgHr).map((r) => r.avgHr);
+    return {
+      n: rs.length,
+      pace: rs.length ? rs.reduce((a, r) => a + paceOf(r), 0) / rs.length : null,
+      hr: hrs.length ? Math.round(hrs.reduce((a, b) => a + b, 0) / hrs.length) : null,
+    };
+  };
+  const fitNow = easyWindow(0, 28), fitPrev = easyWindow(28, 56);
+  const fitnessReady = fitNow.n >= 3 && fitPrev.n >= 3 && fitNow.pace && fitPrev.pace;
+  const fitnessDelta = fitnessReady ? fitPrev.pace - fitNow.pace : 0; // +ve = faster now
+
+  // consistency: runs in last 28d + current run-every-week streak
+  const runs28 = recent.length;
+  let streak = 0;
+  for (let w = 0; w < 26; w++) {
+    const c = runs.filter((r) => { const a = ageDays(r.date); return a >= w * 7 && a < (w + 1) * 7; }).length;
+    if (c > 0) streak += 1; else break;
+  }
+
+  // easy-but-hot: ran at easy pace yet HR drifted over LT1 (heat/fatigue).
+  // Pace-based intent + HR-based flag — no reliance on the stored type.
+  const easyPaced = (lt1 && zones && zones.easy) ? runs.filter((r) => r.avgHr && paceOf(r) >= zones.easy[1]) : [];
+  const hotEasy = easyPaced.filter((r) => r.avgHr > lt1);
+
+  // ---- self-report: how runs felt ----
   const scored = runs.filter((r) => r.score != null);
-  if (scored.length < 3) return <Empty msg="Log or score a few runs and the patterns will show up here." />;
-
   const lowRuns = scored.filter((r) => r.score <= 6);
-  const goodRuns = scored.filter((r) => r.score >= 8);
+  const warmedScores = scored.filter((r) => r.warmup).map((r) => r.score);
+  const coldScores = scored.filter((r) => !r.warmup).map((r) => r.score);
 
-  // most common "what went wrong"
   const wrongTally = {};
   lowRuns.forEach((r) => (r.wrong || []).forEach((w) => (wrongTally[w] = (wrongTally[w] || 0) + 1)));
   const topWrong = Object.entries(wrongTally).sort((a, b) => b[1] - a[1]).slice(0, 4);
 
-  // pain tally
   const painTally = {};
   runs.forEach((r) => (r.pain || []).forEach((p) => (painTally[p] = (painTally[p] || 0) + 1)));
   const topPain = Object.entries(painTally).sort((a, b) => b[1] - a[1]);
 
-  const load = loadWatch(runs);
+  const showWarm = avg(warmedScores) && avg(coldScores);
+  const showHot = lt1 && easyPaced.length >= 3 && hotEasy.length > 0;
+  const feelAny = showWarm || topWrong.length > 0 || showHot || topPain.length > 0;
 
-  // warm-up effect
-  const warmedScores = scored.filter((r) => r.warmup).map((r) => r.score);
-  const coldScores = scored.filter((r) => !r.warmup).map((r) => r.score);
-  const avg = (a) => (a.length ? (a.reduce((x, y) => x + y, 0) / a.length).toFixed(1) : null);
-
-  // easy runs run too hard
-  const easyRuns = runs.filter((r) => r.type === "easy" && zones);
-  const tooFastEasy = easyRuns.filter((r) => paceOf(r) < zones.easy[1]);
-
-  // easy runs that ran hot on HR (needs LT1 + HR data; catches what pace misses)
-  const lt1 = profile?.lt1Hr ?? null;
-  const easyWithHr = runs.filter((r) => r.type === "easy" && r.avgHr);
-  const tooHotEasy = lt1 ? easyWithHr.filter((r) => r.avgHr > lt1) : [];
-
-  // fuel correlation: low runs preceded by no carbs
+  // ---- fuel link ----
   const fuelByDate = {};
   fuel.forEach((f) => (fuelByDate[f.date] = f));
+  const longScored = runs.filter((r) => r.score != null && (r.type === "long" || r.timeSec >= 75 * 60));
+  const fueledLong = [], unfueledLong = [];
+  longScored.forEach((r) => {
+    const c = carbsLoggedBeforeRun(r, fuelByDate);
+    if (c === true) fueledLong.push(r); else if (c === false) unfueledLong.push(r);
+  });
+  const showFuel = fueledLong.length >= 2 && unfueledLong.length >= 1;
+  const fueledAvg = avg(fueledLong.map((r) => r.score));
+  const unfueledAvg = avg(unfueledLong.map((r) => r.score));
 
   return (
     <div className="stack">
       <section className="card">
         <h3>What your data is telling you</h3>
         <div className="hero-row">
-          <Stat label="Runs scored" value={scored.length} />
+          <Stat label="Runs (28d)" value={runs28} />
           <Stat label="Avg score" value={avg(scored.map((r) => r.score)) || "—"} accent />
-          <Stat label="Warmed-up runs" value={`${Math.round((scored.filter(r=>r.warmup).length / scored.length) * 100)}%`} />
+          <Stat label="Week streak" value={streak} />
         </div>
       </section>
 
-      {avg(warmedScores) && avg(coldScores) && (
+      <div className="sub-h">The data</div>
+
+      <section className="card insight">
+        <h3>Volume trend</h3>
+        <div className="vol-chart">
+          {vol.map((km, i) => (
+            <div key={i} className="vol-col" title={`${km.toFixed(1)}km`}>
+              <div className="vol-bar" style={{ height: `${Math.max(2, Math.round((km / volMax) * 100))}%`, ...(i === vol.length - 1 ? { opacity: 0.45 } : {}) }} />
+            </div>
+          ))}
+        </div>
+        <div className="vol-axis muted small"><span>8 weeks ago</span><span>this week</span></div>
+        {load.flagged
+          ? <p className="muted small">Last full week was {Math.round(load.jump * 100)}% up on the week before — past the ~10% mark that tends to precede injury. Worth an easier week before pushing further.</p>
+          : <p className="muted small">Each bar is a week's distance; the last is the current week so far.</p>}
+      </section>
+
+      {easyPct != null && classified >= 4 && (
         <section className="card insight">
-          <h3>🔥 Warm-up effect</h3>
+          <h3>Easy / hard balance</h3>
+          <div className="zbar">
+            <div className="zbar-seg" style={{ width: `${easyPct}%`, background: "var(--positive)" }} />
+            <div className="zbar-seg" style={{ width: `${100 - easyPct}%`, background: "var(--coral)" }} />
+          </div>
+          <p>
+            Last 4 weeks: <strong style={{ color: "var(--positive)" }}>{easyPct}% easy</strong> / {100 - easyPct}% hard {lt1 ? "(by heart rate)" : "(by pace)"}.
+            {easyPct >= 75
+              ? " Close to the 80/20 sweet spot — mostly easy, a controlled dose of hard. Keep it there."
+              : " That's more hard running than the 80/20 ideal. Easing your easy days down protects the quality of your hard ones."}
+          </p>
+        </section>
+      )}
+
+      {fitnessReady && (
+        <section className="card insight">
+          <h3>Aerobic fitness</h3>
+          <p>
+            Your easy-run pace over the last 4 weeks averaged <strong className="mono">{fmtPace(fitNow.pace)}</strong>{fitNow.hr ? ` at ~${fitNow.hr} bpm` : ""}, vs <strong className="mono">{fmtPace(fitPrev.pace)}</strong> the 4 weeks before.
+            {Math.abs(fitnessDelta) < 3
+              ? " Holding steady."
+              : fitnessDelta > 0
+                ? " You're running easy faster for the same effort — aerobic fitness is trending up."
+                : " Easy pace has slipped a little — could be fatigue, heat, or a heavier block."}
+          </p>
+        </section>
+      )}
+
+      {feelAny && <div className="sub-h">How your runs felt</div>}
+
+      {showWarm && (
+        <section className="card insight">
+          <h3>Warm-up effect</h3>
           <p>
             Runs where you warmed up score <strong style={{ color: "var(--positive)" }}>{avg(warmedScores)}/10</strong> on
             average, vs <strong style={{ color: "var(--coral)" }}>{avg(coldScores)}/10</strong> when you didn't.
@@ -2740,7 +3097,7 @@ function Insights({ runs, fuel, zones, profile }) {
 
       {topWrong.length > 0 && (
         <section className="card insight">
-          <h3>🔎 Your tougher runs usually involve</h3>
+          <h3>Your tougher runs usually involve</h3>
           <div className="bars">
             {topWrong.map(([w, n]) => (
               <div key={w} className="bar-row">
@@ -2756,47 +3113,14 @@ function Insights({ runs, fuel, zones, profile }) {
         </section>
       )}
 
-      {tooFastEasy.length > 0 && (
+      {showHot && (
         <section className="card insight">
-          <h3>🐢 Easy runs aren't easy enough</h3>
+          <h3>Easy days running hot</h3>
           <p>
-            {tooFastEasy.length} of your {easyRuns.length} easy runs were faster than your easy
-            zone ({fmtPace(zones.easy[1])} or slower). Running easy days too hard is the classic
-            reason every run feels mediocre. This impacts recovery. Slow them down and your hard
-            days get better.
+            {hotEasy.length} of your {easyPaced.length} easy-paced runs with HR data averaged above
+            your LT1 of {lt1} bpm — the pace looked easy but the effort wasn't. Heat, hills and
+            fatigue all push HR up. On easy days, back off enough to keep your average under {lt1}.
           </p>
-        </section>
-      )}
-
-      {lt1 && easyWithHr.length > 0 && tooHotEasy.length > 0 && (
-        <section className="card insight">
-          <h3>Easy runs running hot</h3>
-          <p>
-            {tooHotEasy.length} of your {easyWithHr.length} easy runs with HR data averaged above
-            your LT1 of {lt1} bpm. They drifted out of the easy zone even if the pace looked fine.
-            Heat, hills and fatigue all push HR up! On easy days, ease off enough to keep your
-            average under {lt1}.
-          </p>
-        </section>
-      )}
-
-      {load.prev > 0 && (
-        <section className="card insight">
-          <h3>📈 Load watch</h3>
-          <div className="row-item">
-            <span>Last full week</span>
-            <Pill tone={load.flagged ? "warn" : "base"}>{load.last.toFixed(1)}km</Pill>
-          </div>
-          <div className="row-item">
-            <span>Week before</span>
-            <Pill tone="base">{load.prev.toFixed(1)}km</Pill>
-          </div>
-          {load.flagged && (
-            <p className="muted small">
-              That's a {Math.round(load.jump * 100)}% jump week-on-week — past the ~10% mark that
-              tends to precede injury. Worth an easier week before pushing further.
-            </p>
-          )}
         </section>
       )}
 
@@ -2810,16 +3134,151 @@ function Insights({ runs, fuel, zones, profile }) {
         </section>
       )}
 
-      {goodRuns.length > 0 && (
+      {showFuel && (
+        <>
+          <div className="sub-h">Fuelling</div>
+          <section className="card insight">
+            <h3>Fuelling &amp; long runs</h3>
+            <p>
+              Your long runs with carbs logged the day before score <strong style={{ color: "var(--positive)" }}>{fueledAvg}/10</strong> on
+              average, vs <strong style={{ color: "var(--coral)" }}>{unfueledAvg}/10</strong> when you hadn't.
+              {Number(fueledAvg) > Number(unfueledAvg) + 0.5
+                ? " Carbing up the day before clearly pays off — make it routine before long runs."
+                : " Keep logging your food to sharpen the picture."}
+            </p>
+          </section>
+        </>
+      )}
+
+      <MusicInsights />
+    </div>
+  );
+}
+
+// Average HR / pace of the chart points falling inside a song's time window.
+function streamAvgWindow(series, startSec, endSec) {
+  const pts = series.points.filter((p) => p.t >= startSec && p.t <= endSec);
+  const mean = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
+  return {
+    hr: mean(pts.filter((p) => p.hr != null).map((p) => p.hr)),
+    pace: mean(pts.filter((p) => p.pace != null).map((p) => p.pace)),
+  };
+}
+
+// Aggregate listening stats + per-moment HR/pace per track from raw history.
+function computeMusicInsights(hist) {
+  if (!hist || !hist.plays || !hist.plays.length) return null;
+  const { plays, dateById = {}, streamsById = {} } = hist;
+  const mean = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
+
+  const trackMap = {};
+  plays.forEach((p) => {
+    const key = p.track_id || p.track_name;
+    if (!trackMap[key]) trackMap[key] = { key, name: p.track_name, artists: Array.isArray(p.artists) ? p.artists : [], art: p.album_art_url, uri: p.track_uri, count: 0, hrs: [], paces: [] };
+    trackMap[key].count += 1;
+  });
+  const artistMap = {};
+  plays.forEach((p) => (Array.isArray(p.artists) ? p.artists : []).forEach((a) => (artistMap[a] = (artistMap[a] || 0) + 1)));
+
+  // per-moment: only for activities we have cached streams for
+  const seriesByAct = {};
+  Object.keys(streamsById).forEach((id) => { const s = buildSeries(streamsById[id]); if (s) seriesByAct[id] = s; });
+  plays.forEach((p) => {
+    const series = seriesByAct[p.activity_id];
+    const date = dateById[p.activity_id];
+    if (!series || !date) return;
+    const startMs = new Date(date).getTime();
+    const endSec = (new Date(p.played_at).getTime() - startMs) / 1000;
+    const w = streamAvgWindow(series, Math.max(0, endSec - (p.duration_ms || 0) / 1000), endSec);
+    const t = trackMap[p.track_id || p.track_name];
+    if (w.hr != null) t.hrs.push(w.hr);
+    if (w.pace != null) t.paces.push(w.pace);
+  });
+
+  const tracks = Object.values(trackMap).map((t) => ({ ...t, avgHr: mean(t.hrs), avgPace: mean(t.paces) }));
+  return {
+    total: plays.length,
+    unique: tracks.length,
+    runsWithMusic: new Set(plays.map((p) => p.activity_id)).size,
+    leaderboard: tracks.slice().sort((a, b) => b.count - a.count).slice(0, 6),
+    topArtist: Object.entries(artistMap).sort((a, b) => b[1] - a[1])[0] || null,
+    hardest: tracks.filter((t) => t.avgHr != null).sort((a, b) => b.avgHr - a.avgHr).slice(0, 5),
+    fastest: tracks.filter((t) => t.avgPace != null).sort((a, b) => a.avgPace - b.avgPace).slice(0, 5),
+  };
+}
+
+// Loads its own history on mount so it doesn't block the rest of Insights;
+// renders nothing until there's music to show.
+function MusicInsights() {
+  const [insight, setInsight] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    loadSpotifyHistory().then((d) => { if (alive) setInsight(d ? computeMusicInsights(d) : null); });
+    return () => { alive = false; };
+  }, []);
+  if (!insight || insight.total === 0) return null;
+
+  const { total, unique, runsWithMusic, leaderboard, topArtist, hardest, fastest } = insight;
+  const perRun = runsWithMusic ? (total / runsWithMusic).toFixed(1) : "—";
+
+  return (
+    <>
+      <div className="sub-h">Your soundtrack</div>
+
+      <section className="card">
+        <h3>Listening</h3>
+        <div className="hero-row">
+          <Stat label="Tracks played" value={total} />
+          <Stat label="Unique" value={unique} accent />
+          <Stat label="Per run" value={perRun} />
+        </div>
+        {topArtist && <p className="muted small">Most-played artist: <strong>{topArtist[0]}</strong> ({topArtist[1]} {topArtist[1] === 1 ? "play" : "plays"}).</p>}
+      </section>
+
+      {leaderboard.length > 0 && (
         <section className="card insight">
-          <h3>✅ On your best runs</h3>
-          <p>
-            {Math.round((goodRuns.filter((r) => r.warmup).length / goodRuns.length) * 100)}% of your
-            8+ runs included a warm-up. Whatever you did on those days — repeat it.
-          </p>
+          <h3>Your running soundtrack</h3>
+          <div className="song-list">
+            {leaderboard.map((t) => (
+              <div key={t.key} className="song-rank">
+                <SongCell seg={t} />
+                <Pill tone="base">{t.count}×</Pill>
+              </div>
+            ))}
+          </div>
         </section>
       )}
-    </div>
+
+      {hardest.length > 0 && (
+        <section className="card insight">
+          <h3>Songs you run hardest to</h3>
+          <p className="muted small">Average heart rate while each track played.</p>
+          <div className="song-list">
+            {hardest.map((t) => (
+              <div key={t.key} className="song-rank">
+                <SongCell seg={t} />
+                <span className="song-stat" style={{ color: "var(--viz-b)" }}>{Math.round(t.avgHr)} bpm</span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {fastest.length > 0 && (
+        <section className="card insight">
+          <h3>Songs you run fastest to</h3>
+          <p className="muted small">Average pace while each track played.</p>
+          <div className="song-list">
+            {fastest.map((t) => (
+              <div key={t.key} className="song-rank">
+                <SongCell seg={t} />
+                <span className="song-stat mono" style={{ color: "var(--accent)" }}>{fmtPace(t.avgPace)}</span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+    </>
   );
 }
 
@@ -3330,10 +3789,10 @@ function StyleBlock() {
       .wu-done .wu-time { font-size:30px; }
 
       .form-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
-      .field { display:flex; flex-direction:column; gap:6px; font-size:12px; color:var(--muted); font-weight:600; margin-bottom:10px; }
+      .field { display:flex; flex-direction:column; gap:6px; font-size:12px; color:var(--muted); font-weight:600; margin-bottom:10px; min-width:0; }
       .field span { text-transform:uppercase; letter-spacing:0.05em; font-size:11px; }
       input, select, textarea { background:var(--bg); border:1px solid var(--line); color:var(--ink);
-        border-radius:10px; padding:11px; font-family:inherit; font-size:14px; width:100%; }
+        border-radius:10px; padding:11px; font-family:inherit; font-size:14px; width:100%; min-width:0; }
       input:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent-dim); }
       textarea { resize:vertical; }
 
@@ -3396,6 +3855,11 @@ function StyleBlock() {
       .bar-fill { height:100%; background:var(--accent); border-radius:999px; }
       .bar-n { font-family:var(--font-mono),monospace; font-size:12px; color:var(--muted); width:20px; text-align:right; }
 
+      .vol-chart { display:flex; align-items:flex-end; gap:6px; height:96px; margin-bottom:6px; }
+      .vol-col { flex:1; display:flex; align-items:flex-end; height:100%; }
+      .vol-bar { width:100%; background:var(--accent); border-radius:6px 6px 0 0; min-height:2px; }
+      .vol-axis { display:flex; justify-content:space-between; }
+
       .pace-table { margin-top:12px; background:var(--bg); border:1px solid var(--line); border-radius:12px; padding:6px 14px; }
       .pt-section { font-size:11px; text-transform:uppercase; letter-spacing:0.06em; color:var(--accent-dim); padding:12px 0 6px; font-weight:600; }
       .pt-row { display:flex; justify-content:space-between; padding:6px 0; border-top:1px solid var(--line); font-size:13.5px; }
@@ -3426,6 +3890,41 @@ function StyleBlock() {
       .chart-tip { background:var(--panel-2); border:1px solid var(--line); border-radius:10px; padding:8px 10px; font-size:12.5px; line-height:1.5; }
       .chart-tip-t { color:var(--muted); font-size:11px; margin-bottom:4px; }
       .chip .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+
+      .chart-tip-wrap { display:flex; flex-direction:column; gap:6px; max-width:240px; }
+      .chart-tip-song { padding:7px 8px; }
+
+      /* shared album-art + title + artist cell */
+      .song-cell { display:flex; align-items:center; gap:10px; min-width:0; }
+      .song-art { width:40px; height:40px; border-radius:7px; object-fit:cover; flex-shrink:0; background:var(--bg); }
+      .song-art-ph { display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:18px; }
+      .song-meta { min-width:0; }
+      .song-title { font-weight:700; font-size:13.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+      .song-artist { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+      /* chart focus pin (jumped-to moment from the setlist) */
+      .chart-pin { margin-top:10px; padding:10px 12px; background:var(--panel-2); border:1px solid var(--line); border-radius:12px; display:flex; flex-direction:column; gap:8px; }
+      .chart-pin-data { display:flex; align-items:center; gap:14px; font-size:13px; }
+      .chart-pin-data > strong { color:var(--ink); }
+      .pin-close { margin-left:auto; background:none; border:none; color:var(--muted); cursor:pointer; font-size:13px; padding:2px 4px; }
+      .pin-close:hover { color:var(--ink); }
+
+      /* per-activity setlist */
+      .setlist { display:flex; flex-direction:column; gap:4px; margin-top:8px; }
+      .setlist-row { display:flex; align-items:center; gap:8px; }
+      .setlist-main { flex:1; min-width:0; display:flex; align-items:center; gap:12px; background:var(--bg); border:1px solid var(--line);
+        border-radius:12px; padding:8px 12px; cursor:pointer; font-family:inherit; text-align:left; color:var(--ink); transition:.12s; }
+      .setlist-main:hover { border-color:var(--accent-dim); }
+      .setlist-time { color:var(--accent); font-size:12px; width:40px; flex-shrink:0; }
+      .setlist-spotify { flex-shrink:0; font-size:12px; font-weight:700; color:var(--positive); white-space:nowrap;
+        border:1px solid color-mix(in srgb, var(--positive) 35%, transparent); border-radius:999px; padding:6px 10px; }
+      .setlist-spotify:hover { background:color-mix(in srgb, var(--positive) 12%, transparent); }
+
+      /* insights song lists (leaderboard / hardest / fastest) */
+      .song-list { display:flex; flex-direction:column; gap:10px; }
+      .song-rank { display:flex; align-items:center; gap:12px; }
+      .song-rank .song-cell { flex:1; }
+      .song-stat { font-weight:700; font-size:13px; flex-shrink:0; }
 
       .zlist { display:flex; flex-direction:column; }
       .zrow { display:grid; grid-template-columns:14px 1fr auto; gap:10px; align-items:center; padding:7px 0; border-top:1px solid var(--line); font-size:13px; }
