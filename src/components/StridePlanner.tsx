@@ -1394,7 +1394,7 @@ useEffect(() => {
 
       <main className="content">
         {tab === "today" && <Today profile={profile} plan={plan} runs={runs} zones={zones} go={setTab} onUpdateFitness={updateFitness} refreshKey={dataVersion} />}
-        {tab === "plan" && <PlanView plan={plan} zones={zones} profile={profile} onReschedule={setSessionSchedule} refreshKey={dataVersion} />}
+        {tab === "plan" && <PlanView plan={plan} zones={zones} profile={profile} runs={runs} onReschedule={setSessionSchedule} onOpenRun={openActivity} refreshKey={dataVersion} />}
         {tab === "log" && (
           <div className="stack">
             <button className="btn-ghost back-btn" onClick={() => setTab("today")}>‹ Back to today</button>
@@ -1654,18 +1654,21 @@ function WarmupTimer() {
 
 /* ---------- PLAN ---------- */
 
-function PlanView({ plan, zones, profile, onReschedule, refreshKey }) {
+function PlanView({ plan, zones, profile, runs, onReschedule, onOpenRun, refreshKey }) {
   const [open, setOpen] = useState(null); // which week is expanded
   const [editing, setEditing] = useState(null); // "week:origDay" of the session being moved/skipped
-  const [done, setDone] = useState(() => new Set());
+  // "week:day" -> linked activity id (the run the user matched to this session)
+  const [links, setLinks] = useState(() => new Map());
 
   useEffect(() => {
     let alive = true;
     loadCompletions().then((rows) => {
-      if (alive) setDone(new Set(rows.map((r) => `${r.planned_week}:${r.planned_day}`)));
+      if (alive) setLinks(new Map(rows.map((r) => [`${r.planned_week}:${r.planned_day}`, r.activity_id])));
     });
     return () => { alive = false; };
   }, [refreshKey]);
+
+  const runById = new Map((runs || []).map((r) => [r.id, r]));
 
   // Auto-expand the current week when the plan loads (plan identity is stable
   // between renders, so this fires on load/regeneration — not on user toggles).
@@ -1700,7 +1703,7 @@ function PlanView({ plan, zones, profile, onReschedule, refreshKey }) {
       {plan.map((w) => {
         const active = w.sessions.filter((s) => !s.skipped);
         const total = active.length;
-        const doneCount = active.filter((s) => done.has(`${w.week}:${s.day}`)).length;
+        const doneCount = active.filter((s) => links.has(`${w.week}:${s.day}`)).length;
         const isPast = w.week < curNum;
         const showCount = (isPast || w.week === curNum) && doneCount > 0;
         const range = `${fmtShortDate(w.weekStart)} – ${fmtShortDate(addDays(w.weekStart, 6))}`;
@@ -1721,7 +1724,9 @@ function PlanView({ plan, zones, profile, onReschedule, refreshKey }) {
               <div className="sessions">
                 {w.sessions.map((s, i) => {
                   const d = sessionDescription(s, zones);
-                  const isDone = !s.skipped && done.has(`${w.week}:${s.day}`);
+                  const linkedId = s.skipped ? null : links.get(`${w.week}:${s.day}`);
+                  const linkedRun = linkedId != null ? runById.get(linkedId) : null;
+                  const isDone = !!linkedId;
                   const isMissed = !s.skipped && isPast && !isDone;
                   const key = `${w.week}:${s.origDay}`;
                   const isEditing = editing === key;
@@ -1747,35 +1752,57 @@ function PlanView({ plan, zones, profile, onReschedule, refreshKey }) {
                       </div>
                       {isEditing && (
                         <div className="sess-editor">
-                          {s.skipped ? (
-                            <p className="muted small" style={{ margin: "0 0 8px" }}>This run is skipped — it won't count toward your week.</p>
+                          {linkedId ? (
+                            // Linked to a logged run: it's settled, so moving/skipping
+                            // no longer makes sense. Show a short recap + a jump to the
+                            // activity, where it can be unlinked to free up these options.
+                            <>
+                              <div className="sess-editor-lbl">Logged run</div>
+                              <div className="sess-linked muted small" style={{ margin: "0 0 8px" }}>
+                                {linkedRun ? (
+                                  <>{relDate(linkedRun.date)} · {linkedRun.distance}km · {fmtPaceBare(paceOf(linkedRun))}/km{linkedRun.score != null ? ` · ${linkedRun.score}/10` : ""}</>
+                                ) : (
+                                  <>This run is linked to a logged activity.</>
+                                )}
+                              </div>
+                              <div className="sess-editor-actions">
+                                <button className="btn-ghost" onClick={() => { onOpenRun(linkedId); }}>View in Activities ›</button>
+                              </div>
+                              <p className="muted small" style={{ margin: "8px 0 0" }}>To move or skip this run, unlink it from its activity first.</p>
+                            </>
                           ) : (
                             <>
-                              <div className="sess-editor-lbl">Move to</div>
-                              <div className="day-picker">
-                                {blockDays.map((iso) => (
-                                  <button
-                                    key={iso}
-                                    className={`day-chip ${iso === s.date ? "on" : ""}`}
-                                    onClick={() => { onReschedule(w.week, s.origDay, iso); setEditing(null); }}
-                                  >
-                                    <span className="dc-dow">{dowName(iso)}</span>
-                                    <span className="dc-num">{Number(iso.slice(8, 10))}</span>
-                                  </button>
-                                ))}
+                              {s.skipped ? (
+                                <p className="muted small" style={{ margin: "0 0 8px" }}>This run is skipped — it won't count toward your week.</p>
+                              ) : (
+                                <>
+                                  <div className="sess-editor-lbl">Move to</div>
+                                  <div className="day-picker">
+                                    {blockDays.map((iso) => (
+                                      <button
+                                        key={iso}
+                                        className={`day-chip ${iso === s.date ? "on" : ""}`}
+                                        onClick={() => { onReschedule(w.week, s.origDay, iso); setEditing(null); }}
+                                      >
+                                        <span className="dc-dow">{dowName(iso)}</span>
+                                        <span className="dc-num">{Number(iso.slice(8, 10))}</span>
+                                      </button>
+                                    ))}
+                                  </div>
+                                </>
+                              )}
+                              <div className="sess-editor-actions">
+                                {s.skipped ? (
+                                  <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, null); setEditing(null); }}>Un-skip</button>
+                                ) : (
+                                  <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, "skipped"); setEditing(null); }}>Skip this run</button>
+                                )}
+                                {(s.date !== dateForDayInWeek(w.weekStart, s.origDay) || s.skipped) && (
+                                  <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, null); setEditing(null); }}>Reset</button>
+                                )}
                               </div>
                             </>
                           )}
-                          <div className="sess-editor-actions">
-                            {s.skipped ? (
-                              <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, null); setEditing(null); }}>Un-skip</button>
-                            ) : (
-                              <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, "skipped"); setEditing(null); }}>Skip this run</button>
-                            )}
-                            {(s.date !== dateForDayInWeek(w.weekStart, s.origDay) || s.skipped) && (
-                              <button className="btn-ghost" onClick={() => { onReschedule(w.week, s.origDay, null); setEditing(null); }}>Reset</button>
-                            )}
-                          </div>
                         </div>
                       )}
                     </div>
