@@ -53,6 +53,14 @@ function fmtPaceBare(secPerKm) {
   return p === "—" ? p : p.replace("/km", "");
 }
 
+// a pace difference (seconds) as "M:SS" or "Ns" — for "X/km quicker than…" copy
+function fmtPaceDelta(sec) {
+  const s = Math.round(Math.abs(sec));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return m > 0 ? `${m}:${String(r).padStart(2, "0")}` : `${r}s`;
+}
+
 // Riegel race-time prediction: t2 = t1 * (d2/d1)^1.06
 function riegel(t1, d1, d2) {
   return t1 * Math.pow(d2 / d1, 1.06);
@@ -200,7 +208,7 @@ function generatePlan(profile) {
     }
     const weekVol = Math.round(vol);
     const weekStart = addDays(firstMonday, w * 7);
-    weeks.push(buildWeek(w, totalWeeks, weekVol, goalDistanceKm, days, isTaper, cutback, sched, weekStart, overrides, start, w === 0));
+    weeks.push(buildWeek(w, totalWeeks, weekVol, goalDistanceKm, days, isTaper, cutback, sched, weekStart, overrides, start, todayISO()));
   }
   return weeks;
 }
@@ -234,7 +242,7 @@ function peakVol(start, buildWeeks) {
   return v;
 }
 
-function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, weekStart, overrides, start, isFirst) {
+function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, weekStart, overrides, start, today) {
   // long run grows toward ~ goalKm (capped for safety) but eased in taper
   const longCap = goalKm <= 10 ? goalKm * 1.0 : goalKm <= 21.1 ? goalKm * 0.95 : goalKm * 0.80;
   const progress = Math.min(1, (idx + 1) / Math.max(1, total - 2));
@@ -271,14 +279,20 @@ function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, w
     return { ...s, origDay, day: dowName(date), date, skipped };
   });
 
-  // First (partial) week: drop any run day that falls before the start date,
-  // and scale the volume target to the days that actually remain.
+  // Drop run days that can't actually be run: anything before the plan's start
+  // date (partial first week), and — for the week that contains today — any day
+  // that has already passed. A plan generated on Saturday shouldn't prescribe a
+  // Wednesday run for this week. Scale the volume target to the days that remain.
+  const weekEnd = addDays(weekStart, 6);
+  const isCurrentWeek = today >= weekStart && today <= weekEnd;
   let volume = weekVol;
-  if (isFirst) {
-    const full = sessions.length;
-    sessions = sessions.filter((s) => s.date >= start);
-    if (full > 0 && sessions.length < full) volume = Math.round(weekVol * sessions.length / full);
-  }
+  const full = sessions.length;
+  sessions = sessions.filter((s) => {
+    if (s.date < start) return false;                  // plan hasn't started yet
+    if (isCurrentWeek && s.date < today) return false; // already passed this week
+    return true;
+  });
+  if (full > 0 && sessions.length < full) volume = Math.round(weekVol * sessions.length / full);
   sessions.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 
   return {
@@ -321,8 +335,6 @@ function fmtDurRange(range) {
 }
 
 function sessionDescription(s, zones) {
-  const pz = zones && zones[s.type];
-  const paceStr = pz ? `${fmtPace(pz[0])}–${fmtPace(pz[1])}` : "by feel";
   const dur = sessionDurationRange(s, zones);
   const timeStr = dur ? `                 ${fmtDurRange(dur)}.` : "";
   const fuelStr = dur && dur[1] >= 90 * 60
@@ -336,11 +348,20 @@ function sessionDescription(s, zones) {
     const ip = zones && zones.interval;
     return { title: "Intervals (VO2)", detail: `15min easy warm-up with strides, then 5 × 3min @ ${ip ? fmtPace(ip[1]) : "hard"} with 90s jog between, then 10min easy cool-down.${timeStr}` };
   }
+  // Easy + long are always conversational, so the pace prescription is noise —
+  // just state the distance and the effort. (Pace adherence is surfaced after
+  // the run, as a drift flag on the activity. See PaceInsights.)
   if (s.type === "long") {
-    const lp = zones && zones.long;
-    return { title: `Long run · ${s.km}km`, detail: `Steady & easy @ ${lp ? fmtPace(lp[0]) + "–" + fmtPace(lp[1]) : "conversational"}.${timeStr}${fuelStr}` };
+    return { title: `Long run · ${s.km}km`, detail: `Conversational — easy by feel.${fuelStr}` };
   }
-  return { title: `Easy / Zone 2 · ${s.km}km`, detail: `Truly easy @ ${paceStr}. If you can't talk in full sentences, slow down.${timeStr}${fuelStr}` };
+  return { title: `Easy / Zone 2 · ${s.km}km`, detail: `Conversational — easy by feel.` };
+}
+
+// Planned distance for a session. Distance runs (easy/long) carry it directly;
+// structured quality sessions don't, so we use the ~6km the weekly-volume math
+// budgets for them (warm-up + work + cool-down). Used for the week's km target.
+function plannedKm(s) {
+  return s.km != null ? s.km : 6;
 }
 
 /* ---------- adaptive fitness ---------- */
@@ -1123,6 +1144,9 @@ export default function App() {
   const [cross, setCross] = useState([]);
   const [fuel, setFuel] = useState([]);
   const [selectedActivityId, setSelectedActivityId] = useState(null);
+  // Bumped on every realtime change so child views that hold their own data
+  // (e.g. Today's completions) can re-fetch without a remount.
+  const [dataVersion, setDataVersion] = useState(0);
 
   /* --- URL <-> activity-detail sync (History API, see docs/UI_overhaul.md §2.4).
      Only the activity-detail dimension lives in the URL: /?activity=<uuid>.
@@ -1212,6 +1236,31 @@ export default function App() {
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [refreshAll]);
+
+  // Live updates: subscribe to the user's own rows so changes made anywhere —
+  // a run arriving via the Strava webhook, a link/score saved on another device
+  // — refresh the UI without a manual reload. Realtime honours RLS, so we only
+  // receive our own rows. Focus-refresh above remains the fallback. See
+  // migration 014_realtime.sql (tables must be in the supabase_realtime pub).
+  useEffect(() => {
+    const supabase = sb();
+    let channel;
+    let cancelled = false;
+    (async () => {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user || cancelled) return;
+      const bump = () => { refreshAll(); setDataVersion((v) => v + 1); };
+      const sub = (table) => ({ event: "*", schema: "public", table, filter: `user_id=eq.${user.id}` });
+      channel = supabase
+        .channel("stride-live")
+        .on("postgres_changes", sub("activities"), bump)
+        .on("postgres_changes", sub("run_logs"), bump)
+        .on("postgres_changes", sub("session_completions"), bump)
+        .on("postgres_changes", sub("activity_streams"), bump)
+        .subscribe();
+    })();
+    return () => { cancelled = true; if (channel) supabase.removeChannel(channel); };
   }, [refreshAll]);
 
   const zones = computeZones(profile);
@@ -1344,8 +1393,8 @@ useEffect(() => {
       </nav>
 
       <main className="content">
-        {tab === "today" && <Today profile={profile} plan={plan} runs={runs} zones={zones} go={setTab} onUpdateFitness={updateFitness} />}
-        {tab === "plan" && <PlanView plan={plan} zones={zones} profile={profile} onReschedule={setSessionSchedule} />}
+        {tab === "today" && <Today profile={profile} plan={plan} runs={runs} zones={zones} go={setTab} onUpdateFitness={updateFitness} refreshKey={dataVersion} />}
+        {tab === "plan" && <PlanView plan={plan} zones={zones} profile={profile} onReschedule={setSessionSchedule} refreshKey={dataVersion} />}
         {tab === "log" && (
           <div className="stack">
             <button className="btn-ghost back-btn" onClick={() => setTab("today")}>‹ Back to today</button>
@@ -1375,13 +1424,13 @@ useEffect(() => {
 
 /* ---------- TODAY ---------- */
 
-function Today({ profile, plan, runs, zones, go, onUpdateFitness }) {
+function Today({ profile, plan, runs, zones, go, onUpdateFitness, refreshKey }) {
   const [completions, setCompletions] = useState([]);
   useEffect(() => {
     let alive = true;
     loadCompletions().then((c) => { if (alive) setCompletions(c); });
     return () => { alive = false; };
-  }, []);
+  }, [refreshKey]);
   if (!profile) return <Empty msg="Head to Setup to get started." />;
   const review = weekReview(plan, profile, runs, completions);
   const wk = currentWeek(profile, plan);
@@ -1391,10 +1440,21 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness }) {
     .reduce((a, r) => a + (parseFloat(r.distance) || 0), 0);
   const fitness = fitnessUpdateSuggestion(profile, runs);
 
-  // Weekly-target progress for the hub ring.
-  const target = wk ? wk.volume : 0;
-  const weekPct = target ? weekKm / target : 0;
-  const weekRemain = target ? Math.max(0, target - weekKm) : 0;
+  // Weekly-target progress for the hub ring. Target = the km actually planned
+  // for THIS week (sum of its sessions — quality sessions don't carry a km, so
+  // we use the ~6km the volume math assumes for them). Filled = km from runs
+  // the user has linked to this week's plan, so stray runs don't skew it.
+  const runById = new Map(runs.map((r) => [r.id, parseFloat(r.distance) || 0]));
+  const target = wk
+    ? wk.sessions.filter((s) => !s.skipped).reduce((a, s) => a + plannedKm(s), 0)
+    : 0;
+  const weekLinkedKm = wk
+    ? completions
+        .filter((c) => c.planned_week === wk.week)
+        .reduce((a, c) => a + (runById.get(c.activity_id) || 0), 0)
+    : 0;
+  const weekPct = target ? weekLinkedKm / target : 0;
+  const weekRemain = target ? Math.max(0, target - weekLinkedKm) : 0;
   const doneSet = new Set(completions.map((c) => `${c.planned_week}:${c.planned_day}`));
   const wkSessions = wk ? wk.sessions.filter((s) => !s.skipped) : []; // skipped don't count toward the week
   const wkDone = wkSessions.filter((s) => doneSet.has(`${wk.week}:${s.day}`)).length;
@@ -1438,7 +1498,7 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness }) {
             <Pill tone="accent">Week {wk.week} · {wk.label}</Pill>
           </div>
           <div className="week-hub-row">
-            <ProgressRing pct={weekPct} value={weekKm.toFixed(1)} sub={`of ${wk.volume} km`} />
+            <ProgressRing pct={weekPct} value={weekLinkedKm.toFixed(1)} sub={`of ${target} km`} />
             <div className="week-hub-side">
               <div className="wh-stat">
                 <span className="wh-num" style={{ color: weekPct >= 1 ? "var(--positive)" : "var(--accent)" }}>{Math.round(weekPct * 100)}%</span>
@@ -1594,7 +1654,7 @@ function WarmupTimer() {
 
 /* ---------- PLAN ---------- */
 
-function PlanView({ plan, zones, profile, onReschedule }) {
+function PlanView({ plan, zones, profile, onReschedule, refreshKey }) {
   const [open, setOpen] = useState(null); // which week is expanded
   const [editing, setEditing] = useState(null); // "week:origDay" of the session being moved/skipped
   const [done, setDone] = useState(() => new Set());
@@ -1605,7 +1665,7 @@ function PlanView({ plan, zones, profile, onReschedule }) {
       if (alive) setDone(new Set(rows.map((r) => `${r.planned_week}:${r.planned_day}`)));
     });
     return () => { alive = false; };
-  }, []);
+  }, [refreshKey]);
 
   // Auto-expand the current week when the plan loads (plan identity is stable
   // between renders, so this fires on load/regeneration — not on user toggles).
@@ -2166,6 +2226,7 @@ function ActivityDetail({ activityId, onBack, profile, onScored, onDelete }) {
         </section>
       )}
 
+      <PaceInsights pace={pace} splits={splits} completion={completion} profile={profile} />
       <LinkSession activity={a} log={log} completion={completion} profile={profile} onSaved={() => setReloadTick((t) => t + 1)} />
       <ScoreCard activity={a} log={log} onSaved={() => { setReloadTick((t) => t + 1); onScored?.(); }} />
 
@@ -2437,6 +2498,87 @@ function ScoreCard({ activity, log, onSaved }) {
         <button className="btn-primary slim" onClick={save} disabled={saving}>{saving ? "Saving…" : "Save"}</button>
         <button className="btn-ghost" onClick={() => setEditing(false)} disabled={saving}>Cancel</button>
       </div>
+    </section>
+  );
+}
+
+// Pace adherence for a run that's been LINKED to a planned session. Unlinked
+// runs show nothing here (just the "Link to plan" tile). Easy/long runs are
+// always conversational, so we only flag running TOO HARD; quality sessions get
+// the full whole-run + per-km breakdown against the planned pace band.
+function PaceInsights({ pace, splits, completion, profile }) {
+  if (!completion) return null;
+  const zones = computeZones(profile);
+  const plan = profile ? generatePlan(profile) : [];
+  const wk = plan.find((w) => w.week === completion.planned_week);
+  const session = wk && wk.sessions.find((s) => s.day === completion.planned_day);
+  const type = session ? session.type : null;
+  const band = type && zones ? zones[type] : null;
+  if (!type || !band || !pace) return null;
+  const [slow, fast] = band; // sec/km; slow end is the larger number
+
+  // Easy / long: conversational by definition. The only meaningful miss is
+  // going faster than the top of the easy range — flag that, praise the rest.
+  if (type === "easy" || type === "long") {
+    const tooHard = pace < fast;
+    return (
+      <section className="card">
+        <div className="card-head">
+          <h3>Pace check</h3>
+          <Pill tone={tooHard ? "warn" : "accent"}>{tooHard ? "ran hot" : "kept it easy"}</Pill>
+        </div>
+        {tooHard ? (
+          <p className="muted small">
+            You averaged {fmtPace(pace)} — about {fmtPaceDelta(fast - pace)}/km quicker than the top of your easy range ({fmtPace(fast)}).
+            Easy days do their job only when they stay genuinely easy; ease off and let these be recovery.
+          </p>
+        ) : (
+          <p className="muted small">
+            You averaged {fmtPace(pace)}, comfortably within easy effort. Nicely controlled — exactly how easy and long runs should feel.
+          </p>
+        )}
+      </section>
+    );
+  }
+
+  // Quality (tempo / interval): whole-run summary + per-km vs the target band.
+  const verdict = pace <= slow && pace >= fast ? "on target" : pace < fast ? "faster than target" : "slower than target";
+  const km = splits.map((s, i) => {
+    const sp = s.average_speed ? 1000 / s.average_speed : null;
+    const tone = sp == null ? "" : sp < fast ? "fast" : sp > slow ? "slow" : "on";
+    return { n: s.split ?? i + 1, sp, tone };
+  });
+  return (
+    <section className="card">
+      <div className="card-head">
+        <h3>Pace vs plan</h3>
+        <Pill tone="base">{cap(type)}</Pill>
+      </div>
+      <div className="hero-row">
+        <Stat label="Your avg" value={fmtPaceBare(pace)} accent />
+        <Stat label="Target" value={`${fmtPaceBare(slow)}–${fmtPaceBare(fast)}`} />
+        <Stat label="Verdict" value={verdict} />
+      </div>
+      {km.length > 0 && (
+        <div className="splits-table" style={{ marginTop: 10 }}>
+          <div className="srow shead"><span>Km</span><span>Pace</span><span>vs plan</span></div>
+          {km.map((k) => (
+            <div key={k.n} className="srow">
+              <span>{k.n}</span>
+              <span className="mono">{fmtPace(k.sp)}</span>
+              <span
+                className={`mono ${k.tone === "slow" ? "muted" : ""}`}
+                style={k.tone === "on" ? { color: "var(--positive)" } : k.tone === "fast" ? { color: "var(--accent)" } : undefined}
+              >
+                {k.tone === "on" ? "on target" : k.tone === "fast" ? "faster" : k.tone === "slow" ? "easier" : "—"}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      <p className="muted small" style={{ marginTop: 8 }}>
+        Warm-up and cool-down kms read “easier” than target — that’s expected; the work intervals are where it counts.
+      </p>
     </section>
   );
 }

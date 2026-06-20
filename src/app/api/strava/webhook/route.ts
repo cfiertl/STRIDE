@@ -94,6 +94,16 @@ async function processActivityEvent(event: any) {
     description: d.description ?? null,
   };
 
+  // Is this the first time we've seen this activity? Strava doesn't guarantee a
+  // "create" arrives before an "update" (and a create can be missed), so we key
+  // the notification off first-seen rather than the event's aspect_type.
+  const { data: existing } = await admin
+    .from("activities")
+    .select("id")
+    .eq("strava_id", d.id)
+    .maybeSingle();
+  const firstSeen = !existing;
+
   const { data: upserted, error: upErr } = await admin
     .from("activities")
     .upsert(row, { onConflict: "strava_id" })
@@ -113,12 +123,19 @@ async function processActivityEvent(event: any) {
     );
   }
 
-  if (event.aspect_type === "create") {
-    await sendPushToUser(userId, {
+  console.log(
+    `strava webhook: ${event.aspect_type} activity ${stravaId} user ${userId} firstSeen=${firstSeen}`
+  );
+
+  if (firstSeen) {
+    const pushRes = await sendPushToUser(userId, {
       title: "STRIDE",
       body: "New activity available to view in STRIDE",
       url: "/",
     });
+    console.log(
+      `strava webhook: push for ${stravaId} sent=${pushRes.sent} pruned=${pushRes.pruned} errors=${JSON.stringify(pushRes.errors)}`
+    );
 
     try {
       await captureSpotifyForActivity(userId, {
