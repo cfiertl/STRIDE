@@ -1230,6 +1230,28 @@ function SessionSteps({ session, zones }) {
   );
 }
 
+// Which pace metric the watch alert should watch, per session type. They differ,
+// and the difference matters more than the range does:
+//
+// A 3-minute rep is too short for average pace to help — it needs most of the rep
+// to converge, by which point the rep is over and nothing can be corrected. Only
+// current pace can prompt a mid-rep correction, at the cost of GPS noise for the
+// first ~20s while it settles.
+//
+// A 22:30 threshold block is the opposite: average converges within a few minutes
+// and holding a steady average IS the session, whereas current pace would nag on
+// every rise and corner.
+const WATCH_PACE_METRIC = {
+  tempo: {
+    metric: "Average pace",
+    why: "Over 22:30 the average settles quickly, and holding it steady is the session. Current pace would buzz on every rise and corner.",
+  },
+  interval: {
+    metric: "Current pace",
+    why: "Average pace can't react inside a 3:00 rep — it only converges once the rep is over. Ignore the first ~20s of each effort: that's GPS settling, not you.",
+  },
+};
+
 // The pace alert a watch workout would be built against, per structured session
 // type. Both the setup card and the drift check read this, so what gets confirmed
 // and what gets compared can't diverge.
@@ -1280,6 +1302,7 @@ function WatchSetup({ session, zones, built, onBuilt }) {
   const target = watchTargets(zones)[session.type] || "";
   const mark = built && built[session.type];
   const isCurrent = mark && mark.target === target;
+  const metric = WATCH_PACE_METRIC[session.type];
 
   const blocks = [];
   sessionSteps(session).forEach((st) => {
@@ -1312,7 +1335,10 @@ function WatchSetup({ session, zones, built, onBuilt }) {
               <div key={i} className="watch-block">
                 <span className="wb-name">{b.name}</span>
                 <span className="wb-dur">{fmtTime(b.sec)}</span>
-                <span className="wb-target">{b.target || "no target"}</span>
+                <span className="wb-target">
+                  {b.target ? `${b.target}` : "no target"}
+                  {b.target && metric && <span className="wb-metric">{metric.metric}</span>}
+                </span>
                 <span className="wb-reps">{b.reps ? `×${b.reps}` : ""}</span>
               </div>
             ))}
@@ -1322,6 +1348,11 @@ function WatchSetup({ session, zones, built, onBuilt }) {
             a <strong>pace alert</strong> on the work block to that range — the watch buzzes when you drift
             out, so you never have to read pace mid-rep. Build it once; this session repeats all plan.
           </p>
+          {metric && (
+            <p className="muted small" style={{ margin: "8px 0 0" }}>
+              Set the alert to <strong>{metric.metric}</strong> — not the other one. {metric.why}
+            </p>
+          )}
           {onBuilt && target && (
             <div className="sess-editor-actions">
               {isCurrent ? (
@@ -4439,6 +4470,9 @@ function StyleBlock() {
       .wb-arrow { color:var(--muted); font-size:11px; }
       .watch-block .wb-was + .wb-arrow + .wb-target { color:var(--amber); font-weight:700; width:auto; }
       .wb-ok { color:var(--positive); font-weight:800; font-size:13px; }
+      .watch-block .wb-target { display:flex; flex-direction:column; align-items:flex-end; gap:1px; }
+      .wb-metric { font-family:inherit; font-size:9.5px; font-weight:700; text-transform:uppercase;
+        letter-spacing:0.04em; color:var(--accent); }
 
       .sess-editor { background:var(--panel-2); border:1px solid var(--line); border-top:none;
         border-radius:0 0 12px 12px; margin:-6px 0 0; padding:14px 12px 12px; }
