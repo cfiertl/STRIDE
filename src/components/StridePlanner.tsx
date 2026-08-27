@@ -337,6 +337,13 @@ function sessionSteps(s) {
 // Seconds a step occupies. Reps carry recoveries *between* efforts only — the
 // last one runs straight into the cool-down. `end` picks the slow/fast end of a
 // step that's prescribed as a range (the tempo block).
+// Does this session have a real prescription, or is it one steady block? Decides
+// whether a step breakdown is worth rendering at all.
+function hasSteps(s) {
+  const steps = sessionSteps(s);
+  return !(steps.length === 1 && steps[0].kind === "steady");
+}
+
 function stepSeconds(step, end = "mid") {
   if (step.kind === "reps") {
     return step.reps * step.work.sec + (step.reps - 1) * step.rest.sec;
@@ -391,37 +398,37 @@ function stepPace(step, zones, fallback) {
 
 function sessionDescription(s, zones) {
   const dur = sessionDurationRange(s, zones);
-  const timeStr = dur ? ` ${fmtDurRange(dur)}.` : "";
+  const durStr = dur ? `${fmtDurRange(dur)} · ` : "";
   const fuelStr = dur && dur[1] >= 90 * 60
     ? " Long enough to fuel — aim ~30–60g carbs/hour (a gel every ~30–40 min)."
     : "";
-  // Structured sessions read their sentence off the steps, so the prose and the
-  // breakdown can never drift apart.
+  // Structured sessions don't spell the prescription out in prose any more —
+  // <SessionSteps/> renders it as a proper breakdown. The row keeps the headline:
+  // how long it takes, and what the hard part of it is.
   if (s.type === "tempo" || s.type === "interval") {
-    const steps = sessionSteps(s);
-    const phrase = steps.map((st) => {
-      if (st.kind === "reps") {
-        const pace = stepPace(st.work, zones, "hard");
-        return `${st.reps} × ${fmtMins(st.work.sec)} @ ${pace} with ${st.rest.sec}s ${st.rest.label.toLowerCase()} between`;
-      }
-      if (st.kind === "work") {
-        const range = st.secRange ? `${Math.round(st.secRange[0] / 60)}–${Math.round(st.secRange[1] / 60)} min` : fmtMins(st.sec);
-        return `${range} @ ${stepPace(st, zones, "comfortably hard")}`;
-      }
-      return `${fmtMins(st.sec)} ${st.label.toLowerCase()}`;
-    });
+    const core = sessionSteps(s).find((st) => st.kind === "reps" || st.kind === "work");
+    let headline = "";
+    if (core && core.kind === "reps") {
+      headline = `${core.reps} × ${fmtTime(core.work.sec)} @ ${stepPace(core.work, zones, "hard")}`;
+    } else if (core) {
+      const range = core.secRange
+        ? `${Math.round(core.secRange[0] / 60)}–${Math.round(core.secRange[1] / 60)} min`
+        : fmtMins(core.sec);
+      headline = `${range} @ ${stepPace(core, zones, "comfortably hard")}`;
+    }
     return {
       title: s.type === "tempo" ? "Tempo / Threshold" : "Intervals (VO2)",
-      detail: `${phrase[0]}, then ${phrase.slice(1, -1).join(", then ")}, then ${phrase[phrase.length - 1]}.${timeStr}`,
+      detail: [dur ? fmtDurRange(dur) : "", headline].filter(Boolean).join(" · "),
+      dur,
     };
   }
   // Easy + long are always conversational, so the pace prescription is noise —
   // just state the distance and the effort. (Pace adherence is surfaced after
   // the run, as a drift flag on the activity. See PaceInsights.)
   if (s.type === "long") {
-    return { title: `Long run · ${s.km}km`, detail: `Conversational — easy by feel.${fuelStr}` };
+    return { title: `Long run · ${s.km}km`, detail: `${durStr}conversational, easy by feel.${fuelStr}`, dur };
   }
-  return { title: `Easy / Zone 2 · ${s.km}km`, detail: `Conversational — easy by feel.` };
+  return { title: `Easy / Zone 2 · ${s.km}km`, detail: `${durStr}conversational, easy by feel.`, dur };
 }
 
 // Planned distance for a session. Distance runs (easy/long) carry it directly;
@@ -1165,7 +1172,7 @@ const Pill = ({ children, tone }) => (
 // where a one-row "breakdown" would say nothing the title doesn't.
 function SessionSteps({ session, zones }) {
   const steps = sessionSteps(session);
-  if (steps.length === 1 && steps[0].kind === "steady") return null;
+  if (!hasSteps(session)) return null;
   return (
     <div className="step-list">
       {steps.map((st, i) => {
@@ -1775,6 +1782,9 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness, onReschedule, 
                 // Today's session gets its full breakdown inline — it's the one
                 // you're about to run, so the steps beat a sentence.
                 const isToday = s.date === today && !s.skipped && !isDone;
+                // With the breakdown below it, the row's headline would just
+                // repeat one of its lines — keep the duration and drop the rest.
+                const showSteps = isToday && hasSteps(s);
                 return (
                   <div key={i} className="session-wrap">
                     <div className={`session ${s.skipped ? "session-skipped" : ""} ${isLate ? "session-overdue" : ""} ${isToday ? "session-today" : ""}`}>
@@ -1784,14 +1794,14 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness, onReschedule, 
                       </div>
                       <div className="session-body">
                         <div className="session-title">{d.title}</div>
-                        <div className="session-detail">{d.detail}</div>
+                        <div className="session-detail">{showSteps && d.dur ? fmtDurRange(d.dur) : d.detail}</div>
                       </div>
                       {s.skipped && <Pill tone="base">skipped</Pill>}
                       {isLate && <Pill tone="warn">overdue</Pill>}
                       {isToday && <Pill tone="accent">today</Pill>}
                       {isDone && <span className="sess-mark done">✓</span>}
                     </div>
-                    {isToday && <SessionSteps session={s} zones={zones} />}
+                    {showSteps && <SessionSteps session={s} zones={zones} />}
                   </div>
                 );
               })}
