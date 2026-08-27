@@ -411,6 +411,26 @@ function stepEffort(step) {
   return (meta && meta.effort) || "";
 }
 
+// Heart-rate band for a step, from the runner's measured thresholds.
+//
+// Only the sustained zones get one, and that's the point rather than a gap: HR
+// takes 60–90s to respond to a change in effort, so on a 3-minute VO2 rep it's
+// still climbing when the rep ends. An HR alert there would fire late and tell
+// you nothing — the same lag argument that ruled out average pace for intervals.
+//
+// A threshold block is the opposite case. LT2 is by definition the effort you can
+// hold for ~30–60 minutes, which is what a 20–25 minute tempo should sit at, so
+// the band runs just under it with LT2 as the ceiling. And unlike pace, HR stays
+// honest on hills and in heat — which is exactly where a tempo goes wrong.
+const TEMPO_HR_FLOOR = 6; // bpm below LT2 the block should stay above
+
+function stepHrBand(step, profile) {
+  if (!profile || step.zone !== "tempo") return null;
+  const lt2 = profile.lt2Hr;
+  if (!lt2) return null;
+  return { lo: lt2 - TEMPO_HR_FLOOR, hi: lt2 };
+}
+
 function sessionDescription(s, zones) {
   const dur = sessionDurationRange(s, zones);
   const durStr = dur ? `${fmtDurRange(dur)} · ` : "";
@@ -1185,9 +1205,13 @@ const Pill = ({ children, tone }) => (
 // nested under their header. Renders from sessionSteps(), so it's the same data
 // the description sentence is built from. Returns null for a plain steady run,
 // where a one-row "breakdown" would say nothing the title doesn't.
-function SessionSteps({ session, zones }) {
+function SessionSteps({ session, zones, profile }) {
   const steps = sessionSteps(session);
   if (!hasSteps(session)) return null;
+  const hrLine = (st) => {
+    const hr = stepHrBand(st, profile);
+    return hr ? `${hr.lo}–${hr.hi} bpm` : "";
+  };
   return (
     <div className="step-list">
       {steps.map((st, i) => {
@@ -1219,8 +1243,11 @@ function SessionSteps({ session, zones }) {
                 <span>{st.label}</span>
                 <span className="step-pace">{stepPace(st, zones, "by feel")}</span>
               </div>
-              {st.kind === "work" && stepEffort(st) && (
-                <div className="step-effort">{stepEffort(st)}</div>
+              {st.kind === "work" && (stepEffort(st) || hrLine(st)) && (
+                <div className="step-effort">
+                  {stepEffort(st)}
+                  {hrLine(st) && <span className="step-hr"> · {hrLine(st)}</span>}
+                </div>
               )}
             </div>
           </div>
@@ -1295,7 +1322,7 @@ function staleWatchTargets(built, zones) {
 // next best thing: the concrete numbers, once, and the watch handles the alerts
 // from then on. Durations resolve to a single buildable value — a builder can't
 // take "20–25 min".
-function WatchSetup({ session, zones, built, onBuilt }) {
+function WatchSetup({ session, zones, built, onBuilt, profile }) {
   const [open, setOpen] = useState(false);
   if (!hasSteps(session)) return null;
 
@@ -1315,8 +1342,13 @@ function WatchSetup({ session, zones, built, onBuilt }) {
       name: st.kind === "warmup" ? "Warm-up" : st.kind === "cooldown" ? "Cool-down" : "Work",
       sec: stepSeconds(st, "mid"),
       target: st.kind === "work" ? stepPace(st, zones, "") : "",
+      hr: st.kind === "work" ? stepHrBand(st, profile) : null,
     });
   });
+  // A tempo block earns an HR alert; a 3-minute rep can't (see stepHrBand). Say
+  // so rather than leaving its absence looking like an oversight.
+  const wantsHr = session.type === "tempo";
+  const hrBand = wantsHr ? stepHrBand({ zone: "tempo" }, profile) : null;
 
   return (
     <div className="watch-setup">
@@ -1338,6 +1370,7 @@ function WatchSetup({ session, zones, built, onBuilt }) {
                 <span className="wb-target">
                   {b.target ? `${b.target}` : "no target"}
                   {b.target && metric && <span className="wb-metric">{metric.metric}</span>}
+                  {b.hr && <span className="wb-hr">+ HR {b.hr.lo}–{b.hr.hi}</span>}
                 </span>
                 <span className="wb-reps">{b.reps ? `×${b.reps}` : ""}</span>
               </div>
@@ -1351,6 +1384,25 @@ function WatchSetup({ session, zones, built, onBuilt }) {
           {metric && (
             <p className="muted small" style={{ margin: "8px 0 0" }}>
               Set the alert to <strong>{metric.metric}</strong> — not the other one. {metric.why}
+            </p>
+          )}
+          {wantsHr && hrBand && (
+            <p className="muted small" style={{ margin: "8px 0 0" }}>
+              Add a second alert on the same block: <strong>heart rate {hrBand.lo}–{hrBand.hi} bpm</strong>, from
+              your measured LT2 of {profile.lt2Hr}. On a hot day or a hilly route pace lies and HR doesn't — if the
+              two disagree, trust the HR and let the pace go.
+            </p>
+          )}
+          {wantsHr && !hrBand && (
+            <p className="muted small" style={{ margin: "8px 0 0" }}>
+              No HR target yet — run the <strong>30-minute test</strong> in Setup and this block gets one too,
+              which is what keeps a tempo honest when heat or hills make pace misleading.
+            </p>
+          )}
+          {session.type === "interval" && (
+            <p className="muted small" style={{ margin: "8px 0 0" }}>
+              No HR alert on this one, deliberately: heart rate takes 60–90s to respond, so on a 3:00 rep it's
+              still climbing when the rep ends.
             </p>
           )}
           {onBuilt && target && (
@@ -2009,8 +2061,8 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness, onReschedule, 
                       {isToday && <Pill tone="accent">today</Pill>}
                       {isDone && <span className="sess-mark done">✓</span>}
                     </div>
-                    {showSteps && <SessionSteps session={s} zones={zones} />}
-                    {showSteps && <WatchSetup session={s} zones={zones} built={watchBuilt} onBuilt={onWatchBuilt} />}
+                    {showSteps && <SessionSteps session={s} zones={zones} profile={profile} />}
+                    {showSteps && <WatchSetup session={s} zones={zones} profile={profile} built={watchBuilt} onBuilt={onWatchBuilt} />}
                   </div>
                 );
               })}
@@ -2259,8 +2311,8 @@ function PlanView({ plan, zones, profile, runs, onReschedule, onOpenRun, complet
                             </>
                           ) : (
                             <>
-                              {!s.skipped && <SessionSteps session={s} zones={zones} />}
-                              {!s.skipped && <WatchSetup session={s} zones={zones} built={watchBuilt} onBuilt={onWatchBuilt} />}
+                              {!s.skipped && <SessionSteps session={s} zones={zones} profile={profile} />}
+                              {!s.skipped && <WatchSetup session={s} zones={zones} profile={profile} built={watchBuilt} onBuilt={onWatchBuilt} />}
                               {s.skipped ? (
                                 <p className="muted small" style={{ margin: "0 0 8px" }}>This run is skipped — it won't count toward your week.</p>
                               ) : (
@@ -4504,6 +4556,9 @@ function StyleBlock() {
       .watch-block .wb-target { display:flex; flex-direction:column; align-items:flex-end; gap:1px; }
       .wb-metric { font-family:inherit; font-size:9.5px; font-weight:700; text-transform:uppercase;
         letter-spacing:0.04em; color:var(--accent); }
+      .wb-hr { font-family:var(--font-mono),monospace; font-size:11px; font-weight:700;
+        color:var(--viz-b); font-variant-numeric:tabular-nums; }
+      .step-hr { color:var(--viz-b); }
 
       .sess-editor { background:var(--panel-2); border:1px solid var(--line); border-top:none;
         border-radius:0 0 12px 12px; margin:-6px 0 0; padding:14px 12px 12px; }
