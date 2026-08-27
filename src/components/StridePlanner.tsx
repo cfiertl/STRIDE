@@ -303,18 +303,64 @@ function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, w
   };
 }
 
-// Estimated duration band (seconds) for a session. Distance runs come from
-// km × the pace band; structured quality sessions are summed from their
-// prescription (warm-up + work + cool-down).
-function sessionDurationRange(s, zones) {
-  if ((s.type === "easy" || s.type === "long") && s.km > 0) {
-    const pz = zones && zones[s.type];
-    if (!pz) return null;
-    return [Math.round(s.km * pz[0]), Math.round(s.km * pz[1])]; // pz[0] faster → shorter time
+// A session's shape as executable steps rather than a sentence. This is the one
+// source of truth: the prose description, the duration estimate and the on-screen
+// breakdown all derive from it, so a change to a session's prescription happens
+// here and shows up everywhere. Steps are one of:
+//   { kind:"steady",  label, km, zone }                     distance-led
+//   { kind:"warmup"|"work"|"cooldown", label, sec, secRange?, zone }
+//   { kind:"reps", reps, work:{label,sec,zone}, rest:{label,sec,zone} }
+// `zone` names a band in computeZones(), so paces stay tied to current fitness.
+function sessionSteps(s) {
+  if (s.type === "tempo") {
+    return [
+      { kind: "warmup", label: "Easy warm-up", sec: 15 * 60, zone: "easy" },
+      { kind: "work", label: "Threshold", sec: 22 * 60 + 30, secRange: [20 * 60, 25 * 60], zone: "tempo" },
+      { kind: "cooldown", label: "Easy cool-down", sec: 10 * 60, zone: "easy" },
+    ];
   }
-  if (s.type === "tempo") return [45 * 60, 50 * 60];     // 15 wu + 20–25 work + 10 cd
-  if (s.type === "interval") return [45 * 60, 50 * 60];  // 15 wu + ~22.5 work + 10 cd
-  return null;
+  if (s.type === "interval") {
+    return [
+      { kind: "warmup", label: "Easy warm-up with strides", sec: 15 * 60, zone: "easy" },
+      {
+        kind: "reps",
+        reps: 5,
+        work: { label: "Hard", sec: 3 * 60, zone: "interval" },
+        rest: { label: "Jog", sec: 90, zone: "easy" },
+      },
+      { kind: "cooldown", label: "Easy cool-down", sec: 10 * 60, zone: "easy" },
+    ];
+  }
+  return [{ kind: "steady", label: s.type === "long" ? "Long run" : "Easy", km: s.km, zone: s.type }];
+}
+
+// Seconds a step occupies. Reps carry recoveries *between* efforts only — the
+// last one runs straight into the cool-down. `end` picks the slow/fast end of a
+// step that's prescribed as a range (the tempo block).
+function stepSeconds(step, end = "mid") {
+  if (step.kind === "reps") {
+    return step.reps * step.work.sec + (step.reps - 1) * step.rest.sec;
+  }
+  if (step.secRange) return end === "min" ? step.secRange[0] : end === "max" ? step.secRange[1] : step.sec;
+  return step.sec || 0;
+}
+
+// Estimated duration band (seconds). Distance-led sessions come from km × the
+// pace band; structured sessions are summed from their steps.
+// Zone bands run [slower, faster], so the slower end gives the LONGER time —
+// this used to return the pair the other way round and printed "~65–61 min".
+function sessionDurationRange(s, zones) {
+  const steps = sessionSteps(s);
+  const steady = steps.length === 1 && steps[0].kind === "steady" ? steps[0] : null;
+  if (steady) {
+    if (!(steady.km > 0)) return null;
+    const pz = zones && zones[steady.zone];
+    if (!pz) return null;
+    return [Math.round(steady.km * pz[1]), Math.round(steady.km * pz[0])]; // faster first
+  }
+  const lo = steps.reduce((a, st) => a + stepSeconds(st, "min"), 0);
+  const hi = steps.reduce((a, st) => a + stepSeconds(st, "max"), 0);
+  return [lo, hi];
 }
 
 function fmtMins(sec) {
@@ -333,19 +379,41 @@ function fmtDurRange(range) {
   return `~${fmtMins(a)}–${fmtMins(b)}`;
 }
 
+// Pace prescription for a step, as a string. Bands run [slower, faster]. The
+// hard zones quote the fast end alone (a VO2 rep has a target, not a range);
+// everything easier quotes the whole band, fast end first.
+function stepPace(step, zones, fallback) {
+  const band = zones && step.zone && zones[step.zone];
+  if (!band) return fallback;
+  if (step.zone === "interval" || step.zone === "reps") return fmtPace(band[1]);
+  return `${fmtPace(band[1])}–${fmtPace(band[0])}`;
+}
+
 function sessionDescription(s, zones) {
   const dur = sessionDurationRange(s, zones);
-  const timeStr = dur ? `                 ${fmtDurRange(dur)}.` : "";
+  const timeStr = dur ? ` ${fmtDurRange(dur)}.` : "";
   const fuelStr = dur && dur[1] >= 90 * 60
     ? " Long enough to fuel — aim ~30–60g carbs/hour (a gel every ~30–40 min)."
     : "";
-  if (s.type === "tempo") {
-    const tp = zones && zones.tempo;
-    return { title: "Tempo / Threshold", detail: `15min easy warm-up, then 20–25min @ ${tp ? fmtPace(tp[1]) + "–" + fmtPace(tp[0]) : "comfortably hard"}, then 10min easy cool-down.${timeStr}` };
-  }
-  if (s.type === "interval") {
-    const ip = zones && zones.interval;
-    return { title: "Intervals (VO2)", detail: `15min easy warm-up with strides, then 5 × 3min @ ${ip ? fmtPace(ip[1]) : "hard"} with 90s jog between, then 10min easy cool-down.${timeStr}` };
+  // Structured sessions read their sentence off the steps, so the prose and the
+  // breakdown can never drift apart.
+  if (s.type === "tempo" || s.type === "interval") {
+    const steps = sessionSteps(s);
+    const phrase = steps.map((st) => {
+      if (st.kind === "reps") {
+        const pace = stepPace(st.work, zones, "hard");
+        return `${st.reps} × ${fmtMins(st.work.sec)} @ ${pace} with ${st.rest.sec}s ${st.rest.label.toLowerCase()} between`;
+      }
+      if (st.kind === "work") {
+        const range = st.secRange ? `${Math.round(st.secRange[0] / 60)}–${Math.round(st.secRange[1] / 60)} min` : fmtMins(st.sec);
+        return `${range} @ ${stepPace(st, zones, "comfortably hard")}`;
+      }
+      return `${fmtMins(st.sec)} ${st.label.toLowerCase()}`;
+    });
+    return {
+      title: s.type === "tempo" ? "Tempo / Threshold" : "Intervals (VO2)",
+      detail: `${phrase[0]}, then ${phrase.slice(1, -1).join(", then ")}, then ${phrase[phrase.length - 1]}.${timeStr}`,
+    };
   }
   // Easy + long are always conversational, so the pace prescription is noise —
   // just state the distance and the effort. (Pace adherence is surfaced after
@@ -1091,6 +1159,49 @@ const Pill = ({ children, tone }) => (
   <span className={`pill pill-${tone || "base"}`}>{children}</span>
 );
 
+// The session's prescription as a readable block — one row per step, with reps
+// nested under their header. Renders from sessionSteps(), so it's the same data
+// the description sentence is built from. Returns null for a plain steady run,
+// where a one-row "breakdown" would say nothing the title doesn't.
+function SessionSteps({ session, zones }) {
+  const steps = sessionSteps(session);
+  if (steps.length === 1 && steps[0].kind === "steady") return null;
+  return (
+    <div className="step-list">
+      {steps.map((st, i) => {
+        if (st.kind === "reps") {
+          return (
+            <div key={i} className="step-row step-reps">
+              <span className="step-dur">{st.reps} ×</span>
+              <div className="step-main">
+                <div className="step-rep-line">
+                  <span className="step-rep-eff">{fmtTime(st.work.sec)} {st.work.label}</span>
+                  <span className="step-pace">{stepPace(st.work, zones, "hard")}</span>
+                </div>
+                <div className="step-rep-line muted">
+                  <span>{fmtTime(st.rest.sec)} {st.rest.label}</span>
+                  <span className="step-pace">between efforts</span>
+                </div>
+              </div>
+            </div>
+          );
+        }
+        return (
+          <div key={i} className={`step-row step-${st.kind}`}>
+            <span className="step-dur">{fmtTime(stepSeconds(st))}</span>
+            <div className="step-main">
+              <div className="step-rep-line">
+                <span>{st.label}</span>
+                <span className="step-pace">{stepPace(st, zones, "by feel")}</span>
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // Circular progress ring (Apple-Activity style). Fills with how much of a
 // target has been done; the arc is cobalt and turns positive-green once the
 // target is hit. value/sub render stacked in the middle.
@@ -1661,19 +1772,26 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness, onReschedule, 
                 const d = sessionDescription(s, zones);
                 const isDone = !s.skipped && doneSet.has(`${wk.week}:${s.day}`);
                 const isLate = !s.skipped && !isDone && s.date < today;
+                // Today's session gets its full breakdown inline — it's the one
+                // you're about to run, so the steps beat a sentence.
+                const isToday = s.date === today && !s.skipped && !isDone;
                 return (
-                  <div key={i} className={`session ${s.skipped ? "session-skipped" : ""} ${isLate ? "session-overdue" : ""}`}>
-                    <div className="session-day">
-                      <span className="sd-dow">{dowName(s.date)}</span>
-                      <span className="sd-num">{Number(s.date.slice(8, 10))}</span>
+                  <div key={i} className="session-wrap">
+                    <div className={`session ${s.skipped ? "session-skipped" : ""} ${isLate ? "session-overdue" : ""} ${isToday ? "session-today" : ""}`}>
+                      <div className="session-day">
+                        <span className="sd-dow">{dowName(s.date)}</span>
+                        <span className="sd-num">{Number(s.date.slice(8, 10))}</span>
+                      </div>
+                      <div className="session-body">
+                        <div className="session-title">{d.title}</div>
+                        <div className="session-detail">{d.detail}</div>
+                      </div>
+                      {s.skipped && <Pill tone="base">skipped</Pill>}
+                      {isLate && <Pill tone="warn">overdue</Pill>}
+                      {isToday && <Pill tone="accent">today</Pill>}
+                      {isDone && <span className="sess-mark done">✓</span>}
                     </div>
-                    <div className="session-body">
-                      <div className="session-title">{d.title}</div>
-                      <div className="session-detail">{d.detail}</div>
-                    </div>
-                    {s.skipped && <Pill tone="base">skipped</Pill>}
-                    {isLate && <Pill tone="warn">overdue</Pill>}
-                    {isDone && <span className="sess-mark done">✓</span>}
+                    {isToday && <SessionSteps session={s} zones={zones} />}
                   </div>
                 );
               })}
@@ -1922,6 +2040,7 @@ function PlanView({ plan, zones, profile, runs, onReschedule, onOpenRun, complet
                             </>
                           ) : (
                             <>
+                              {!s.skipped && <SessionSteps session={s} zones={zones} />}
                               {s.skipped ? (
                                 <p className="muted small" style={{ margin: "0 0 8px" }}>This run is skipped — it won't count toward your week.</p>
                               ) : (
@@ -4092,6 +4211,23 @@ function StyleBlock() {
       .session-overdue .session-day .sd-num { color:var(--amber); }
       .sess-edit { color:var(--muted); font-size:15px; flex-shrink:0; }
       .session.clickable:hover .sess-edit { color:var(--accent); }
+
+      /* session prescription, one row per step */
+      .step-list { display:flex; flex-direction:column; gap:1px; background:var(--line);
+        border:1px solid var(--line); border-radius:10px; overflow:hidden; margin:0 0 12px; }
+      .step-row { display:flex; align-items:flex-start; gap:12px; padding:9px 11px; background:var(--bg); }
+      .step-dur { flex-shrink:0; width:52px; font-family:var(--font-mono),monospace; font-size:13px;
+        font-weight:700; font-variant-numeric:tabular-nums; color:var(--accent); padding-top:1px; }
+      .step-main { flex:1; min-width:0; display:flex; flex-direction:column; gap:3px; }
+      .step-rep-line { display:flex; align-items:baseline; justify-content:space-between; gap:10px;
+        font-size:13px; font-weight:600; }
+      .step-rep-line.muted { font-size:12px; font-weight:500; }
+      .step-rep-eff { font-weight:700; }
+      .step-pace { flex-shrink:0; font-family:var(--font-mono),monospace; font-size:11.5px;
+        font-weight:600; color:var(--muted); font-variant-numeric:tabular-nums; }
+      .step-reps { background:color-mix(in srgb, var(--accent) 5%, var(--bg)); }
+      .step-reps .step-dur { font-size:14px; }
+      .session-today { border-color:var(--accent-dim); }
 
       .sess-editor { background:var(--panel-2); border:1px solid var(--line); border-top:none;
         border-radius:0 0 12px 12px; margin:-6px 0 0; padding:14px 12px 12px; }
