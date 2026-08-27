@@ -1169,10 +1169,10 @@ export default function App() {
   const [runs, setRuns] = useState([]);
   const [cross, setCross] = useState([]);
   const [fuel, setFuel] = useState([]);
+  const [completions, setCompletions] = useState([]); // plan↔run links, loaded with everything else
   const [selectedActivityId, setSelectedActivityId] = useState(null);
   // Bumped on every realtime change so child views that hold their own data
   // (e.g. Today's completions) can re-fetch without a remount.
-  const [dataVersion, setDataVersion] = useState(0);
 
   /* --- URL <-> activity-detail sync (History API, see docs/UI_overhaul.md §2.4).
      Only the activity-detail dimension lives in the URL: /?activity=<uuid>.
@@ -1231,17 +1231,22 @@ export default function App() {
   // fresh data without a full close-and-reopen. Returns the profile so the
   // caller can decide on the first-load setup redirect.
   const refreshAll = useCallback(async () => {
-    const [p, r, c, f] = await Promise.all([
+    // Completions load here rather than inside Today/PlanView so the week review
+    // and the done ✓s are present on first paint — fetching them per-tab meant
+    // they popped in half a second late, after everything else had rendered.
+    const [p, r, c, f, comp] = await Promise.all([
       loadKey(KEYS.profile, null),
       loadRuns(),
       loadCross(),
       loadFuel(),
+      loadCompletions(),
     ]);
     setProfile(p);
     setPlan(p ? generatePlan(p) : []); // plan is derived from profile, not stored
     setRuns(r);
     setCross(c);
     setFuel(f);
+    setCompletions(comp);
     return p;
   }, []);
 
@@ -1276,7 +1281,8 @@ export default function App() {
     (async () => {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user || cancelled) return;
-      const bump = () => { refreshAll(); setDataVersion((v) => v + 1); };
+      // refreshAll now pulls completions too, so it alone is the refresh signal.
+      const bump = () => { refreshAll(); };
       const sub = (table) => ({ event: "*", schema: "public", table, filter: `user_id=eq.${user.id}` });
       channel = supabase
         .channel("stride-live")
@@ -1317,7 +1323,6 @@ export default function App() {
     try {
       await saveCompletion(activityId, week, day);
       await refreshAll();
-      setDataVersion((v) => v + 1);
     } catch (e) {
       console.error("link completion failed", e);
     }
@@ -1432,8 +1437,8 @@ useEffect(() => {
       </nav>
 
       <main className="content">
-        {tab === "today" && <Today profile={profile} plan={plan} runs={runs} zones={zones} go={setTab} onUpdateFitness={updateFitness} onReschedule={setSessionSchedule} onLinkRun={linkCompletion} refreshKey={dataVersion} />}
-        {tab === "plan" && <PlanView plan={plan} zones={zones} profile={profile} runs={runs} onReschedule={setSessionSchedule} onOpenRun={openActivity} refreshKey={dataVersion} />}
+        {tab === "today" && <Today profile={profile} plan={plan} runs={runs} zones={zones} go={setTab} onUpdateFitness={updateFitness} onReschedule={setSessionSchedule} onLinkRun={linkCompletion} completions={completions} />}
+        {tab === "plan" && <PlanView plan={plan} zones={zones} profile={profile} runs={runs} onReschedule={setSessionSchedule} onOpenRun={openActivity} completions={completions} />}
         {tab === "log" && (
           <div className="stack">
             <button className="btn-ghost back-btn" onClick={() => setTab("today")}>‹ Back to today</button>
@@ -1463,14 +1468,8 @@ useEffect(() => {
 
 /* ---------- TODAY ---------- */
 
-function Today({ profile, plan, runs, zones, go, onUpdateFitness, onReschedule, onLinkRun, refreshKey }) {
-  const [completions, setCompletions] = useState([]);
+function Today({ profile, plan, runs, zones, go, onUpdateFitness, onReschedule, onLinkRun, completions }) {
   const [noMatch, setNoMatch] = useState(() => new Set()); // sessions where the suggested run was waved off
-  useEffect(() => {
-    let alive = true;
-    loadCompletions().then((c) => { if (alive) setCompletions(c); });
-    return () => { alive = false; };
-  }, [refreshKey]);
   if (!profile) return <Empty msg="Head to Setup to get started." />;
   const review = weekReview(plan, profile, runs, completions);
   const wk = currentWeek(profile, plan);
@@ -1692,7 +1691,7 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness, onReschedule, 
       {last && (
         <section className="card">
           <div className="card-head"><h3>Last run</h3><span className="muted">{relDate(last.date)}</span></div>
-          <div className="hero-row">
+          <div className="hero-row quad">
             <Stat label="Type" value={ZONE_META[last.type] ? ZONE_META[last.type].name.split(" ")[0] : last.type} />
             <Stat label="Distance" value={`${last.distance}km`} />
             <Stat label="Pace" value={fmtPaceBare(paceOf(last))} accent />
@@ -1708,11 +1707,20 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness, onReschedule, 
 
 /* ---------- guided warm-up ---------- */
 
+// Movement-by-movement, each on its own timer — no jog. Order runs bottom-up
+// (ankles → calves → hips → glutes) and ends on the fast, running-specific
+// drills, so nothing sharp happens before the tissue is ready.
 const WARMUP_STEPS = [
-  { label: "Easy jog", sub: "Properly easy. Slower than feels natural — you're just raising the temperature.", sec: 600 },
-  { label: "Dynamic drills", sub: "Leg swings, walking lunges, hip openers, ankle circles.", sec: 120 },
-  { label: "Strides", sub: "4–6 × ~20s, building to fast-but-relaxed. Walk back to recover between each.", sec: 180 },
-  { label: "Settle", sub: "Shake the legs out, easy breathing, then start your session warm.", sec: 60 },
+  { label: "Ankle bounces", sub: "Feet hip-width. Small, fast bounces off the balls of both feet — heels barely kissing the floor, knees soft.", sec: 30 },
+  { label: "Calf raises", sub: "Full range, up onto the toes and slowly back down. Switch to one leg at a time for the last few.", sec: 45 },
+  { label: "Leg swings — forward", sub: "Hand on a wall or post. Swing one leg front-to-back, loose, letting the range grow. Swap legs at halfway.", sec: 60 },
+  { label: "Leg swings — across", sub: "Same hold, now swinging the leg side to side across your body. Keep the hips square. Swap at halfway.", sec: 60 },
+  { label: "Walking lunges", sub: "Long step, back knee toward the floor, chest tall. Reach both arms overhead on each rep.", sec: 45 },
+  { label: "Hip openers", sub: "Knee up to your chest, rotate it out to the side, then step through. Alternate — slow and controlled.", sec: 45 },
+  { label: "Glute bridges", sub: "Squeeze hard at the top for a second, lower slowly. The muscle you most want awake before you run.", sec: 45 },
+  { label: "High knees & heel flicks", sub: "30s knees up with quick feet, then 30s flicking your heels to your backside.", sec: 60 },
+  { label: "A-skips", sub: "Skip with a driven knee and a tall posture. Light contacts, quick off the ground.", sec: 30 },
+  { label: "Strides", sub: "4–6 × ~20s, building to fast-but-relaxed. Walk back to full recovery between each.", sec: 180 },
 ];
 
 function beep() {
@@ -1798,20 +1806,12 @@ function WarmupTimer() {
 
 /* ---------- PLAN ---------- */
 
-function PlanView({ plan, zones, profile, runs, onReschedule, onOpenRun, refreshKey }) {
+function PlanView({ plan, zones, profile, runs, onReschedule, onOpenRun, completions }) {
   const [open, setOpen] = useState(null); // which week is expanded
   const [editing, setEditing] = useState(null); // "week:origDay" of the session being moved/skipped
+
   // "week:day" -> linked activity id (the run the user matched to this session)
-  const [links, setLinks] = useState(() => new Map());
-
-  useEffect(() => {
-    let alive = true;
-    loadCompletions().then((rows) => {
-      if (alive) setLinks(new Map(rows.map((r) => [`${r.planned_week}:${r.planned_day}`, r.activity_id])));
-    });
-    return () => { alive = false; };
-  }, [refreshKey]);
-
+  const links = new Map((completions || []).map((r) => [`${r.planned_week}:${r.planned_day}`, r.activity_id]));
   const runById = new Map((runs || []).map((r) => [r.id, r]));
 
   // Auto-expand the current week when the plan loads (plan identity is stable
@@ -3715,7 +3715,17 @@ function Setup({ profile, onSave, zones, runs, onPlanReset }) {
         <h3>Your profile</h3>
         <label className="field"><span>Name</span><input value={name} onChange={(e) => setName(e.target.value)} placeholder="Chris" /></label>
       </section>
-      <a className="btn" href="/api/spotify/authorize">Connect Spotify</a>
+      <section className="card">
+        <div className="card-head">
+          <h3>Spotify</h3>
+          <Pill tone="base">optional</Pill>
+        </div>
+        <p className="muted small" style={{ margin: "0 0 12px" }}>
+          Link your account and STRIDE records what was playing during each run, so you can see the
+          setlist on the activity afterwards.
+        </p>
+        <a className="btn-ghost wide btn-link" href="/api/spotify/authorize">Connect Spotify ↗</a>
+      </section>
       <section className="card">
         <h3>Your goal</h3>
         <div className="chips">
@@ -4041,6 +4051,10 @@ function StyleBlock() {
 
       .hero { background:linear-gradient(135deg, var(--panel-2), var(--panel)); }
       .hero-row { display:flex; gap:10px; flex-wrap:wrap; }
+      /* Four stats in a wrapping flex row leave the last one alone on its own
+         line, stretched the full card width. Grid keeps them an even 2×2. */
+      .hero-row.quad { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); }
+      @media (min-width:560px){ .hero-row.quad { grid-template-columns:repeat(4, minmax(0, 1fr)); } }
       .stat { flex:1; min-width:80px; background:var(--bg); border:1px solid var(--line); border-radius:12px; padding:12px; }
       .stat-val { font-size:24px; font-weight:600; letter-spacing:-0.02em; }
       .stat-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em; margin-top:4px; }
@@ -4124,6 +4138,8 @@ function StyleBlock() {
         padding:7px 12px; font-family:inherit; font-size:13px; cursor:pointer; font-weight:600; }
       .btn-ghost:hover { border-color:var(--accent-dim); }
       .btn-ghost.wide { width:100%; padding:12px; }
+      /* an <a> styled as a button: buttons centre their text, anchors don't */
+      .btn-link { display:block; text-align:center; font-weight:700; font-size:14px; }
       .btn-primary.slim { padding:10px 16px; font-size:14px; }
       .span-2 { grid-column:1 / -1; }
 
@@ -4145,11 +4161,19 @@ function StyleBlock() {
       .wu-done { padding:6px 0; }
       .wu-done .wu-time { font-size:30px; }
 
-      .form-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+      /* minmax(0,1fr), not 1fr: a grid track's default min is min-content, so a
+         date input's intrinsic width (locale format + calendar icon) pushed the
+         track wider than the card and spilled off the right edge. */
+      .form-grid { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; }
       .field { display:flex; flex-direction:column; gap:6px; font-size:12px; color:var(--muted); font-weight:600; margin-bottom:10px; min-width:0; }
       .field span { text-transform:uppercase; letter-spacing:0.05em; font-size:11px; }
       input, select, textarea { background:var(--bg); border:1px solid var(--line); color:var(--ink);
-        border-radius:10px; padding:11px; font-family:inherit; font-size:14px; width:100%; min-width:0; }
+        border-radius:10px; padding:11px; font-family:inherit; font-size:14px; width:100%; min-width:0; max-width:100%; }
+      /* Safari gives date inputs a fixed intrinsic width that ignores width:100%
+         unless the native appearance is off. */
+      input[type="date"] { -webkit-appearance:none; appearance:none; }
+      input[type="date"]::-webkit-date-and-time-value { text-align:left; margin:0; }
+      input[type="date"]::-webkit-calendar-picker-indicator { margin-left:0; }
       input:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent-dim); }
       textarea { resize:vertical; }
 
