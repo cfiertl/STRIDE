@@ -208,7 +208,7 @@ function generatePlan(profile) {
     }
     const weekVol = Math.round(vol);
     const weekStart = addDays(firstMonday, w * 7);
-    weeks.push(buildWeek(w, totalWeeks, weekVol, goalDistanceKm, days, isTaper, cutback, sched, weekStart, overrides, start, todayISO()));
+    weeks.push(buildWeek(w, totalWeeks, weekVol, goalDistanceKm, days, isTaper, cutback, sched, weekStart, overrides, start));
   }
   return weeks;
 }
@@ -242,7 +242,7 @@ function peakVol(start, buildWeeks) {
   return v;
 }
 
-function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, weekStart, overrides, start, today) {
+function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, weekStart, overrides, start) {
   // long run grows toward ~ goalKm (capped for safety) but eased in taper
   const longCap = goalKm <= 10 ? goalKm * 1.0 : goalKm <= 21.1 ? goalKm * 0.95 : goalKm * 0.80;
   const progress = Math.min(1, (idx + 1) / Math.max(1, total - 2));
@@ -280,18 +280,17 @@ function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, w
   });
 
   // Drop run days that can't actually be run: anything before the plan's start
-  // date (partial first week), and — for the week that contains today — any day
-  // that has already passed. A plan generated on Saturday shouldn't prescribe a
-  // Wednesday run for this week. Scale the volume target to the days that remain.
-  const weekEnd = addDays(weekStart, 6);
-  const isCurrentWeek = today >= weekStart && today <= weekEnd;
+  // date. A plan generated on Saturday starts that Saturday, so week 1's Mon–Fri
+  // fall away here and the week's volume target scales to what's left.
+  //
+  // Deliberately NOT filtered against today: the plan is derived fresh on every
+  // render, so a "hide days already past this week" rule would keep firing as the
+  // week wore on and silently delete a session the moment its day passed. A
+  // prescribed day stands once set — a run that wasn't done shows up as overdue
+  // (see overdueSessions) and it's the runner's call to move or skip it.
   let volume = weekVol;
   const full = sessions.length;
-  sessions = sessions.filter((s) => {
-    if (s.date < start) return false;                  // plan hasn't started yet
-    if (isCurrentWeek && s.date < today) return false; // already passed this week
-    return true;
-  });
+  sessions = sessions.filter((s) => s.date >= start);
   if (full > 0 && sessions.length < full) volume = Math.round(weekVol * sessions.length / full);
   sessions.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 
@@ -362,6 +361,33 @@ function sessionDescription(s, zones) {
 // budgets for them (warm-up + work + cool-down). Used for the week's km target.
 function plannedKm(s) {
   return s.km != null ? s.km : 6;
+}
+
+// Sessions in `week` whose planned day has been and gone with no run linked to
+// them. buildWeek leaves them in place rather than hiding them, so this is what
+// surfaces them: the Plan marks them "overdue" and Today prompts to move, skip
+// or link a run. Once the week rolls over they read as missed (✕) instead.
+// doneSet holds `${week}:${day}` keys from session_completions.
+function overdueSessions(week, doneSet, today = todayISO()) {
+  if (!week) return [];
+  return week.sessions.filter(
+    (s) => !s.skipped && s.date < today && !doneSet.has(`${week.week}:${s.day}`)
+  );
+}
+
+// Runs inside `week`'s 7-day block that aren't linked to any planned session.
+// These are the candidates for "you ran on Tuesday — count it toward Wednesday's
+// tempo?", so a casual run can be reconciled instead of leaving a hole.
+function unlinkedRunsInWeek(week, runs, completions) {
+  if (!week) return [];
+  const linked = new Set(completions.map((c) => c.activity_id));
+  const end = addDays(week.weekStart, 7);
+  return runs
+    .filter((r) => {
+      const d = isoDate(r.date);
+      return d >= week.weekStart && d < end && !linked.has(r.id);
+    })
+    .sort((a, b) => (isoDate(a.date) < isoDate(b.date) ? -1 : 1));
 }
 
 /* ---------- adaptive fitness ---------- */
@@ -1284,6 +1310,19 @@ export default function App() {
     saveProfile({ ...profile, scheduleOverrides: overrides });
   };
 
+  // Count an already-logged run toward a planned session (the "you ran Tuesday,
+  // was that Wednesday's tempo?" reconciliation). Upsert is keyed on the
+  // activity, so a run can only ever hold one slot.
+  const linkCompletion = useCallback(async (activityId, week, day) => {
+    try {
+      await saveCompletion(activityId, week, day);
+      await refreshAll();
+      setDataVersion((v) => v + 1);
+    } catch (e) {
+      console.error("link completion failed", e);
+    }
+  }, [refreshAll]);
+
   const addRun = async (run) => {
     try {
       const saved = await insertRun(run);
@@ -1393,7 +1432,7 @@ useEffect(() => {
       </nav>
 
       <main className="content">
-        {tab === "today" && <Today profile={profile} plan={plan} runs={runs} zones={zones} go={setTab} onUpdateFitness={updateFitness} refreshKey={dataVersion} />}
+        {tab === "today" && <Today profile={profile} plan={plan} runs={runs} zones={zones} go={setTab} onUpdateFitness={updateFitness} onReschedule={setSessionSchedule} onLinkRun={linkCompletion} refreshKey={dataVersion} />}
         {tab === "plan" && <PlanView plan={plan} zones={zones} profile={profile} runs={runs} onReschedule={setSessionSchedule} onOpenRun={openActivity} refreshKey={dataVersion} />}
         {tab === "log" && (
           <div className="stack">
@@ -1424,8 +1463,9 @@ useEffect(() => {
 
 /* ---------- TODAY ---------- */
 
-function Today({ profile, plan, runs, zones, go, onUpdateFitness, refreshKey }) {
+function Today({ profile, plan, runs, zones, go, onUpdateFitness, onReschedule, onLinkRun, refreshKey }) {
   const [completions, setCompletions] = useState([]);
+  const [noMatch, setNoMatch] = useState(() => new Set()); // sessions where the suggested run was waved off
   useEffect(() => {
     let alive = true;
     loadCompletions().then((c) => { if (alive) setCompletions(c); });
@@ -1459,8 +1499,110 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness, refreshKey }) 
   const wkSessions = wk ? wk.sessions.filter((s) => !s.skipped) : []; // skipped don't count toward the week
   const wkDone = wkSessions.filter((s) => doneSet.has(`${wk.week}:${s.day}`)).length;
 
+  // Days this week that have been and gone unrun, plus the days still left to
+  // move them onto and any casual run that might actually have been one of them.
+  const today = todayISO();
+  const overdue = overdueSessions(wk, doneSet, today);
+  const daysLeft = wk
+    ? Array.from({ length: 7 }, (_, k) => addDays(wk.weekStart, k)).filter((iso) => iso >= today)
+    : [];
+  const spareRuns = unlinkedRunsInWeek(wk, runs, completions);
+
+  // Pair each stray run with the overdue session it most likely was, one run per
+  // session (a completion is keyed on the activity, so a run can only fill one).
+  const matched = new Map();
+  if (wk && overdue.length) {
+    spareRuns.forEach((r) => {
+      const open = overdue.filter((s) => !matched.has(`${wk.week}:${s.origDay}`));
+      const s = matchOverdueRun(open, r);
+      if (s) matched.set(`${wk.week}:${s.origDay}`, r);
+    });
+  }
+
   return (
     <div className="stack">
+      {overdue.length > 0 && (
+        <section className="card review-card review-warn">
+          <div className="card-head">
+            <h3>{overdue.length === 1 ? "One run still open" : `${overdue.length} runs still open`}</h3>
+            <Pill tone="warn">week {wk.week}</Pill>
+          </div>
+          <p className="muted small">
+            The day has passed and nothing was logged against it. The plan leaves it where it is —
+            move it to a day still to come this week, or skip it.
+          </p>
+          <div className="sessions" style={{ marginTop: 12 }}>
+            {overdue.map((s) => {
+              const key = `${wk.week}:${s.origDay}`;
+              const d = sessionDescription(s, zones);
+              const match = noMatch.has(key) ? null : matched.get(key);
+              return (
+                <div key={key} className="session-wrap">
+                  <div className="session session-overdue">
+                    <div className="session-day">
+                      <span className="sd-dow">{dowName(s.date)}</span>
+                      <span className="sd-num">{Number(s.date.slice(8, 10))}</span>
+                    </div>
+                    <div className="session-body">
+                      <div className="session-title">{d.title}</div>
+                      <div className="session-detail">Planned for {relDate(s.date)} · not logged</div>
+                    </div>
+                    <Pill tone="warn">overdue</Pill>
+                  </div>
+                  <div className="sess-editor">
+                    {match ? (
+                      // A run from this week that isn't linked to anything, close
+                      // enough to have been this session. Offer it before the
+                      // move/skip options — the run may already be done.
+                      <>
+                        <div className="sess-editor-lbl">Was this it?</div>
+                        <p className="muted small" style={{ margin: "0 0 10px" }}>
+                          You ran {relDate(match.date)} — {match.distance}km at {fmtPaceBare(paceOf(match))}/km —
+                          and it isn’t counted toward any planned session.
+                        </p>
+                        <div className="sess-editor-actions">
+                          <button className="btn-primary slim" onClick={() => onLinkRun(match.id, wk.week, s.day)}>
+                            Count it toward this run
+                          </button>
+                          <button className="btn-ghost" onClick={() => setNoMatch((prev) => new Set(prev).add(key))}>
+                            No, keep it casual
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        {daysLeft.length > 0 ? (
+                          <>
+                            <div className="sess-editor-lbl">Move to</div>
+                            <div className="day-picker">
+                              {daysLeft.map((iso) => (
+                                <button key={iso} className="day-chip" onClick={() => onReschedule(wk.week, s.origDay, iso)}>
+                                  <span className="dc-dow">{dowName(iso)}</span>
+                                  <span className="dc-num">{Number(iso.slice(8, 10))}</span>
+                                </button>
+                              ))}
+                            </div>
+                          </>
+                        ) : (
+                          <p className="muted small" style={{ margin: "0 0 8px" }}>
+                            No days left this week. Skip it, or leave it — it’ll show as missed once the week closes.
+                          </p>
+                        )}
+                        <div className="sess-editor-actions">
+                          <button className="btn-ghost" onClick={() => onReschedule(wk.week, s.origDay, "skipped")}>
+                            Skip this run
+                          </button>
+                          <button className="btn-ghost" onClick={() => go("log")}>Log a run</button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
       {review && (
         <section className={`card review-card review-${review.tone}`}>
           <div className="card-head">
@@ -1519,8 +1661,9 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness, refreshKey }) 
               {wk.sessions.map((s, i) => {
                 const d = sessionDescription(s, zones);
                 const isDone = !s.skipped && doneSet.has(`${wk.week}:${s.day}`);
+                const isLate = !s.skipped && !isDone && s.date < today;
                 return (
-                  <div key={i} className={`session ${s.skipped ? "session-skipped" : ""}`}>
+                  <div key={i} className={`session ${s.skipped ? "session-skipped" : ""} ${isLate ? "session-overdue" : ""}`}>
                     <div className="session-day">
                       <span className="sd-dow">{dowName(s.date)}</span>
                       <span className="sd-num">{Number(s.date.slice(8, 10))}</span>
@@ -1530,6 +1673,7 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness, refreshKey }) 
                       <div className="session-detail">{d.detail}</div>
                     </div>
                     {s.skipped && <Pill tone="base">skipped</Pill>}
+                    {isLate && <Pill tone="warn">overdue</Pill>}
                     {isDone && <span className="sess-mark done">✓</span>}
                   </div>
                 );
@@ -1682,6 +1826,7 @@ function PlanView({ plan, zones, profile, runs, onReschedule, onOpenRun, refresh
   if (!plan.length) return <Empty msg="No plan yet — check your goal date in Setup." />;
 
   const planStart = profile.planStartDate || todayISO();
+  const today = todayISO();
   const cur = currentWeek(profile, plan);
   const curNum = cur ? cur.week : 1;
 
@@ -1728,12 +1873,16 @@ function PlanView({ plan, zones, profile, runs, onReschedule, onOpenRun, refresh
                   const linkedRun = linkedId != null ? runById.get(linkedId) : null;
                   const isDone = !!linkedId;
                   const isMissed = !s.skipped && isPast && !isDone;
+                  // This week, a day that's been and gone without a run is
+                  // overdue, not missed — there's still time to move it to a
+                  // remaining day (or skip it) before the week closes out.
+                  const isOverdue = !s.skipped && !isDone && w.week === curNum && s.date < today;
                   const key = `${w.week}:${s.origDay}`;
                   const isEditing = editing === key;
                   return (
                     <div key={i} className="session-wrap">
                       <div
-                        className={`session clickable ${s.skipped ? "session-skipped" : ""}`}
+                        className={`session clickable ${s.skipped ? "session-skipped" : ""} ${isOverdue ? "session-overdue" : ""}`}
                         onClick={() => setEditing(isEditing ? null : key)}
                       >
                         <div className="session-day">
@@ -1746,6 +1895,7 @@ function PlanView({ plan, zones, profile, runs, onReschedule, onOpenRun, refresh
                           <div className="session-detail">{d.detail}</div>
                         </div>
                         {s.skipped && <Pill tone="base">skipped</Pill>}
+                        {isOverdue && <Pill tone="warn">overdue</Pill>}
                         {isDone && <span className="sess-mark done">✓</span>}
                         {isMissed && <span className="sess-mark miss">✕</span>}
                         <span className="sess-edit">{isEditing ? "▾" : "⋯"}</span>
@@ -1776,18 +1926,30 @@ function PlanView({ plan, zones, profile, runs, onReschedule, onOpenRun, refresh
                                 <p className="muted small" style={{ margin: "0 0 8px" }}>This run is skipped — it won't count toward your week.</p>
                               ) : (
                                 <>
+                                  {isOverdue && (
+                                    <p className="muted small" style={{ margin: "0 0 10px" }}>
+                                      {dowName(s.date)}’s run hasn’t been logged. Move it to a day still to come this
+                                      week, or skip it.
+                                    </p>
+                                  )}
                                   <div className="sess-editor-lbl">Move to</div>
                                   <div className="day-picker">
-                                    {blockDays.map((iso) => (
-                                      <button
-                                        key={iso}
-                                        className={`day-chip ${iso === s.date ? "on" : ""}`}
-                                        onClick={() => { onReschedule(w.week, s.origDay, iso); setEditing(null); }}
-                                      >
-                                        <span className="dc-dow">{dowName(iso)}</span>
-                                        <span className="dc-num">{Number(iso.slice(8, 10))}</span>
-                                      </button>
-                                    ))}
+                                    {blockDays.map((iso) => {
+                                      // In the current week you can only move a run forward — a
+                                      // day that's already gone can't be run on.
+                                      const gone = w.week === curNum && iso < today;
+                                      return (
+                                        <button
+                                          key={iso}
+                                          className={`day-chip ${iso === s.date ? "on" : ""} ${gone ? "gone" : ""}`}
+                                          disabled={gone}
+                                          onClick={() => { onReschedule(w.week, s.origDay, iso); setEditing(null); }}
+                                        >
+                                          <span className="dc-dow">{dowName(iso)}</span>
+                                          <span className="dc-num">{Number(iso.slice(8, 10))}</span>
+                                        </button>
+                                      );
+                                    })}
                                   </div>
                                 </>
                               )}
@@ -3757,6 +3919,27 @@ function suggestSessionIdx(sessions, activity) {
   return bestIdx;
 }
 
+// Which overdue session was a stray run most likely to have been? Nearest
+// planned day wins and distance breaks the tie for sessions that carry one
+// (quality sessions don't, so they lean entirely on the date). Capped at 3 days
+// apart — a Monday run isn't Friday's long run. Returns null when nothing fits.
+// suggestSessionIdx does the opposite job (a run picking from a whole week) and
+// leans on the weekday matching exactly, which an overdue run never does.
+function matchOverdueRun(overdue, run) {
+  const rd = isoDate(run.date);
+  const dist = parseFloat(run.distance) || null;
+  let best = null;
+  let bestScore = 0;
+  overdue.forEach((s) => {
+    const gap = Math.abs(Math.round((new Date(`${rd}T12:00:00`) - new Date(`${s.date}T12:00:00`)) / DAY_MS));
+    if (gap > 3) return;
+    let score = 40 - gap * 10;
+    if (dist != null && s.km) score += Math.max(0, 25 * (1 - Math.abs(dist - s.km) / s.km));
+    if (score > bestScore) { bestScore = score; best = s; }
+  });
+  return best;
+}
+
 function daysUntil(iso) {
   const d = Math.ceil((new Date(iso) - new Date()) / (24 * 3600 * 1000));
   return Math.max(0, d);
@@ -3890,6 +4073,9 @@ function StyleBlock() {
       .session-wrap { display:flex; flex-direction:column; }
       .session-skipped { opacity:0.5; }
       .session-skipped .session-title { text-decoration:line-through; }
+      .session-overdue { border-color:color-mix(in srgb, var(--amber) 40%, transparent);
+        background:color-mix(in srgb, var(--amber) 5%, var(--bg)); }
+      .session-overdue .session-day .sd-num { color:var(--amber); }
       .sess-edit { color:var(--muted); font-size:15px; flex-shrink:0; }
       .session.clickable:hover .sess-edit { color:var(--accent); }
 
@@ -3901,6 +4087,8 @@ function StyleBlock() {
         border:1px solid var(--line); background:var(--bg); color:var(--ink); font-family:inherit; cursor:pointer; transition:.12s; }
       .day-chip:hover { border-color:var(--accent-dim); }
       .day-chip.on { background:var(--accent); border-color:var(--accent); color:var(--on-accent); }
+      .day-chip.gone { opacity:.32; cursor:default; }
+      .day-chip.gone:hover { border-color:var(--line); }
       .day-chip .dc-dow { font-size:9.5px; font-weight:700; text-transform:uppercase; letter-spacing:0.03em; }
       .day-chip .dc-num { font-size:14px; font-weight:800; font-variant-numeric:tabular-nums; }
       .sess-editor-actions { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
