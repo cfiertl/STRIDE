@@ -1230,14 +1230,56 @@ function SessionSteps({ session, zones }) {
   );
 }
 
+// The pace alert a watch workout would be built against, per structured session
+// type. Both the setup card and the drift check read this, so what gets confirmed
+// and what gets compared can't diverge.
+function watchTargets(zones) {
+  const out = {};
+  ["tempo", "interval"].forEach((type) => {
+    const core = sessionSteps({ type }).find((st) => st.kind === "reps" || st.kind === "work");
+    if (!core) return;
+    const t = stepPace(core.kind === "reps" ? core.work : core, zones, "");
+    if (t) out[type] = t;
+  });
+  return out;
+}
+
+// Which confirmed watch workouts no longer match current paces.
+//
+// This lives in localStorage rather than on the profile deliberately: it
+// describes a watch, not a runner, so it's device-scoped by nature — and a new
+// profile column needs a migration that silently breaks every profile save until
+// it's applied in Supabase. Losing this to a cleared cache just re-prompts.
+const WATCH_KEY = "stride:watchBuilt";
+
+function loadWatchBuilt() {
+  try { return JSON.parse(window.localStorage.getItem(WATCH_KEY) || "{}") || {}; }
+  catch { return {}; }
+}
+function saveWatchBuilt(v) {
+  try { window.localStorage.setItem(WATCH_KEY, JSON.stringify(v)); } catch { /* private mode */ }
+}
+
+function staleWatchTargets(built, zones) {
+  if (!built || !zones) return [];
+  const now = watchTargets(zones);
+  return Object.keys(now)
+    .filter((type) => built[type] && built[type].target && built[type].target !== now[type])
+    .map((type) => ({ type, was: built[type].target, now: now[type], at: built[type].at }));
+}
+
 // The same prescription as blocks to punch into a watch's custom-workout builder.
 // Nothing can push a workout to an Apple Watch from a web app, so this is the
 // next best thing: the concrete numbers, once, and the watch handles the alerts
 // from then on. Durations resolve to a single buildable value — a builder can't
 // take "20–25 min".
-function WatchSetup({ session, zones }) {
+function WatchSetup({ session, zones, built, onBuilt }) {
   const [open, setOpen] = useState(false);
   if (!hasSteps(session)) return null;
+
+  const target = watchTargets(zones)[session.type] || "";
+  const mark = built && built[session.type];
+  const isCurrent = mark && mark.target === target;
 
   const blocks = [];
   sessionSteps(session).forEach((st) => {
@@ -1256,8 +1298,12 @@ function WatchSetup({ session, zones }) {
   return (
     <div className="watch-setup">
       <button className="watch-toggle" onClick={() => setOpen(!open)}>
-        <span>⌚ Build this on your watch</span>
-        <span className="chev">{open ? "▾" : "▸"}</span>
+        <span>⌚ {isCurrent ? "Built on your watch" : mark ? "Watch targets out of date" : "Build this on your watch"}</span>
+        <span className="row-gap">
+          {isCurrent && <span className="wb-ok">✓</span>}
+          {mark && !isCurrent && <Pill tone="warn">update</Pill>}
+          <span className="chev">{open ? "▾" : "▸"}</span>
+        </span>
       </button>
       {open && (
         <>
@@ -1276,6 +1322,17 @@ function WatchSetup({ session, zones }) {
             a <strong>pace alert</strong> on the work block to that range — the watch buzzes when you drift
             out, so you never have to read pace mid-rep. Build it once; this session repeats all plan.
           </p>
+          {onBuilt && target && (
+            <div className="sess-editor-actions">
+              {isCurrent ? (
+                <span className="muted small">Confirmed {relDate(mark.at)} · targets still match.</span>
+              ) : (
+                <button className="btn-primary slim" onClick={() => onBuilt(session.type, target)}>
+                  {mark ? "I've updated it on my watch" : "I've built this on my watch"}
+                </button>
+              )}
+            </div>
+          )}
         </>
       )}
     </div>
@@ -1361,6 +1418,9 @@ export default function App() {
   const [cross, setCross] = useState([]);
   const [fuel, setFuel] = useState([]);
   const [completions, setCompletions] = useState([]); // plan↔run links, loaded with everything else
+  // Which watch workouts the runner has confirmed built, and against which pace
+  // band. Read after mount — localStorage doesn't exist during SSR.
+  const [watchBuilt, setWatchBuilt] = useState({});
   const [selectedActivityId, setSelectedActivityId] = useState(null);
   // Bumped on every realtime change so child views that hold their own data
   // (e.g. Today's completions) can re-fetch without a remount.
@@ -1532,6 +1592,16 @@ export default function App() {
     }
   };
 
+  useEffect(() => { setWatchBuilt(loadWatchBuilt()); }, []);
+
+  const markWatchBuilt = useCallback((type, target) => {
+    setWatchBuilt((prev) => {
+      const next = { ...prev, [type]: { target, at: todayISO() } };
+      saveWatchBuilt(next);
+      return next;
+    });
+  }, []);
+
   const updateFitness = (distKm, timeSec) => {
     const p = { ...profile, benchDistKm: distKm, benchTimeSec: timeSec };
     saveProfile(p);
@@ -1628,8 +1698,8 @@ useEffect(() => {
       </nav>
 
       <main className="content">
-        {tab === "today" && <Today profile={profile} plan={plan} runs={runs} zones={zones} go={setTab} onUpdateFitness={updateFitness} onReschedule={setSessionSchedule} onLinkRun={linkCompletion} completions={completions} />}
-        {tab === "plan" && <PlanView plan={plan} zones={zones} profile={profile} runs={runs} onReschedule={setSessionSchedule} onOpenRun={openActivity} completions={completions} />}
+        {tab === "today" && <Today profile={profile} plan={plan} runs={runs} zones={zones} go={setTab} onUpdateFitness={updateFitness} onReschedule={setSessionSchedule} onLinkRun={linkCompletion} completions={completions} watchBuilt={watchBuilt} onWatchBuilt={markWatchBuilt} />}
+        {tab === "plan" && <PlanView plan={plan} zones={zones} profile={profile} runs={runs} onReschedule={setSessionSchedule} onOpenRun={openActivity} completions={completions} watchBuilt={watchBuilt} onWatchBuilt={markWatchBuilt} />}
         {tab === "log" && (
           <div className="stack">
             <button className="btn-ghost back-btn" onClick={() => setTab("today")}>‹ Back to today</button>
@@ -1659,7 +1729,7 @@ useEffect(() => {
 
 /* ---------- TODAY ---------- */
 
-function Today({ profile, plan, runs, zones, go, onUpdateFitness, onReschedule, onLinkRun, completions }) {
+function Today({ profile, plan, runs, zones, go, onUpdateFitness, onReschedule, onLinkRun, completions, watchBuilt, onWatchBuilt }) {
   const [noMatch, setNoMatch] = useState(() => new Set()); // sessions where the suggested run was waved off
   if (!profile) return <Empty msg="Head to Setup to get started." />;
   const review = weekReview(plan, profile, runs, completions);
@@ -1709,8 +1779,42 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness, onReschedule, 
     });
   }
 
+  // Paces can move without the runner doing anything — a synced run that beats
+  // the current benchmark re-benchmarks silently — so a watch workout's pace
+  // alert can go stale unannounced. This is the announcement.
+  const staleWatch = staleWatchTargets(watchBuilt, zones);
+
   return (
     <div className="stack">
+      {staleWatch.length > 0 && (
+        <section className="card review-card review-warn">
+          <div className="card-head">
+            <h3>⌚ Watch targets out of date</h3>
+            <Pill tone="warn">{staleWatch.length}</Pill>
+          </div>
+          <p className="muted small">
+            Your paces have moved since you built {staleWatch.length === 1 ? "this workout" : "these workouts"} on
+            your watch. Update the <strong>pace alert</strong> on the work block so it stops buzzing at the old range.
+          </p>
+          <div className="watch-blocks">
+            {staleWatch.map((w) => (
+              <div key={w.type} className="watch-block">
+                <span className="wb-name">{sessionDescription({ type: w.type }, zones).title}</span>
+                <span className="wb-was">{w.was}</span>
+                <span className="wb-arrow">→</span>
+                <span className="wb-target">{w.now}</span>
+              </div>
+            ))}
+          </div>
+          <div className="sess-editor-actions">
+            {staleWatch.map((w) => (
+              <button key={w.type} className="btn-ghost" onClick={() => onWatchBuilt(w.type, w.now)}>
+                {staleWatch.length === 1 ? "Done — updated" : `${sessionDescription({ type: w.type }, zones).title} updated`}
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
       {overdue.length > 0 && (
         <section className="card review-card review-warn">
           <div className="card-head">
@@ -1875,7 +1979,7 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness, onReschedule, 
                       {isDone && <span className="sess-mark done">✓</span>}
                     </div>
                     {showSteps && <SessionSteps session={s} zones={zones} />}
-                    {showSteps && <WatchSetup session={s} zones={zones} />}
+                    {showSteps && <WatchSetup session={s} zones={zones} built={watchBuilt} onBuilt={onWatchBuilt} />}
                   </div>
                 );
               })}
@@ -2008,7 +2112,7 @@ function WarmupTimer() {
 
 /* ---------- PLAN ---------- */
 
-function PlanView({ plan, zones, profile, runs, onReschedule, onOpenRun, completions }) {
+function PlanView({ plan, zones, profile, runs, onReschedule, onOpenRun, completions, watchBuilt, onWatchBuilt }) {
   const [open, setOpen] = useState(null); // which week is expanded
   const [editing, setEditing] = useState(null); // "week:origDay" of the session being moved/skipped
 
@@ -2125,7 +2229,7 @@ function PlanView({ plan, zones, profile, runs, onReschedule, onOpenRun, complet
                           ) : (
                             <>
                               {!s.skipped && <SessionSteps session={s} zones={zones} />}
-                              {!s.skipped && <WatchSetup session={s} zones={zones} />}
+                              {!s.skipped && <WatchSetup session={s} zones={zones} built={watchBuilt} onBuilt={onWatchBuilt} />}
                               {s.skipped ? (
                                 <p className="muted small" style={{ margin: "0 0 8px" }}>This run is skipped — it won't count toward your week.</p>
                               ) : (
@@ -4330,6 +4434,11 @@ function StyleBlock() {
       .wb-dur { width:52px; text-align:right; font-weight:700; color:var(--accent); }
       .wb-target { width:104px; text-align:right; color:var(--muted); font-size:11.5px; }
       .wb-reps { width:26px; text-align:right; font-weight:700; color:var(--muted); }
+      .wb-was { font-family:var(--font-mono),monospace; font-size:11.5px; color:var(--muted);
+        text-decoration:line-through; font-variant-numeric:tabular-nums; }
+      .wb-arrow { color:var(--muted); font-size:11px; }
+      .watch-block .wb-was + .wb-arrow + .wb-target { color:var(--amber); font-weight:700; width:auto; }
+      .wb-ok { color:var(--positive); font-weight:800; font-size:13px; }
 
       .sess-editor { background:var(--panel-2); border:1px solid var(--line); border-top:none;
         border-radius:0 0 12px 12px; margin:-6px 0 0; padding:14px 12px 12px; }
