@@ -103,13 +103,16 @@ function computeZones(profile) {
   return z;
 }
 
+// `effort` is the feel-based anchor for the zone. GPS pace is too noisy to chase
+// inside a short rep — it needs ~15–20s to settle after a change — so the effort
+// cue is what you actually run to, with the pace band as the guardrail.
 const ZONE_META = {
-  easy: { name: "Easy / Zone 2", note: "Conversational. Talk in full sentences. This is most of your running." },
-  long: { name: "Long run", note: "Easy effort, sustained. Build endurance and fatigue resistance." },
-  marathon: { name: "Marathon pace", note: "Steady, controlled, 'comfortably hard'." },
-  tempo: { name: "Tempo / Threshold", note: "Comfortably hard. ~1hr race effort. Builds your lactate ceiling." },
-  interval: { name: "Interval / VO2", note: "Hard. 3–5min reps. Lifts top-end aerobic power." },
-  reps: { name: "Reps / Strides", note: "Fast & short. Form, economy, leg speed. Stay relaxed." },
+  easy: { name: "Easy / Zone 2", effort: "conversational", note: "Conversational. Talk in full sentences. This is most of your running." },
+  long: { name: "Long run", effort: "conversational", note: "Easy effort, sustained. Build endurance and fatigue resistance." },
+  marathon: { name: "Marathon pace", effort: "steady, controlled", note: "Steady, controlled, 'comfortably hard'." },
+  tempo: { name: "Tempo / Threshold", effort: "~1hr race effort", note: "Comfortably hard. ~1hr race effort. Builds your lactate ceiling." },
+  interval: { name: "Interval / VO2", effort: "3k–5k effort", note: "Hard. 3–5min reps. Lifts top-end aerobic power." },
+  reps: { name: "Reps / Strides", effort: "fast & relaxed", note: "Fast & short. Form, economy, leg speed. Stay relaxed." },
 };
 
 /* ---------- plan generation ---------- */
@@ -386,14 +389,26 @@ function fmtDurRange(range) {
   return `~${fmtMins(a)}–${fmtMins(b)}`;
 }
 
-// Pace prescription for a step, as a string. Bands run [slower, faster]. The
-// hard zones quote the fast end alone (a VO2 rep has a target, not a range);
-// everything easier quotes the whole band, fast end first.
+// Pace prescription for a step. Bands run [slower, faster] and every zone quotes
+// the whole band, fast end first.
+//
+// Intervals used to quote the fast edge alone, which read as a precise target the
+// zone model never actually prescribed — and no GPS watch can resolve a single
+// pace inside a 3-minute rep anyway. The band is both the honest number and the
+// usable one; stepEffort() carries the feel cue that goes with it.
 function stepPace(step, zones, fallback) {
   const band = zones && step.zone && zones[step.zone];
   if (!band) return fallback;
-  if (step.zone === "interval" || step.zone === "reps") return fmtPace(band[1]);
-  return `${fmtPace(band[1])}–${fmtPace(band[0])}`;
+  const fast = fmtPace(band[1]);
+  const slow = fmtPace(band[0]);
+  // "4:03–4:14/km", not "4:03/km–4:14/km"
+  return fast === slow ? fast : `${fast.replace("/km", "")}–${slow}`;
+}
+
+// Feel-based anchor for a step, e.g. "3k–5k effort". Empty when the zone has none.
+function stepEffort(step) {
+  const meta = step.zone && ZONE_META[step.zone];
+  return (meta && meta.effort) || "";
 }
 
 function sessionDescription(s, zones) {
@@ -1185,6 +1200,9 @@ function SessionSteps({ session, zones }) {
                   <span className="step-rep-eff">{fmtTime(st.work.sec)} {st.work.label}</span>
                   <span className="step-pace">{stepPace(st.work, zones, "hard")}</span>
                 </div>
+                {stepEffort(st.work) && (
+                  <div className="step-effort">{stepEffort(st.work)}</div>
+                )}
                 <div className="step-rep-line muted">
                   <span>{fmtTime(st.rest.sec)} {st.rest.label}</span>
                   <span className="step-pace">between efforts</span>
@@ -1201,10 +1219,65 @@ function SessionSteps({ session, zones }) {
                 <span>{st.label}</span>
                 <span className="step-pace">{stepPace(st, zones, "by feel")}</span>
               </div>
+              {st.kind === "work" && stepEffort(st) && (
+                <div className="step-effort">{stepEffort(st)}</div>
+              )}
             </div>
           </div>
         );
       })}
+    </div>
+  );
+}
+
+// The same prescription as blocks to punch into a watch's custom-workout builder.
+// Nothing can push a workout to an Apple Watch from a web app, so this is the
+// next best thing: the concrete numbers, once, and the watch handles the alerts
+// from then on. Durations resolve to a single buildable value — a builder can't
+// take "20–25 min".
+function WatchSetup({ session, zones }) {
+  const [open, setOpen] = useState(false);
+  if (!hasSteps(session)) return null;
+
+  const blocks = [];
+  sessionSteps(session).forEach((st) => {
+    if (st.kind === "reps") {
+      blocks.push({ name: "Work", sec: st.work.sec, target: stepPace(st.work, zones, "hard"), reps: st.reps });
+      blocks.push({ name: "Recovery", sec: st.rest.sec, target: "", reps: st.reps });
+      return;
+    }
+    blocks.push({
+      name: st.kind === "warmup" ? "Warm-up" : st.kind === "cooldown" ? "Cool-down" : "Work",
+      sec: stepSeconds(st, "mid"),
+      target: st.kind === "work" ? stepPace(st, zones, "") : "",
+    });
+  });
+
+  return (
+    <div className="watch-setup">
+      <button className="watch-toggle" onClick={() => setOpen(!open)}>
+        <span>⌚ Build this on your watch</span>
+        <span className="chev">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && (
+        <>
+          <div className="watch-blocks">
+            {blocks.map((b, i) => (
+              <div key={i} className="watch-block">
+                <span className="wb-name">{b.name}</span>
+                <span className="wb-dur">{fmtTime(b.sec)}</span>
+                <span className="wb-target">{b.target || "no target"}</span>
+                <span className="wb-reps">{b.reps ? `×${b.reps}` : ""}</span>
+              </div>
+            ))}
+          </div>
+          <p className="muted small" style={{ margin: "10px 0 0" }}>
+            Apple Watch: Workout → Outdoor Run → ⋯ → <strong>Custom</strong>. Add the blocks above and set
+            a <strong>pace alert</strong> on the work block to that range — the watch buzzes when you drift
+            out, so you never have to read pace mid-rep. Build it once; this session repeats all plan.
+          </p>
+        </>
+      )}
     </div>
   );
 }
@@ -1802,6 +1875,7 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness, onReschedule, 
                       {isDone && <span className="sess-mark done">✓</span>}
                     </div>
                     {showSteps && <SessionSteps session={s} zones={zones} />}
+                    {showSteps && <WatchSetup session={s} zones={zones} />}
                   </div>
                 );
               })}
@@ -2051,6 +2125,7 @@ function PlanView({ plan, zones, profile, runs, onReschedule, onOpenRun, complet
                           ) : (
                             <>
                               {!s.skipped && <SessionSteps session={s} zones={zones} />}
+                              {!s.skipped && <WatchSetup session={s} zones={zones} />}
                               {s.skipped ? (
                                 <p className="muted small" style={{ margin: "0 0 8px" }}>This run is skipped — it won't count toward your week.</p>
                               ) : (
@@ -4237,7 +4312,24 @@ function StyleBlock() {
         font-weight:600; color:var(--muted); font-variant-numeric:tabular-nums; }
       .step-reps { background:color-mix(in srgb, var(--accent) 5%, var(--bg)); }
       .step-reps .step-dur { font-size:14px; }
+      .step-effort { font-size:11px; font-weight:600; color:var(--muted); text-transform:uppercase;
+        letter-spacing:0.04em; margin-top:-1px; }
       .session-today { border-color:var(--accent-dim); }
+
+      .watch-setup { margin:0 0 12px; }
+      .watch-toggle { display:flex; align-items:center; justify-content:space-between; width:100%;
+        background:transparent; border:1px dashed var(--line); border-radius:10px; padding:9px 11px;
+        color:var(--muted); font-family:inherit; font-size:12.5px; font-weight:700; cursor:pointer; }
+      .watch-toggle:hover { border-color:var(--accent-dim); color:var(--ink); }
+      .watch-blocks { display:flex; flex-direction:column; gap:1px; background:var(--line);
+        border:1px solid var(--line); border-radius:10px; overflow:hidden; margin-top:8px; }
+      .watch-block { display:flex; align-items:baseline; gap:8px; padding:8px 11px; background:var(--bg);
+        font-size:12.5px; }
+      .wb-name { flex:1; min-width:0; font-weight:700; }
+      .wb-dur, .wb-target, .wb-reps { font-family:var(--font-mono),monospace; font-variant-numeric:tabular-nums; }
+      .wb-dur { width:52px; text-align:right; font-weight:700; color:var(--accent); }
+      .wb-target { width:104px; text-align:right; color:var(--muted); font-size:11.5px; }
+      .wb-reps { width:26px; text-align:right; font-weight:700; color:var(--muted); }
 
       .sess-editor { background:var(--panel-2); border:1px solid var(--line); border-top:none;
         border-radius:0 0 12px 12px; margin:-6px 0 0; padding:14px 12px 12px; }
