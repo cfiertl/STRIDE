@@ -2647,6 +2647,7 @@ function ActivityDetail({ activityId, onBack, profile, onScored, onDelete }) {
   const laps = Array.isArray(a.laps) ? a.laps : [];
   const best = Array.isArray(a.best_efforts) ? a.best_efforts : [];
   const typeName = ZONE_META[a.type] ? ZONE_META[a.type].name : cap(a.type || "Run");
+  const power = powerSummary(streams);
   const dateStr = a.date
     ? new Date(a.date).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" })
     : "";
@@ -2669,12 +2670,18 @@ function ActivityDetail({ activityId, onBack, profile, onScored, onDelete }) {
           <Stat label="Moving" value={fmtTime(a.moving_time_s)} />
           {dist != null && dist > 0 && <Stat label="Pace" value={fmtPaceBare(pace)} accent />}
         </div>
-        <div className="hero-row" style={{ marginTop: 10 }}>
+        <div className="hero-row quad" style={{ marginTop: 10 }}>
           <Stat label="Avg HR" value={a.avg_hr ? String(a.avg_hr) : "—"} />
           <Stat label="Max HR" value={a.max_hr ? String(a.max_hr) : "—"} />
           <Stat label="Elev gain" value={a.elevation_m != null ? `${Math.round(a.elevation_m)}m` : "—"} />
-          <Stat label="Effort" value={a.relative_effort != null ? `${a.relative_effort}` : "—"} />        
+          <Stat label="Effort" value={a.relative_effort != null ? `${a.relative_effort}` : "—"} />
         </div>
+        {power && (
+          <div className="hero-row" style={{ marginTop: 10 }}>
+            <Stat label="Avg power" value={`${power.avg}W`} />
+            <Stat label="Max power" value={`${power.max}W`} />
+          </div>
+        )}
         {(a.gear_name || a.device_name || a.calories || a.avg_cadence) && (
           <div className="detail-meta muted small">
             {a.gear_name && <span>👟 {a.gear_name}</span>}
@@ -2775,6 +2782,9 @@ function buildSeries(streams) {
   const time = get("time");
   if (!time) return null;
   const hr = get("heartrate"), vel = get("velocity_smooth"), alt = get("altitude"), cad = get("cadence");
+  // Apple Watch reports running power and Strava carries it through. It was
+  // already being fetched and stored — it just had nowhere to go.
+  const pwr = get("watts");
   const n = time.length;
   const step = Math.max(1, Math.ceil(n / 300));   // decimate to ~300 points
   const points = [];
@@ -2786,9 +2796,25 @@ function buildSeries(streams) {
       pace: v && v > 0.5 ? 1000 / v : null,        // s/km; drop near-stops so pace doesn't spike
       elev: alt ? alt[i] : null,
       cad: cad ? Math.round(cad[i] * 2) : null,    // per-leg RPM → spm
+      pwr: pwr && pwr[i] > 0 ? pwr[i] : null,
     });
   }
-  return { points, has: { hr: !!hr, pace: !!vel, elev: !!alt, cad: !!cad } };
+  const hasPwr = !!pwr && pwr.some((w) => w > 0);
+  return { points, has: { hr: !!hr, pace: !!vel, elev: !!alt, cad: !!cad, pwr: hasPwr } };
+}
+
+// Average / max running power over a run, straight off the stored stream — no new
+// column needed, and it backfills every run already synced. Zeros are the watch
+// reporting a stop, not an effort, so they're dropped.
+function powerSummary(streams) {
+  const w = streams && streams.watts && Array.isArray(streams.watts.data) ? streams.watts.data : null;
+  if (!w) return null;
+  const v = w.filter((x) => typeof x === "number" && x > 0);
+  if (v.length < 30) return null;
+  return {
+    avg: Math.round(v.reduce((a, b) => a + b, 0) / v.length),
+    max: Math.max(...v),
+  };
 }
 
 // Album art + title + artist, reused in the tooltip, the focus pin and the setlist.
@@ -2820,6 +2846,7 @@ function ChartTip({ active, payload, label, songSegs }) {
         {v.pace != null && <div><span style={{ color: "var(--accent)" }}>Pace</span> {fmtPace(v.pace)}</div>}
         {v.elev != null && <div><span style={{ color: "var(--muted)" }}>Elev</span> {Math.round(v.elev)} m</div>}
         {v.cad != null && <div><span style={{ color: "var(--amber)" }}>Cadence</span> {v.cad} spm</div>}
+        {v.pwr != null && <div><span style={{ color: "var(--viz-c)" }}>Power</span> {Math.round(v.pwr)} W</div>}
       </div>
       {songSegs && (
         <div className="chart-tip chart-tip-song">
@@ -2832,7 +2859,7 @@ function ChartTip({ active, payload, label, songSegs }) {
 
 function StreamChart({ streams, songSegs, focusT, onClearFocus }) {
   const series = buildSeries(streams);
-  const [show, setShow] = useState({ hr: true, pace: true, elev: true, cad: false });
+  const [show, setShow] = useState({ hr: true, pace: true, elev: true, cad: false, pwr: false });
   const [tunes, setTunes] = useState(false);
   if (!series || series.points.length < 2) return null;
   const { points, has } = series;
@@ -2844,6 +2871,7 @@ function StreamChart({ streams, songSegs, focusT, onClearFocus }) {
   const toggles = [
     ["hr", "HR", "var(--viz-b)"], ["pace", "Pace", "var(--accent)"],
     ["elev", "Elevation", "var(--muted)"], ["cad", "Cadence", "var(--amber)"],
+    ["pwr", "Power", "var(--viz-c)"],
   ].filter(([k]) => has[k]);
 
   const focusSong = focusT != null && hasTunes ? songAt(songSegs, focusT) : null;
@@ -2874,12 +2902,14 @@ function StreamChart({ streams, songSegs, focusT, onClearFocus }) {
             <YAxis yAxisId="pace" reversed domain={["auto", "auto"]} hide />
             <YAxis yAxisId="elev" domain={["auto", "auto"]} hide />
             <YAxis yAxisId="cad" domain={["auto", "auto"]} hide />
+            <YAxis yAxisId="pwr" domain={["auto", "auto"]} hide />
             <Tooltip content={(p) => <ChartTip {...p} songSegs={tunes && hasTunes ? songSegs : null} />} />
             {focusT != null && <ReferenceLine yAxisId="hr" x={focusT} stroke="var(--accent)" strokeDasharray="4 3" />}
             {has.elev && show.elev && <Area yAxisId="elev" dataKey="elev" stroke="none" fill="var(--muted)" fillOpacity={0.18} isAnimationActive={false} connectNulls />}
             {has.pace && show.pace && <Line yAxisId="pace" dataKey="pace" stroke="var(--accent)" dot={false} strokeWidth={2} isAnimationActive={false} connectNulls />}
             {has.hr && show.hr && <Line yAxisId="hr" dataKey="hr" stroke="var(--viz-b)" dot={false} strokeWidth={2} isAnimationActive={false} connectNulls />}
             {has.cad && show.cad && <Line yAxisId="cad" dataKey="cad" stroke="var(--amber)" dot={false} strokeWidth={1.5} isAnimationActive={false} connectNulls />}
+            {has.pwr && show.pwr && <Line yAxisId="pwr" dataKey="pwr" stroke="var(--viz-c)" dot={false} strokeWidth={1.5} isAnimationActive={false} connectNulls />}
           </ComposedChart>
         </ResponsiveContainer>
       </div>
@@ -4317,12 +4347,13 @@ function StyleBlock() {
         /* Court — energetic light. White ground, electric cobalt action
            colour, tinted card fills, real depth. Cobalt = action/brand;
            the semantic triad is --positive / --amber / --coral; --viz-b is
-           the second chart series (HR). Triad values run darker than the
-           fills so 11px text clears WCAG AA on white. */
+           the second chart series (HR) and --viz-c the third (power) — violet
+           reads clearly against cobalt, orange and amber. Triad values run
+           darker than the fills so 11px text clears WCAG AA on white. */
         --bg: #f6f7fb; --panel: #ffffff; --panel-2:#eef1fb; --line:#e3e7f2;
         --ink:#15192b; --muted:#697086; --accent:#2451ff; --accent-dim:#1c40cc;
         --coral:#dc2626; --amber:#b45309; --on-accent:#ffffff;
-        --positive:#15803d; --viz-b:#ff7d2e;
+        --positive:#15803d; --viz-b:#ff7d2e; --viz-c:#7c3aed;
         /* Plainhand: one family everywhere; numeral classes keep their
            --font-mono hook but it resolves to the body face, and alignment
            comes from tabular figures below. */
