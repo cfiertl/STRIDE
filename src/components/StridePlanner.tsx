@@ -211,7 +211,7 @@ function generatePlan(profile) {
     }
     const weekVol = Math.round(vol);
     const weekStart = addDays(firstMonday, w * 7);
-    weeks.push(buildWeek(w, totalWeeks, weekVol, goalDistanceKm, days, isTaper, cutback, sched, weekStart, overrides, start));
+    weeks.push(buildWeek(w, totalWeeks, weekVol, goalDistanceKm, days, isTaper, cutback, sched, weekStart, overrides, start, { date: goalDate, time: profile.goalTime || null }));
   }
   return weeks;
 }
@@ -245,7 +245,7 @@ function peakVol(start, buildWeeks) {
   return v;
 }
 
-function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, weekStart, overrides, start) {
+function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, weekStart, overrides, start, goal) {
   // long run grows toward ~ goalKm (capped for safety) but eased in taper
   const longCap = goalKm <= 10 ? goalKm * 1.0 : goalKm <= 21.1 ? goalKm * 0.95 : goalKm * 0.80;
   const progress = Math.min(1, (idx + 1) / Math.max(1, total - 2));
@@ -264,8 +264,16 @@ function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, w
 
   // fill remaining preferred days with easy/zone2 runs to hit volume
   const easyD = sched.rest.slice(qualityCount);
-  const remaining = Math.max(0, weekVol - longKm - qualityCount * 6); // assume ~6km per quality incl w/u
-  const perEasy = easyD.length > 0 ? Math.max(4, Math.round(remaining / easyD.length)) : 0;
+  // weekVol is a floor here, not a ceiling. Subtracting a growing long run from
+  // it drove easy days to their 4km minimum exactly as the long run — and so the
+  // need for supporting volume — was peaking, which is backwards. Size them off
+  // the long run as well and take whichever is larger. easyD is empty on a 2-day
+  // week (long + quality only), so this leaves those plans untouched.
+  const spare = Math.max(0, weekVol - longKm - qualityCount * 6); // assume ~6km per quality incl w/u
+  const perEasy =
+    easyD.length > 0
+      ? Math.max(4, Math.round(Math.max(spare / easyD.length, longKm * 0.5)))
+      : 0;
   easyD.forEach((day) => slots.push({ day, type: "easy", km: perEasy }));
 
   // resolve each slot onto a real date in this week's 7-day block, applying any
@@ -295,6 +303,26 @@ function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, w
   const full = sessions.length;
   sessions = sessions.filter((s) => s.date >= start);
   if (full > 0 && sessions.length < full) volume = Math.round(weekVol * sessions.length / full);
+
+  // Race day comes from the goal date, not from the weekday slots, so it is
+  // added after the override pass: it can't be rescheduled or skipped, and it
+  // doesn't scale the week's volume. Whatever training session lands on it gives
+  // way — the plan used to prescribe a long run on top of the actual race.
+  const raceDate = goal && goal.date;
+  if (raceDate && raceDate >= weekStart && raceDate < addDays(weekStart, 7) && raceDate >= start) {
+    sessions = sessions.filter((s) => s.date !== raceDate);
+    sessions.push({
+      day: dowName(raceDate),
+      origDay: dowName(raceDate),
+      date: raceDate,
+      type: "race",
+      km: goalKm,
+      race: true,
+      goalTime: (goal && goal.time) || null,
+      skipped: false,
+    });
+  }
+
   sessions.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 
   return {
@@ -333,6 +361,12 @@ function sessionSteps(s) {
       },
       { kind: "cooldown", label: "Easy cool-down", sec: 10 * 60, zone: "easy" },
     ];
+  }
+  if (s.type === "race") {
+    // No pace prescription: the zone bands describe training, and race effort is
+    // the runner's call on the day. "marathon" is only here so the duration
+    // estimate has a band to work from.
+    return [{ kind: "steady", label: "Race", km: s.km, zone: "marathon" }];
   }
   return [{ kind: "steady", label: s.type === "long" ? "Long run" : "Easy", km: s.km, zone: s.type }];
 }
@@ -460,6 +494,15 @@ function sessionDescription(s, zones) {
   // Easy + long are always conversational, so the pace prescription is noise —
   // just state the distance and the effort. (Pace adherence is surfaced after
   // the run, as a drift flag on the activity. See PaceInsights.)
+  if (s.type === "race") {
+    return {
+      title: `Race day · ${s.km}km`,
+      detail: s.goalTime
+        ? `Goal ${s.goalTime}. This is the one the plan has been building for.`
+        : `${durStr}this is the one the plan has been building for.`,
+      dur,
+    };
+  }
   if (s.type === "long") {
     return { title: `Long run · ${s.km}km`, detail: `${durStr}conversational, easy by feel.${fuelStr}`, dur };
   }
@@ -566,7 +609,7 @@ function weekReview(plan, profile, runs, completions) {
   const sessions = lastWk.sessions.filter((s) => !s.skipped); // skipped = deliberate, not missed
   const total = sessions.length;
   const doneCount = sessions.filter((s) => doneDays.has(s.day)).length;
-  const keySessions = sessions.filter((s) => s.type === "long" || s.quality);
+  const keySessions = sessions.filter((s) => s.type === "long" || s.type === "race" || s.quality);
   const missedKey = keySessions.filter((s) => !doneDays.has(s.day));
 
   const byId = new Map(runs.map((r) => [r.id, r]));
@@ -4343,7 +4386,7 @@ function suggestSessionIdx(sessions, activity) {
     if (runDay && s.day === runDay) score += 100;            // same weekday: strongest signal
     if (dist != null && s.km) {                              // distance fit (long/easy carry km)
       score += Math.max(0, 40 * (1 - Math.abs(dist - s.km) / s.km));
-      if (s.type === "long" && dist >= s.km * 0.85) score += 25;  // a long effort leans long
+      if ((s.type === "long" || s.type === "race") && dist >= s.km * 0.85) score += 25;  // a long effort leans long
     }
     if (score > best) { best = score; bestIdx = i; }
   });
