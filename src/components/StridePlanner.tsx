@@ -176,6 +176,42 @@ function fmtShortDate(iso) {
   return `${d.getDate()} ${MONTHS[d.getMonth()]}`;
 }
 
+// A plan is one continuous build plus a taper, and the long-run ramp is paced
+// against the plan's total length. Stretch it far enough and `progress` never
+// clears the goalKm*0.35 floor early on, so the opening months all prescribe the
+// same distance — a 39-week half plan opens with 13 identical 7km long runs.
+// 24 weeks is as far as that stays honest.
+const MAX_PLAN_WEEKS = 24;
+
+// "Sun 24 Jan 2027" — goal dates can land in another year, where fmtDayDate
+// alone would be ambiguous.
+function fmtFullDate(iso) {
+  if (!iso) return "";
+  return `${fmtDayDate(iso)} ${new Date(`${iso}T12:00:00`).getFullYear()}`;
+}
+
+// Non-null when the goal date sits beyond what one plan can cover. generatePlan
+// clamps to MAX_PLAN_WEEKS, which would otherwise hand back a plan that just
+// stops months short of the race with no race day in it and nothing said. The
+// returned dates are the two ways out, so the warning can offer both.
+function planRangeWarning(planStartDate, goalDate) {
+  if (!planStartDate || !goalDate) return null;
+  const firstMonday = mondayOf(planStartDate);
+  const spanDays = Math.round(
+    (new Date(`${goalDate}T12:00:00`) - new Date(`${firstMonday}T12:00:00`)) / DAY_MS
+  );
+  if (spanDays <= 0) return null;
+  const weeks = Math.ceil(spanDays / 7);
+  if (weeks <= MAX_PLAN_WEEKS) return null;
+  return {
+    weeks,
+    // Last day this plan would actually reach — and so also the latest goal
+    // date that still fits inside it.
+    planEnds: addDays(firstMonday, MAX_PLAN_WEEKS * 7 - 1),
+    suggestedStart: addDays(mondayOf(goalDate), -((MAX_PLAN_WEEKS - 1) * 7)),
+  };
+}
+
 function generatePlan(profile) {
   const { goalDistanceKm, goalDate, currentWeeklyKm, daysPerWeek } = profile;
   if (!goalDistanceKm || !goalDate || !currentWeeklyKm) return [];
@@ -184,7 +220,7 @@ function generatePlan(profile) {
   // date but only spans to that week's Sunday, so it can be partial.
   const firstMonday = mondayOf(start);
   const spanDays = Math.round((new Date(`${goalDate}T12:00:00`) - new Date(`${firstMonday}T12:00:00`)) / DAY_MS);
-  const totalWeeks = Math.min(24, Math.max(4, Math.ceil(spanDays / 7)));
+  const totalWeeks = Math.min(MAX_PLAN_WEEKS, Math.max(4, Math.ceil(spanDays / 7)));
   const days = Math.min(6, Math.max(2, daysPerWeek || 4));
 
   // which weekdays the runner uses + which is the long run
@@ -4128,6 +4164,7 @@ function Setup({ profile, onSave, zones, runs, onPlanReset }) {
     if (!next.includes(longDay)) setLongDay(defaultLong(next));
   };
   const daysValid = preferredDays.length === parseInt(daysPerWeek) && !!longDay;
+  const planRange = planRangeWarning(planStartDate, goalDate);
 
   const submit = () => {
     const goalLabel =
@@ -4227,6 +4264,14 @@ function Setup({ profile, onSave, zones, runs, onPlanReset }) {
           </label>
           <label className="field"><span>Plan start date</span><input type="date" value={planStartDate} onChange={(e) => setPlanStartDate(e.target.value)} /></label>
         </div>
+        {planRange && (
+          <p className="warn small" style={{ marginTop: 8 }}>
+            Your goal is {planRange.weeks} weeks away and plans run to {MAX_PLAN_WEEKS}, so this one
+            would stop on {fmtFullDate(planRange.planEnds)} — before your race, with no race day in it.
+            Either set a goal date on or before {fmtFullDate(planRange.planEnds)}, or start the plan on{" "}
+            {fmtFullDate(planRange.suggestedStart)} and keep ticking over until then.
+          </p>
+        )}
         {parseInt(daysPerWeek) === 2 && (
           <p className="muted small">On 2 days a week, both runs count: one long run (easy effort) and one quality session. That's a legit way to train — consistency beats volume.</p>
         )}
