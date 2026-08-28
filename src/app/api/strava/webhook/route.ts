@@ -6,6 +6,12 @@ import { sendPushToUser } from "@/utils/push/send";
 import { captureSpotifyForActivity } from "@/utils/spotify/capture";
 import { waitUntil } from "@vercel/functions";
 
+// waitUntil keeps the function alive past the response, but it's still bounded by
+// this cap. The background work makes four network round-trips (token, activity,
+// streams, Spotify) and writes a multi-MB stream blob, so the platform default is
+// too tight to rely on.
+export const maxDuration = 60;
+
 const STREAM_KEYS =
   "time,distance,latlng,altitude,velocity_smooth,heartrate,cadence,watts,temp,moving,grade_smooth";
 
@@ -111,6 +117,26 @@ async function processActivityEvent(event: any) {
     .single();
   if (upErr || !upserted) { console.error("activity upsert failed", upErr?.message); return; }
 
+  console.log(
+    `strava webhook: ${event.aspect_type} activity ${stravaId} user ${userId} firstSeen=${firstSeen}`
+  );
+
+  // Notify as soon as the run is viewable — deliberately BEFORE the streams fetch.
+  // Nothing in the notification depends on streams, and streams are the slowest,
+  // heaviest step here; queueing the push behind them only creates a window where
+  // a slow fetch or a timeout swallows the notification after the run has already
+  // landed in the UI. (docs/ideas.md: fire run-available promptly off the webhook.)
+  if (firstSeen) {
+    const pushRes = await sendPushToUser(userId, {
+      title: "STRIDE",
+      body: "New activity available to view in STRIDE",
+      url: "/",
+    });
+    console.log(
+      `strava webhook: push for ${stravaId} subs=${pushRes.subscriptions} sent=${pushRes.sent} pruned=${pushRes.pruned} errors=${JSON.stringify(pushRes.errors)}`
+    );
+  }
+
   const sres = await fetch(
     `https://www.strava.com/api/v3/activities/${stravaId}/streams?keys=${STREAM_KEYS}&key_by_type=true`,
     { headers: { Authorization: `Bearer ${token}` } }
@@ -123,20 +149,7 @@ async function processActivityEvent(event: any) {
     );
   }
 
-  console.log(
-    `strava webhook: ${event.aspect_type} activity ${stravaId} user ${userId} firstSeen=${firstSeen}`
-  );
-
   if (firstSeen) {
-    const pushRes = await sendPushToUser(userId, {
-      title: "STRIDE",
-      body: "New activity available to view in STRIDE",
-      url: "/",
-    });
-    console.log(
-      `strava webhook: push for ${stravaId} sent=${pushRes.sent} pruned=${pushRes.pruned} errors=${JSON.stringify(pushRes.errors)}`
-    );
-
     try {
       await captureSpotifyForActivity(userId, {
         id: upserted.id,

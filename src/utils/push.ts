@@ -35,6 +35,24 @@ export async function getExistingSubscription(): Promise<PushSubscription | null
   return reg.pushManager.getSubscription();
 }
 
+// A subscription is bound to the VAPID key it was created with. Rotate the key
+// pair and every existing subscription keeps working from the browser's point of
+// view while the server's sends fail with 403 — invisible unless we check.
+// Returns true when we can't read the key back, so an unknown never churns a
+// perfectly good subscription.
+export function matchesCurrentVapidKey(
+  sub: PushSubscription,
+  vapid: string | undefined = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY
+): boolean {
+  if (!vapid) return true;
+  const current = sub.options?.applicationServerKey;
+  if (!current) return true;
+  const want = urlBase64ToUint8Array(vapid);
+  const have = new Uint8Array(current);
+  if (have.length !== want.length) return false;
+  return want.every((b, i) => have[i] === b);
+}
+
 // Registers the SW, asks permission (must be called from a user gesture),
 // subscribes, and returns the subscription as plain JSON for storage.
 export async function subscribeToPush(): Promise<PushSubscriptionJSON> {
@@ -48,8 +66,13 @@ export async function subscribeToPush(): Promise<PushSubscriptionJSON> {
   if (permission !== "granted") throw new Error("Notification permission denied");
 
   const existing = await reg.pushManager.getSubscription();
-    if (existing) return existing.toJSON();
-    
+  if (existing) {
+    if (matchesCurrentVapidKey(existing, vapid)) return existing.toJSON();
+    // Minted against an old key — drop it and subscribe again, otherwise we'd
+    // hand the caller an endpoint the server can never authenticate to.
+    await existing.unsubscribe();
+  }
+
   const sub = await reg.pushManager.subscribe({
     userVisibleOnly: true,
     applicationServerKey: urlBase64ToUint8Array(vapid),

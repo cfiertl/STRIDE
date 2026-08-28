@@ -21,6 +21,10 @@ export interface PushMessage {
 }
 
 export interface SendResult {
+  // How many subscription rows the user had. Distinguishes "nobody is subscribed"
+  // from "we tried and every send failed" — those look identical on sent:0 alone,
+  // and the first one is the silent failure mode worth catching.
+  subscriptions: number;
   sent: number;
   pruned: number;
   errors: { statusCode?: number; detail?: string }[];
@@ -33,10 +37,15 @@ export async function sendPushToUser(
   userId: string,
   msg: PushMessage
 ): Promise<SendResult> {
-  const result: SendResult = { sent: 0, pruned: 0, errors: [] };
+  const result: SendResult = { subscriptions: 0, sent: 0, pruned: 0, errors: [] };
 
-  if (!process.env.VAPID_PRIVATE_KEY || !process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY) {
-    result.errors.push({ detail: "VAPID keys not configured" });
+  // VAPID_SUBJECT is as required as the key pair — web-push throws without it,
+  // so check all three together rather than letting one fail in the catch below.
+  const missing = (
+    ["NEXT_PUBLIC_VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY", "VAPID_SUBJECT"] as const
+  ).filter((k) => !process.env[k]);
+  if (missing.length) {
+    result.errors.push({ detail: `VAPID not configured: missing ${missing.join(", ")}` });
     return result;
   }
   try {
@@ -57,6 +66,7 @@ export async function sendPushToUser(
     return result;
   }
   if (!subs || subs.length === 0) return result;
+  result.subscriptions = subs.length;
 
   const payload = JSON.stringify({
     title: msg.title,
