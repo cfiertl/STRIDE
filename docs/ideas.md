@@ -228,79 +228,12 @@ URL state together, then the two riders.
 
 ## Baseline health: readiness from Apple Health
 
-**The idea:** Let STRIDE see resting HR, HRV, sleep and heart-rate recovery, so
-the plan can say *"don't do the intervals today"* instead of prescribing the same
-session regardless of what state you're in. This is the step that turns a fixed
-plan into an adaptive one.
+**Status:** Promoted out of the parking lot. See **[healthBridge.md](./healthBridge.md)**
+for the build: the full metric survey, schema, endpoint contract, Shortcut spec
+and phased sequence.
 
-**Status:** Idea / not scheduled. The largest item in the backlog and the one
-with the biggest payoff. Needs a new ingest path before any of the interesting
-logic is possible.
-
-### Why it can't be done today
-
-STRIDE's entire view of the runner arrives through **Strava**, and Strava carries
-activities, not physiology. Everything on the list above lives in **Apple
-Health** and never reaches Strava:
-
-| Signal | Lives in | Reaches STRIDE today |
-|---|---|---|
-| Pace, HR, cadence, altitude, power | Strava streams | ✅ yes |
-| Resting heart rate | Apple Health | ❌ no |
-| HRV (SDNN) | Apple Health | ❌ no |
-| Sleep duration / stages | Apple Health | ❌ no |
-| Heart-rate recovery (1 min post-workout) | Apple Health | ❌ no |
-| Cardio Fitness (VO2max estimate) | Apple Health | ❌ no |
-
-Apple publishes no web API for Health. A PWA cannot read it, and there is no
-partner programme to apply to — the data only leaves the phone if something on
-the phone pushes it out.
-
-### The viable route: a Shortcuts automation
-
-Apple **Shortcuts** can read Health samples and make a web request, and a
-Personal Automation can run one daily without being opened. So:
-
-1. A new endpoint, e.g. `POST /api/health/daily`, taking a small JSON body:
-   `{ date, restingHr, hrvMs, sleepMinutes, vo2max }`.
-2. Auth by a per-user token, since a Shortcut can't hold a Supabase session.
-   Generate one in Setup, paste it into the Shortcut's header. Treat it as a
-   credential — scope it to this endpoint only, and make it revocable.
-3. A `daily_health` table keyed `(user_id, date)`, upsert on conflict so a re-run
-   is harmless.
-4. A Shortcut spec in the docs for the user to build once: read the four values
-   for today, POST them, run at ~08:00 daily.
-
-No App Store, no native build, no partner API. The cost is that setup is manual
-and the user owns the automation.
-
-### What to do with it once it lands
-
-- **Readiness flag on Today.** Compare this morning against a rolling baseline —
-  never day-to-day. Apple samples HRV sporadically rather than continuously, so
-  a single reading is noise; a 7-day median against a 60-day baseline is signal.
-- **Session downgrade suggestion.** If readiness is poor on a day carrying a
-  quality session, offer to swap it for the week's easy run rather than skip it —
-  reuses the existing `scheduleOverrides` machinery, no new persistence.
-- **Heart-rate recovery as a fitness trend.** Cheap, objective, and it moves
-  faster than race results do.
-- **Cardio Fitness alongside the benchmark.** A second opinion on the pace
-  updates that `fitnessUpdateSuggestion` makes from run data alone.
-
-### Cautions
-
-- **Don't let it auto-modify the plan.** Suggest, never rewrite. The plan is
-  derived from profile and that property is worth keeping.
-- **Apple's HRV is noisy.** Sporadic sampling, and it moves with alcohol, illness
-  and late meals as much as with training load. Baseline-relative only.
-- **Correlation ≠ readiness.** Resist a single "readiness score" out of the gate;
-  show the components first and learn what actually predicts a bad session.
-
-### Related, same pipeline
-
-Running **form metrics** — ground contact time, stride length, vertical
-oscillation — are also Health-only and would ride the same endpoint. Lower value
-than readiness, so not worth building the pipeline for on their own, but free
-once it exists.
-
----
+**The short version:** Apple publishes no web API for Health, so the only route
+is a Shortcuts personal automation that reads samples on the phone and POSTs them
+to us. That unlocks resting HR, HRV, sleep and wrist temperature — plus the thing
+no wearable app can do, which is joining a morning’s readings to the session
+score we already log in `run_logs.score`.
