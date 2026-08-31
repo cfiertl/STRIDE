@@ -410,6 +410,103 @@ function sessionSteps(s) {
 // Seconds a step occupies. Reps carry recoveries *between* efforts only — the
 // last one runs straight into the cool-down. `end` picks the slow/fast end of a
 // step that's prescribed as a range (the tempo block).
+// The prescription flattened into the block sequence a watch actually laps:
+// warm-up, then every rep's work and recovery as their own blocks, then
+// cool-down. sessionSteps collapses reps into a single step — the right shape
+// for reading a session — but a structured workout on the watch expands them,
+// so this is the shape that lines up with Strava laps. Mirrors stepSeconds in
+// putting no recovery after the final rep.
+function prescribedBlocks(session) {
+  const out = [];
+  sessionSteps(session).forEach((st) => {
+    if (st.kind === "reps") {
+      for (let i = 0; i < st.reps; i++) {
+        out.push({ kind: "work", label: `Work ${i + 1}`, sec: st.work.sec, zone: st.work.zone, work: true });
+        if (i < st.reps - 1) out.push({ kind: "recovery", label: "Recovery", sec: st.rest.sec, zone: st.rest.zone, work: false });
+      }
+      return;
+    }
+    out.push({
+      kind: st.kind,
+      label: st.kind === "warmup" ? "Warm-up" : st.kind === "cooldown" ? "Cool-down" : "Work",
+      sec: stepSeconds(st, "mid"),
+      zone: st.zone,
+      work: st.kind === "work",
+    });
+  });
+  return out;
+}
+
+// One lap as distance + time, so work blocks can be averaged properly (total
+// distance over total time) rather than by averaging their paces, which would
+// weight a 200m rep the same as a 2km tempo block.
+function lapMetrics(lap) {
+  const km = lap.distance != null ? lap.distance / 1000 : null;
+  const sec = lap.moving_time ?? lap.elapsed_time ?? null;
+  if (!(km > 0) || !(sec > 0)) return null;
+  return { km, sec, pace: sec / km };
+}
+
+// Line the run's laps up against the prescription.
+//
+// A session built on the watch from WatchSetup emits one lap per block, so an
+// exact count match is positional and certain — that is the common case and
+// the only one we treat as reliable. Otherwise fall back to picking work laps
+// by duration (within 35% of the prescribed block) and breaking ties on pace,
+// since a work rep is the quickest thing of roughly its length.
+//
+// Returns null when nothing lines up, so the caller can say so rather than
+// silently grading against a guess.
+function alignLapsToBlocks(laps, blocks) {
+  if (!Array.isArray(laps) || laps.length < 2 || !blocks.length) return null;
+  const workBlocks = blocks.filter((b) => b.work);
+  if (!workBlocks.length) return null;
+
+  const rows = [];
+  if (laps.length === blocks.length) {
+    for (let i = 0; i < blocks.length; i++) {
+      const m = lapMetrics(laps[i]);
+      if (!m) return null;
+      rows.push({ block: blocks[i], ...m });
+    }
+    return { mode: "exact", rows };
+  }
+
+  // Inexact: claim one lap per work block, nearest duration first, never twice.
+  const claimed = new Set();
+  for (const block of workBlocks) {
+    let best = null;
+    laps.forEach((lap, i) => {
+      if (claimed.has(i)) return;
+      const m = lapMetrics(lap);
+      if (!m) return;
+      if (Math.abs(m.sec - block.sec) > block.sec * 0.35) return;
+      if (!best || m.pace < best.m.pace) best = { i, m };
+    });
+    if (!best) return null;
+    claimed.add(best.i);
+    rows.push({ block, ...best.m });
+  }
+  return { mode: "matched", rows };
+}
+
+// What the whole run should average if every block were run to prescription —
+// duration-weighted across the blocks. This is what makes an unlapped run
+// judgeable at all: comparing its average against the WORK band was the
+// original bug, because warm-up and recoveries are prescribed to be slow.
+function expectedRunPace(blocks, zones) {
+  let sec = 0, km = 0;
+  for (const b of blocks) {
+    const band = zones && zones[b.zone];
+    if (!band || !(b.sec > 0)) return null;
+    const mid = (band[0] + band[1]) / 2; // sec per km
+    if (!(mid > 0)) return null;
+    sec += b.sec;
+    km += b.sec / mid;
+  }
+  return km > 0 ? sec / km : null;
+}
+
 // Does this session have a real prescription, or is it one steady block? Decides
 // whether a step breakdown is worth rendering at all.
 function hasSteps(s) {
@@ -2892,7 +2989,7 @@ function ActivityDetail({ activityId, onBack, profile, onScored, onDelete }) {
         </section>
       )}
 
-      <PaceInsights pace={pace} splits={splits} completion={completion} profile={profile} />
+      <PaceInsights pace={pace} laps={laps} completion={completion} profile={profile} />
       <LinkSession activity={a} log={log} completion={completion} profile={profile} onSaved={() => setReloadTick((t) => t + 1)} />
       <ScoreCard activity={a} log={log} onSaved={() => { setReloadTick((t) => t + 1); onScored?.(); }} />
 
@@ -3195,7 +3292,7 @@ function ScoreCard({ activity, log, onSaved }) {
 // runs show nothing here (just the "Link to plan" tile). Easy/long runs are
 // always conversational, so we only flag running TOO HARD; quality sessions get
 // the full whole-run + per-km breakdown against the planned pace band.
-function PaceInsights({ pace, splits, completion, profile }) {
+function PaceInsights({ pace, laps, completion, profile }) {
   if (!completion) return null;
   const zones = computeZones(profile);
   const plan = profile ? generatePlan(profile) : [];
@@ -3204,7 +3301,7 @@ function PaceInsights({ pace, splits, completion, profile }) {
   const type = session ? session.type : null;
   const band = type && zones ? zones[type] : null;
   if (!type || !band || !pace) return null;
-  const [slow, fast] = band; // sec/km; slow end is the larger number
+  const fast = band[1]; // sec/km; the band runs [slower, faster], so [1] is the quick end
 
   // Easy / long: conversational by definition. The only meaningful miss is
   // going faster than the top of the easy range — flag that, praise the rest.
@@ -3230,13 +3327,83 @@ function PaceInsights({ pace, splits, completion, profile }) {
     );
   }
 
-  // Quality (tempo / interval): whole-run summary + per-km vs the target band.
-  const verdict = pace <= slow && pace >= fast ? "on target" : pace < fast ? "faster than target" : "slower than target";
-  const km = splits.map((s, i) => {
-    const sp = s.average_speed ? 1000 / s.average_speed : null;
-    const tone = sp == null ? "" : sp < fast ? "fast" : sp > slow ? "slow" : "on";
-    return { n: s.split ?? i + 1, sp, tone };
-  });
+  // Quality (tempo / interval): grade the WORK blocks, not the whole run.
+  //
+  // The whole-run average necessarily folds in the warm-up, the recoveries and
+  // the cool-down, every one of which is prescribed to be slow. Comparing that
+  // against the work band made "slower than target" the only verdict a correctly
+  // executed session could earn, and quietly rewarded running the warm-up hard.
+  const blocks = prescribedBlocks(session);
+  const aligned = alignLapsToBlocks(laps, blocks);
+  const workRows = aligned ? aligned.rows.filter((r) => r.block.work) : [];
+
+  if (workRows.length) {
+    const workKm = workRows.reduce((acc, r) => acc + r.km, 0);
+    const workSec = workRows.reduce((acc, r) => acc + r.sec, 0);
+    const workPace = workKm > 0 ? workSec / workKm : null;
+    const wBand = (zones && zones[workRows[0].block.zone]) || band;
+    const [wSlow, wFast] = wBand;
+    const toneOf = (sp) => (sp == null ? "" : sp < wFast ? "fast" : sp > wSlow ? "slow" : "on");
+    const verdict =
+      workPace == null ? "—"
+        : workPace <= wSlow && workPace >= wFast ? "on target"
+        : workPace < wFast ? "faster than target"
+        : "slower than target";
+    const onCount = workRows.filter((r) => toneOf(r.pace) === "on").length;
+    const many = workRows.length > 1;
+
+    return (
+      <section className="card">
+        <div className="card-head">
+          <h3>Pace vs plan</h3>
+          <Pill tone="base">{cap(type)}</Pill>
+        </div>
+        <div className="hero-row">
+          <Stat label="Work avg" value={fmtPaceBare(workPace)} accent />
+          <Stat label="Target" value={`${fmtPaceBare(wSlow)}–${fmtPaceBare(wFast)}`} />
+          <Stat label="Verdict" value={verdict} />
+        </div>
+        {many && (
+          <div className="splits-table" style={{ marginTop: 10 }}>
+            <div className="srow shead"><span>Block</span><span>Pace</span><span>vs plan</span></div>
+            {workRows.map((r, i) => {
+              const t = toneOf(r.pace);
+              return (
+                <div key={i} className="srow">
+                  <span>{r.block.label}</span>
+                  <span className="mono">{fmtPace(r.pace)}</span>
+                  <span
+                    className={`mono ${t === "slow" ? "muted" : ""}`}
+                    style={t === "on" ? { color: "var(--positive)" } : t === "fast" ? { color: "var(--accent)" } : undefined}
+                  >
+                    {t === "on" ? "on target" : t === "fast" ? "faster" : t === "slow" ? "slower" : "—"}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        <p className="muted small" style={{ marginTop: 8 }}>
+          {many
+            ? `Graded on your ${workRows.length} work blocks — ${onCount} of ${workRows.length} inside the target band. `
+            : "Graded on the work block alone. "}
+          Warm-up, recoveries and cool-down aren&apos;t graded — they&apos;re prescribed easy.
+          {aligned.mode === "matched" &&
+            " Your laps didn't line up with the prescription exactly, so these were picked by duration and pace."}
+        </p>
+      </section>
+    );
+  }
+
+  // No usable lap structure. Judge the whole run against what the whole run was
+  // supposed to average — warm-up and recoveries included — rather than against
+  // a work band it was never all meant to hit, and say that that is what we did.
+  const expected = expectedRunPace(blocks, zones);
+  const wholeVerdict =
+    expected == null ? null
+      : pace <= expected * 1.05 && pace >= expected * 0.95 ? "on target"
+      : pace < expected ? "faster than target"
+      : "slower than target";
   return (
     <section className="card">
       <div className="card-head">
@@ -3245,28 +3412,13 @@ function PaceInsights({ pace, splits, completion, profile }) {
       </div>
       <div className="hero-row">
         <Stat label="Your avg" value={fmtPaceBare(pace)} accent />
-        <Stat label="Target" value={`${fmtPaceBare(slow)}–${fmtPaceBare(fast)}`} />
-        <Stat label="Verdict" value={verdict} />
+        <Stat label="Session should avg" value={expected ? fmtPaceBare(expected) : "—"} />
+        <Stat label="Verdict" value={wholeVerdict || "—"} />
       </div>
-      {km.length > 0 && (
-        <div className="splits-table" style={{ marginTop: 10 }}>
-          <div className="srow shead"><span>Km</span><span>Pace</span><span>vs plan</span></div>
-          {km.map((k) => (
-            <div key={k.n} className="srow">
-              <span>{k.n}</span>
-              <span className="mono">{fmtPace(k.sp)}</span>
-              <span
-                className={`mono ${k.tone === "slow" ? "muted" : ""}`}
-                style={k.tone === "on" ? { color: "var(--positive)" } : k.tone === "fast" ? { color: "var(--accent)" } : undefined}
-              >
-                {k.tone === "on" ? "on target" : k.tone === "fast" ? "faster" : k.tone === "slow" ? "easier" : "—"}
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
       <p className="muted small" style={{ marginTop: 8 }}>
-        Warm-up and cool-down kms read “easier” than target — that’s expected; the work intervals are where it counts.
+        This run has no lap structure, so it compares your whole-run average against what the
+        whole session should average, warm-up and recoveries included. Build the session on your
+        watch and each work block gets graded on its own.
       </p>
     </section>
   );
