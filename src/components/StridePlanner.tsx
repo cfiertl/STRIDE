@@ -447,33 +447,58 @@ function lapMetrics(lap) {
   return { km, sec, pace: sec / km };
 }
 
+// Is this lap sequence plausibly this block sequence? Matching counts is only
+// suggestive — durations are what make it certain, and checking them stops an
+// unstructured run that happens to have the right number of laps being graded
+// as though it were the prescription.
+//
+// Work blocks are held tight because they're the ones actually graded. Warm-ups
+// and cool-downs get a loose leash: running 25 minutes of warm-up when 15 was
+// prescribed is normal and shouldn't cost us the alignment.
+function fitsPositionally(laps, blocks) {
+  if (laps.length !== blocks.length) return null;
+  const rows = [];
+  for (let i = 0; i < blocks.length; i++) {
+    const m = lapMetrics(laps[i]);
+    if (!m) return null;
+    const tol = blocks[i].work
+      ? Math.max(45, blocks[i].sec * 0.35)
+      : Math.max(120, blocks[i].sec * 0.9);
+    if (Math.abs(m.sec - blocks[i].sec) > tol) return null;
+    rows.push({ block: blocks[i], ...m });
+  }
+  return rows;
+}
+
 // Line the run's laps up against the prescription.
 //
-// A session built on the watch from WatchSetup emits one lap per block, so an
-// exact count match is positional and certain — that is the common case and
-// the only one we treat as reliable. Otherwise fall back to picking work laps
-// by duration (within 35% of the prescribed block) and breaking ties on pace,
-// since a work rep is the quickest thing of roughly its length.
+// A session built on the watch from WatchSetup emits one lap per block, so a
+// positional fit is the common case and the only one treated as certain.
 //
-// Returns null when nothing lines up, so the caller can say so rather than
-// silently grading against a guess.
+// Before giving up on that, drop a trailing stub lap: Apple opens a fresh lap
+// when a workout ends mid-lap, so most runs carry a few seconds of jogging home
+// as an extra lap that belongs to no block. It is the norm, not an anomaly.
+//
+// Failing both, claim one lap per work block by duration, breaking ties on pace,
+// since a work rep is the quickest thing of roughly its length. Returns null
+// when nothing lines up, so the caller can say so rather than grade a guess.
 function alignLapsToBlocks(laps, blocks) {
   if (!Array.isArray(laps) || laps.length < 2 || !blocks.length) return null;
   const workBlocks = blocks.filter((b) => b.work);
   if (!workBlocks.length) return null;
 
-  const rows = [];
-  if (laps.length === blocks.length) {
-    for (let i = 0; i < blocks.length; i++) {
-      const m = lapMetrics(laps[i]);
-      if (!m) return null;
-      rows.push({ block: blocks[i], ...m });
-    }
-    return { mode: "exact", rows };
+  let rows = fitsPositionally(laps, blocks);
+  if (rows) return { mode: "exact", rows };
+
+  const shortest = Math.min(...blocks.map((b) => b.sec));
+  const tail = lapMetrics(laps[laps.length - 1]);
+  if (tail && tail.sec < shortest * 0.6) {
+    rows = fitsPositionally(laps.slice(0, -1), blocks);
+    if (rows) return { mode: "exact", rows };
   }
 
-  // Inexact: claim one lap per work block, nearest duration first, never twice.
   const claimed = new Set();
+  rows = [];
   for (const block of workBlocks) {
     let best = null;
     laps.forEach((lap, i) => {
