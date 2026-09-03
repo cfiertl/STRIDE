@@ -724,16 +724,18 @@ function fitnessUpdateSuggestion(profile, runs) {
 function loadWatch(runs) {
   const WEEKS = 5;            // how many weeks back to chart
   const THRESHOLD = 0.10;     // 10% week-over-week is the classic flag line
-  const now = Date.now();
-  const DAY = 24 * 3600 * 1000;
 
-  // weeks[0] = most recent 7 days, weeks[1] = 7-14 days ago, etc.
-  const weeks = Array.from({ length: WEEKS }, () => 0);
-  runs.forEach((r) => {
-    const ageDays = (now - new Date(r.date).getTime()) / DAY;
-    if (ageDays < 0) return;
-    const bucket = Math.floor(ageDays / 7);
-    if (bucket < WEEKS) weeks[bucket] += parseFloat(r.distance) || 0;
+  // Monday-anchored calendar weeks, matching mondayOf() and so the plan's own
+  // weeks. Rolling 7-day windows were wrong for this: "last fully-elapsed week"
+  // has no meaning when every bucket ends today, and a Saturday long run sat in
+  // the "current week" bucket for six days after it, inflating it the whole time.
+  const thisMonday = mondayOf(todayISO());
+  const weeks = Array.from({ length: WEEKS }, (_, i) => {
+    const start = addDays(thisMonday, -i * 7);
+    const end = addDays(start, 6);
+    return runs
+      .filter((r) => r.date >= start && r.date <= end)
+      .reduce((a, r) => a + (parseFloat(r.distance) || 0), 0);
   });
 
   // current week (weeks[0]) is partial — don't flag against it yet.
@@ -4047,29 +4049,31 @@ function isRunActivity(r) {
   return RUN_TYPES.includes(t) || /run/i.test(t);
 }
 
-// km totalled into rolling 7-day buckets, oldest → newest. Last entry is the
-// current (partial) week. Returns objects rather than bare numbers so the chart
-// can label and annotate each bar.
+// km per Monday-anchored calendar week, oldest → newest. Last entry is the
+// current, still-running week.
+//
+// These used to be rolling 7-day windows ending today, which quietly overstated
+// the near weeks: "this week" meant the last seven days whatever day it was, so
+// a Saturday long run kept counting towards it until the following Friday, and
+// the same run also appeared in the bucket before. Calendar weeks match
+// mondayOf() and the plan's own weeks, so a bar is the week you actually ran.
 function weeklyVolumeSeries(runs, n) {
-  const now = Date.now(), DAY = 864e5;
-  const weeks = Array.from({ length: n }, () => ({ km: 0, runs: 0 }));
-  runs.forEach((r) => {
-    const age = (now - new Date(r.date).getTime()) / DAY;
-    if (age < 0 || age >= n * 7) return;
-    const b = Math.floor(age / 7);
-    weeks[b].km += parseFloat(r.distance) || 0;
-    weeks[b].runs += 1;
-  });
-  const day = (t) => { const d = new Date(t); return `${d.getDate()} ${MONTHS[d.getMonth()]}`; };
-  return weeks
-    .map((w, b) => ({
-      km: Math.round(w.km * 10) / 10,
-      runs: w.runs,
-      current: b === 0, // the in-progress week, drawn faded
-      label: day(now - (b * 7 + 6) * DAY),
-      range: `${day(now - (b * 7 + 6) * DAY)} – ${day(now - b * 7 * DAY)}`,
-    }))
-    .reverse();
+  const thisMonday = mondayOf(todayISO());
+  const day = (iso) => { const d = new Date(`${iso}T12:00:00`); return `${d.getDate()} ${MONTHS[d.getMonth()]}`; };
+  const weeks = [];
+  for (let i = n - 1; i >= 0; i--) {
+    const start = addDays(thisMonday, -i * 7);
+    const end = addDays(start, 6);
+    const rs = runs.filter((r) => r.date >= start && r.date <= end);
+    weeks.push({
+      km: Math.round(rs.reduce((a, r) => a + (parseFloat(r.distance) || 0), 0) * 10) / 10,
+      runs: rs.length,
+      current: i === 0, // the in-progress week, drawn faded
+      label: day(start),
+      range: `${day(start)} – ${day(end)}`,
+    });
+  }
+  return weeks;
 }
 
 function Insights({ runs: activities, fuel, zones, profile }) {
@@ -4271,7 +4275,7 @@ function Insights({ runs: activities, fuel, zones, profile }) {
 
       <section className="card insight">
         <h3>Volume trend</h3>
-        <p className="muted small" style={{ marginTop: -4 }}>Running distance per week. Tap a bar for the week.</p>
+        <p className="muted small" style={{ marginTop: -4 }}>Running distance per week, Monday to Sunday. Tap a bar for the week.</p>
         <div className="curve-chart">
           <ResponsiveContainer>
             <BarChart data={vol} margin={{ top: 8, right: 6, bottom: 0, left: 6 }}>
