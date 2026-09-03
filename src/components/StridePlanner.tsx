@@ -3,7 +3,7 @@
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { createClient } from "@/utils/supabase/client";
-import { ComposedChart, Line, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, ReferenceLine } from "recharts";
+import { ComposedChart, BarChart, Bar, Cell, Line, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, ReferenceLine } from "recharts";
 import dynamic from "next/dynamic";
 import BodyMap from "@/components/BodyMap";
 import PushToggle from "@/components/PushToggle";
@@ -4036,20 +4036,49 @@ function runIntensity(r, zones, lt1) {
   return null;
 }
 
+// Is this activity a run? `runs` throughout the app is really every activity —
+// walks, swims, gym sessions, badminton — because that's what Strava sends and
+// the Activities tab is right to show all of it. Anywhere we reason about
+// training, though, a walk is actively misleading: slow at a low heart rate is
+// the exact shape of an excellent easy run. A run is either a logged plan type
+// or a Strava sport type with "run" in it (Run, TrailRun, VirtualRun).
+function isRunActivity(r) {
+  const t = String((r && r.type) || "");
+  return RUN_TYPES.includes(t) || /run/i.test(t);
+}
+
 // km totalled into rolling 7-day buckets, oldest → newest. Last entry is the
-// current (partial) week.
+// current (partial) week. Returns objects rather than bare numbers so the chart
+// can label and annotate each bar.
 function weeklyVolumeSeries(runs, n) {
   const now = Date.now(), DAY = 864e5;
-  const weeks = Array.from({ length: n }, () => 0);
+  const weeks = Array.from({ length: n }, () => ({ km: 0, runs: 0 }));
   runs.forEach((r) => {
     const age = (now - new Date(r.date).getTime()) / DAY;
     if (age < 0 || age >= n * 7) return;
-    weeks[Math.floor(age / 7)] += parseFloat(r.distance) || 0;
+    const b = Math.floor(age / 7);
+    weeks[b].km += parseFloat(r.distance) || 0;
+    weeks[b].runs += 1;
   });
-  return weeks.reverse();
+  const day = (t) => { const d = new Date(t); return `${d.getDate()} ${MONTHS[d.getMonth()]}`; };
+  return weeks
+    .map((w, b) => ({
+      km: Math.round(w.km * 10) / 10,
+      runs: w.runs,
+      current: b === 0, // the in-progress week, drawn faded
+      label: day(now - (b * 7 + 6) * DAY),
+      range: `${day(now - (b * 7 + 6) * DAY)} – ${day(now - b * 7 * DAY)}`,
+    }))
+    .reverse();
 }
 
-function Insights({ runs, fuel, zones, profile }) {
+function Insights({ runs: activities, fuel, zones, profile }) {
+  // Everything below reasons about training, so it works on runs only. Filtering
+  // once here rather than per card is deliberate: it's one rule in one place,
+  // and it can't drift out of sync between cards. Volume was counting walk and
+  // swim kilometres as running, the load watch was flagging weeks off the back
+  // of them, and "Runs (28d)" was counting gym sessions.
+  const runs = activities.filter(isRunActivity);
   if (runs.length < 3) return <Empty msg="Sync or log a few runs and the patterns will show up here." />;
 
   const lt1 = profile?.lt1Hr ?? null;
@@ -4057,8 +4086,11 @@ function Insights({ runs, fuel, zones, profile }) {
   const ageDays = (d) => (Date.now() - new Date(d).getTime()) / 864e5;
 
   // ---- objective: synced data ----
-  const vol = weeklyVolumeSeries(runs, 8);
-  const volMax = Math.max(1, ...vol);
+  const volRaw = weeklyVolumeSeries(runs, 8);
+  const volMax = Math.max(1, ...volRaw.map((w) => w.km));
+  // Same trick as the 12-month chart: draw from `plot` so a zero week still
+  // shows a stub, report `km` in the tooltip.
+  const vol = volRaw.map((w) => ({ ...w, plot: w.km > 0 ? w.km : volMax * 0.02 }));
   const load = loadWatch(runs);
 
   // easy/hard balance over the last 28 days, by moving time
@@ -4087,15 +4119,6 @@ function Insights({ runs, fuel, zones, profile }) {
     };
   };
   // ---- the long view -------------------------------------------------------
-  // `runs` is really every activity — walks, swims and gym sessions included.
-  // That's tolerable for the short-window cards but not here: a walk is slow at
-  // a low heart rate, which is exactly the shape of a great easy run, and a
-  // handful of them would flatten the fitness curve into meaninglessness. A run
-  // is either a logged plan type or a Strava sport type with "run" in it
-  // (Run, TrailRun, VirtualRun).
-  const isRun = (r) => { const t = String(r.type || ""); return RUN_TYPES.includes(t) || /run/i.test(t); };
-  const onlyRuns = runs.filter(isRun);
-
   // Everything above this looks at 28–56 days, which is the right window for
   // "how is this block going" and the wrong one for "am I actually getting
   // fitter". These two run over 12 months.
@@ -4123,7 +4146,7 @@ function Insights({ runs, fuel, zones, profile }) {
   const MIN_MONTH_RUNS = 2;
   const fitCurve = refHr
     ? months12.map((k) => {
-        const rs = onlyRuns.filter((r) => monthKey(r.date) === k && r.avgHr && r.avgHr < lt1 && paceOf(r) > 0);
+        const rs = runs.filter((r) => monthKey(r.date) === k && r.avgHr && r.avgHr < lt1 && paceOf(r) > 0);
         if (rs.length < MIN_MONTH_RUNS) return { k, label: monthLabel(k), pace: null, n: rs.length };
         // efficiency: metres covered per minute, per beat
         const ef = rs.reduce((a, r) => a + ((1000 / paceOf(r)) * 60) / r.avgHr, 0) / rs.length;
@@ -4136,13 +4159,16 @@ function Insights({ runs, fuel, zones, profile }) {
   const curveNow = curveReady ? fitCurvePts[fitCurvePts.length - 1] : null;
 
   // Consistency: monthly distance across the same year, and the breaks in it.
-  const monthKm = months12.map((k) => ({
-    k,
-    label: monthLabel(k),
-    km: onlyRuns.filter((r) => monthKey(r.date) === k).reduce((a, r) => a + (parseFloat(r.distance) || 0), 0),
-  }));
-  const monthKmMax = Math.max(1, ...monthKm.map((m) => m.km));
-  const yearRuns = onlyRuns
+  const monthKmRaw = months12.map((k) => {
+    const rs = runs.filter((r) => monthKey(r.date) === k);
+    return { k, label: monthLabel(k), km: rs.reduce((a, r) => a + (parseFloat(r.distance) || 0), 0), runs: rs.length };
+  });
+  const monthKmMax = Math.max(1, ...monthKmRaw.map((m) => m.km));
+  // `plot` is what the bar is drawn from, `km` is what the tooltip reports. A
+  // month with no running would otherwise render as no bar at all, and an empty
+  // month is precisely what this card exists to show.
+  const monthKm = monthKmRaw.map((m) => ({ ...m, plot: m.km > 0 ? m.km : monthKmMax * 0.02 }));
+  const yearRuns = runs
     .filter((r) => ageDays(r.date) < 365 && r.date)
     .map((r) => r.date)
     .sort();
@@ -4156,7 +4182,7 @@ function Insights({ runs, fuel, zones, profile }) {
 
   // Warm-up load: what the first 10 minutes actually cost, from the precomputed
   // grade-adjusted columns. Recent runs only — route habits change.
-  const warmRuns = onlyRuns.filter((r) => ageDays(r.date) < 120 && r.warmupGapPace && r.gapPace).slice(0, 12);
+  const warmRuns = runs.filter((r) => ageDays(r.date) < 120 && r.warmupGapPace && r.gapPace).slice(0, 12);
   const warmReadyMetrics = warmRuns.length >= 4;
   const warmAvgOpen = warmReadyMetrics ? warmRuns.reduce((a, r) => a + r.warmupGapPace, 0) / warmRuns.length : null;
   const warmAvgRun = warmReadyMetrics ? warmRuns.reduce((a, r) => a + r.gapPace, 0) / warmRuns.length : null;
@@ -4219,9 +4245,16 @@ function Insights({ runs, fuel, zones, profile }) {
     const c = carbsLoggedBeforeRun(r, fuelByDate);
     if (c === true) fueledLong.push(r); else if (c === false) unfueledLong.push(r);
   });
-  const showFuel = fueledLong.length >= 2 && unfueledLong.length >= 1;
+  // Same standard as the warm-up card: two runs against one is not a
+  // comparison, and colouring "fuelled" green regardless of which side scored
+  // higher makes the app assert something its data hasn't shown.
+  const FUEL_MIN = 3;
+  const showFuel = fueledLong.length > 0 && unfueledLong.length > 0;
+  const fuelReady = fueledLong.length >= FUEL_MIN && unfueledLong.length >= FUEL_MIN;
   const fueledAvg = avg(fueledLong.map((r) => r.score));
   const unfueledAvg = avg(unfueledLong.map((r) => r.score));
+  const fuelDelta = fuelReady ? Number(fueledAvg) - Number(unfueledAvg) : 0;
+  const fuelMeaningful = fuelReady && Math.abs(fuelDelta) >= 0.5;
 
   return (
     <div className="stack">
@@ -4238,17 +4271,30 @@ function Insights({ runs, fuel, zones, profile }) {
 
       <section className="card insight">
         <h3>Volume trend</h3>
-        <div className="vol-chart">
-          {vol.map((km, i) => (
-            <div key={i} className="vol-col" title={`${km.toFixed(1)}km`}>
-              <div className="vol-bar" style={{ height: `${Math.max(2, Math.round((km / volMax) * 100))}%`, ...(i === vol.length - 1 ? { opacity: 0.45 } : {}) }} />
-            </div>
-          ))}
+        <p className="muted small" style={{ marginTop: -4 }}>Running distance per week. Tap a bar for the week.</p>
+        <div className="curve-chart">
+          <ResponsiveContainer>
+            <BarChart data={vol} margin={{ top: 8, right: 6, bottom: 0, left: 6 }}>
+              <CartesianGrid stroke="var(--line)" vertical={false} />
+              <XAxis dataKey="label" tick={{ fill: "var(--muted)", fontSize: 10 }} stroke="var(--line)" interval={1} />
+              <YAxis hide />
+              <Tooltip
+                cursor={{ fill: "var(--line)", fillOpacity: 0.35 }}
+                contentStyle={{ background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 10, fontSize: 12 }}
+                formatter={(_v, _n, p) => [`${p.payload.km}km · ${p.payload.runs} run${p.payload.runs === 1 ? "" : "s"}`, p.payload.current ? "so far this week" : "week of"]}
+                labelFormatter={(_l, p) => (p && p[0] ? p[0].payload.range : "")}
+              />
+              <Bar dataKey="plot" radius={[6, 6, 0, 0]} isAnimationActive={false}>
+                {vol.map((w, i) => (
+                  <Cell key={i} fill="var(--accent)" fillOpacity={w.current ? 0.45 : 1} />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
         </div>
-        <div className="vol-axis muted small"><span>8 weeks ago</span><span>this week</span></div>
         {load.flagged
           ? <p className="muted small">Last full week was {Math.round(load.jump * 100)}% up on the week before — past the ~10% mark that tends to precede injury. Worth an easier week before pushing further.</p>
-          : <p className="muted small">Each bar is a week's distance; the last is the current week so far.</p>}
+          : <p className="muted small">The last bar is the current week so far, which is why it looks short.</p>}
       </section>
 
       {easyPct != null && classified >= 4 && (
@@ -4305,19 +4351,33 @@ function Insights({ runs, fuel, zones, profile }) {
       {gaps.length > 0 || monthKm.some((m) => m.km > 0) ? (
         <section className="card insight">
           <h3>Consistency, 12 months</h3>
-          <div className="vol-chart">
-            {monthKm.map((m) => (
-              <div key={m.k} className="vol-col" title={`${m.label}: ${m.km.toFixed(1)}km`}>
-                <div
-                  className="vol-bar"
-                  style={{ height: `${Math.max(2, Math.round((m.km / monthKmMax) * 100))}%`, ...(m.km === 0 ? { background: "var(--coral)", opacity: 0.35 } : {}) }}
+          <p className="muted small" style={{ marginTop: -4 }}>Running distance per month. Tap a bar for the month.</p>
+          <div className="curve-chart">
+            <ResponsiveContainer>
+              <BarChart data={monthKm} margin={{ top: 8, right: 6, bottom: 0, left: 6 }}>
+                <CartesianGrid stroke="var(--line)" vertical={false} />
+                <XAxis dataKey="label" tick={{ fill: "var(--muted)", fontSize: 10 }} stroke="var(--line)" interval={0} />
+                <YAxis hide />
+                <Tooltip
+                  cursor={{ fill: "var(--line)", fillOpacity: 0.35 }}
+                  contentStyle={{ background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 10, fontSize: 12 }}
+                  formatter={(_v, _n, p) => [
+                    p.payload.km > 0
+                      ? `${p.payload.km.toFixed(1)}km · ${p.payload.runs} run${p.payload.runs === 1 ? "" : "s"}`
+                      : "no runs at all",
+                    p.payload.label,
+                  ]}
+                  labelFormatter={() => ""}
                 />
-              </div>
-            ))}
-          </div>
-          <div className="vol-axis muted small">
-            <span>{monthKm[0].label}</span>
-            <span>{monthKm[monthKm.length - 1].label}</span>
+                <Bar dataKey="plot" radius={[6, 6, 0, 0]} isAnimationActive={false}>
+                  {monthKm.map((m) => (
+                    // A month with nothing in it is the story this card is telling,
+                    // so give it a visible stub rather than no bar at all.
+                    <Cell key={m.k} fill={m.km === 0 ? "var(--coral)" : "var(--accent)"} fillOpacity={m.km === 0 ? 0.35 : 1} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
           </div>
           {gaps.length > 0 ? (
             <p className="muted small">
@@ -4444,11 +4504,22 @@ function Insights({ runs, fuel, zones, profile }) {
           <section className="card insight">
             <h3>Fuelling &amp; long runs</h3>
             <p>
-              Your long runs with carbs logged the day before score <strong style={{ color: "var(--positive)" }}>{fueledAvg}/10</strong> on
-              average, vs <strong style={{ color: "var(--coral)" }}>{unfueledAvg}/10</strong> when you hadn't.
-              {Number(fueledAvg) > Number(unfueledAvg) + 0.5
-                ? " Carbing up the day before clearly pays off — make it routine before long runs."
-                : " Keep logging your food to sharpen the picture."}
+              Your long runs with carbs logged the day before score{" "}
+              <strong style={fuelMeaningful ? { color: fuelDelta > 0 ? "var(--positive)" : "var(--coral)" } : undefined}>
+                {fueledAvg}/10
+              </strong>{" "}
+              on average ({fueledLong.length} {fueledLong.length === 1 ? "run" : "runs"}), vs{" "}
+              <strong style={fuelMeaningful ? { color: fuelDelta > 0 ? "var(--coral)" : "var(--positive)" } : undefined}>
+                {unfueledAvg}/10
+              </strong>{" "}
+              when you hadn't ({unfueledLong.length}).
+              {!fuelReady
+                ? ` Too few either way to read anything into yet — ${FUEL_MIN} of each is where this starts meaning something.`
+                : !fuelMeaningful
+                  ? " No real difference so far."
+                  : fuelDelta > 0
+                    ? " Carbing up the day before clearly pays off — make it routine before long runs."
+                    : " Your fuelled long runs are scoring lower, which more likely reflects which runs you bother to fuel than the fuelling itself."}
             </p>
           </section>
         </>
@@ -5272,10 +5343,9 @@ function StyleBlock() {
          rather than on the chart. */
       .curve-chart { height:150px; margin:10px 0 6px; }
       .curve-chart .recharts-cartesian-axis-tick text { font-variant-numeric:tabular-nums; }
-      .vol-chart { display:flex; align-items:flex-end; gap:6px; height:96px; margin-bottom:6px; }
-      .vol-col { flex:1; display:flex; align-items:flex-end; height:100%; }
-      .vol-bar { width:100%; background:var(--accent); border-radius:6px 6px 0 0; min-height:2px; }
-      .vol-axis { display:flex; justify-content:space-between; }
+      /* .vol-chart / .vol-col / .vol-bar / .vol-axis removed — the volume and
+         consistency charts are Recharts bars now, so they read from .curve-chart
+         and carry their own tooltips. */
 
       .pace-table { margin-top:12px; background:var(--bg); border:1px solid var(--line); border-radius:12px; padding:6px 14px; }
       .pt-section { font-size:11px; text-transform:uppercase; letter-spacing:0.06em; color:var(--accent-dim); padding:12px 0 6px; font-weight:600; }
