@@ -932,7 +932,14 @@ function rowsToRun(activity, log) {
   const d = activity.distance_km != null ? Number(activity.distance_km) : null;
   return {
     id: activity.id,
-    date: (log && log.date) || (activity.date ? String(activity.date).slice(0, 10) : ""),
+    // The activity's start time is the authoritative record of when you ran, so
+    // it wins over the log's denormalised copy — and it has to be converted to
+    // local time, not sliced. activities.date is a timestamptz: slicing the
+    // first 10 characters reads the UTC calendar day, so at UTC+10 every run
+    // starting before 10am was filed under the day before. Saturday morning
+    // long runs showed as Friday; 31% of this dataset's runs were a day out,
+    // which also put them in the wrong plan week and the wrong volume bar.
+    date: activity.date ? isoDate(activity.date) : (log && log.date) || "",
     type: (log && log.run_type) || activity.type || "easy",
     distance: d != null ? d.toFixed(2) : "0.00",
     timeSec: activity.moving_time_s ?? 0,
@@ -1188,7 +1195,10 @@ async function saveRunLog(activityId, feel) {
     .eq("id", activityId)
     .single();
   if (eA) throw eA;
-  const logDate = act.date ? String(act.date).slice(0, 10) : null;
+  // Local calendar day, not the UTC slice — see the note in rowsToRun. Logs
+  // written before this fix hold the day before for any pre-10am run; harmless
+  // now that rowsToRun reads the activity's own date in preference to this one.
+  const logDate = act.date ? isoDate(act.date) : null;
 
   const { data: existing, error: e0 } = await supabase
     .from("run_logs")
@@ -2657,7 +2667,7 @@ const WRONG_OPTIONS = [
 const RUN_TYPES = ["easy", "long", "tempo", "interval", "reps", "marathon", "race", "other"];
 
 function LogRun({ profile, zones, onSave, fuel }) {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayISO();
   const [date, setDate] = useState(today);
   const [distance, setDistance] = useState("");
   const [time, setTime] = useState("");
@@ -3741,7 +3751,7 @@ function HRZoneHub({ profile, runs, onSaveHr }) {
     setBusyId(null);
     if (!res) { alert("Couldn't read enough HR data from that run — pick another."); return; }
     const newLt1 = lt1 != null ? lt1 : Math.round(res.lt2 * LT1_FACTOR); // keep a refined LT1 if set
-    onSaveHr({ lt2Hr: res.lt2, lt1Hr: newLt1, lt2SourceActivity: r.id, hrTestedAt: new Date().toISOString().slice(0, 10) });
+    onSaveHr({ lt2Hr: res.lt2, lt1Hr: newLt1, lt2SourceActivity: r.id, hrTestedAt: todayISO() });
     setLt1Draft(newLt1);
     setPicking(false);
   };
@@ -3892,7 +3902,7 @@ function CrossForm({ onAdd }) {
         </select>
       </label>
       <button className="btn-primary span-2" disabled={!minutes}
-        onClick={() => onAdd({ id: Date.now(), date: new Date().toISOString().slice(0, 10), activity, minutes, intensity })}>
+        onClick={() => onAdd({ id: Date.now(), date: todayISO(), activity, minutes, intensity })}>
         Add
       </button>
     </div>
@@ -3932,7 +3942,7 @@ function carbsLoggedBeforeRun(r, fuelByDate) {
 }
 
 function FuelView({ fuel, onSave, runs }) {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayISO();
   const [date, setDate] = useState(today);
   const [breakfast, setBreakfast] = useState("");
   const [lunch, setLunch] = useState("");
