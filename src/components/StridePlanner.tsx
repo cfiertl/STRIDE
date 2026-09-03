@@ -1716,7 +1716,12 @@ export default function App() {
   const openActivity = useCallback((id) => {
     setSelectedActivityId(id);
     setTab("activity");
-    window.history.pushState({ strideActivity: id }, "", "/?activity=" + id);
+    // Re-opening the activity we're already showing (tapping the same
+    // notification twice, say) shouldn't stack duplicate history entries —
+    // that would take two backs to escape one detail view.
+    if (window.location.search !== "?activity=" + id) {
+      window.history.pushState({ strideActivity: id }, "", "/?activity=" + id);
+    }
   }, []);
 
   // In-app back from a detail. If we pushed the entry ourselves, pop it so the
@@ -1793,42 +1798,104 @@ export default function App() {
     })();
   }, [refreshAll]);
 
-  // Refresh when the app comes back to the foreground — covers opening via a
-  // push notification (the SW focuses the existing window, so React never
-  // remounts on its own), plus returning from the app switcher or unlock.
-  useEffect(() => {
-    const onVisible = () => {
-      if (document.visibilityState === "visible") refreshAll();
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => document.removeEventListener("visibilitychange", onVisible);
-  }, [refreshAll]);
-
   // Live updates: subscribe to the user's own rows so changes made anywhere —
   // a run arriving via the Strava webhook, a link/score saved on another device
   // — refresh the UI without a manual reload. Realtime honours RLS, so we only
-  // receive our own rows. Focus-refresh above remains the fallback. See
+  // receive our own rows. Resume-refresh below remains the fallback. See
   // migration 014_realtime.sql (tables must be in the supabase_realtime pub).
-  useEffect(() => {
+  const channelRef = useRef(null);
+
+  const connectRealtime = useCallback(async () => {
     const supabase = sb();
-    let channel;
-    let cancelled = false;
-    (async () => {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user || cancelled) return;
-      // refreshAll now pulls completions too, so it alone is the refresh signal.
-      const bump = () => { refreshAll(); };
-      const sub = (table) => ({ event: "*", schema: "public", table, filter: `user_id=eq.${user.id}` });
-      channel = supabase
-        .channel("stride-live")
-        .on("postgres_changes", sub("activities"), bump)
-        .on("postgres_changes", sub("run_logs"), bump)
-        .on("postgres_changes", sub("session_completions"), bump)
-        .on("postgres_changes", sub("activity_streams"), bump)
-        .subscribe();
-    })();
-    return () => { cancelled = true; if (channel) supabase.removeChannel(channel); };
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return;
+    if (channelRef.current) {
+      supabase.removeChannel(channelRef.current);
+      channelRef.current = null;
+    }
+    // refreshAll now pulls completions too, so it alone is the refresh signal.
+    const bump = () => { refreshAll(); };
+    const sub = (table) => ({ event: "*", schema: "public", table, filter: `user_id=eq.${user.id}` });
+    // Unique channel name per connect: re-using one straight after removeChannel
+    // can collide with the old topic still tearing down, and the second
+    // subscribe then silently never joins.
+    channelRef.current = supabase
+      .channel(`stride-live-${Date.now()}`)
+      .on("postgres_changes", sub("activities"), bump)
+      .on("postgres_changes", sub("run_logs"), bump)
+      .on("postgres_changes", sub("session_completions"), bump)
+      .on("postgres_changes", sub("activity_streams"), bump)
+      .subscribe();
   }, [refreshAll]);
+
+  useEffect(() => {
+    connectRealtime();
+    return () => {
+      if (channelRef.current) {
+        sb().removeChannel(channelRef.current);
+        channelRef.current = null;
+      }
+    };
+  }, [connectRealtime]);
+
+  // Refresh when the app comes back to the foreground — covers opening via a
+  // push notification (the SW focuses the existing window, so React never
+  // remounts on its own), plus returning from the app switcher or unlock.
+  //
+  // visibilitychange on its own was not enough. Resuming an installed PWA on
+  // iOS frequently delivers focus/pageshow without ever flipping
+  // visibilityState back to "visible" — the listener never fired, so a run that
+  // arrived while the app was backgrounded stayed invisible until the app was
+  // force-closed and reopened. Listen for all three and de-dupe instead.
+  const lastResumeRef = useRef(0);
+  useEffect(() => {
+    const onResume = () => {
+      if (document.visibilityState === "hidden") return;
+      // The three events overlap on a single resume, and `focus` alone fires
+      // every time the window is clicked back into on desktop — coalesce so one
+      // return to the app costs one refetch, not five.
+      const now = Date.now();
+      if (now - lastResumeRef.current < 2500) return;
+      lastResumeRef.current = now;
+      refreshAll();
+      // The realtime websocket does not survive backgrounding on mobile, and a
+      // dead channel reports no error — it just stops delivering. Re-arm it on
+      // resume rather than trusting it to have recovered.
+      if (!channelRef.current || channelRef.current.state !== "joined") {
+        connectRealtime();
+      }
+    };
+    document.addEventListener("visibilitychange", onResume);
+    window.addEventListener("focus", onResume);
+    window.addEventListener("pageshow", onResume);
+    return () => {
+      document.removeEventListener("visibilitychange", onResume);
+      window.removeEventListener("focus", onResume);
+      window.removeEventListener("pageshow", onResume);
+    };
+  }, [refreshAll, connectRealtime]);
+
+  // Notification taps arrive here as a message from the service worker. The SW
+  // can't navigate an installed PWA's window on iOS, so instead of a page load
+  // we get the target and route in-app: pull fresh data, then open the run the
+  // notification was about.
+  useEffect(() => {
+    if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
+    const onMessage = (event) => {
+      const msg = event.data;
+      if (!msg || msg.type !== "stride:navigate") return;
+      refreshAll();
+      let id = msg.activity || null;
+      if (!id && msg.url) {
+        try {
+          id = new URL(msg.url, window.location.origin).searchParams.get("activity");
+        } catch { /* malformed url — just refresh */ }
+      }
+      if (id) openActivity(id);
+    };
+    navigator.serviceWorker.addEventListener("message", onMessage);
+    return () => navigator.serviceWorker.removeEventListener("message", onMessage);
+  }, [refreshAll, openActivity]);
 
   const zones = computeZones(profile);
 

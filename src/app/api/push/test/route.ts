@@ -15,10 +15,23 @@ export async function POST() {
   } = await supabase.auth.getUser();
   if (!user) return NextResponse.json({ error: "not signed in" }, { status: 401 });
 
+  // Point the test at the most recent activity so tapping it exercises the same
+  // deep-link path a real "new activity" push takes — otherwise this only ever
+  // proved delivery, and the tap-does-nothing bug stayed invisible from here.
+  const { data: latest } = await supabase
+    .from("activities")
+    .select("id")
+    .order("date", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
   const result = await sendPushToUser(user.id, {
     title: "STRIDE",
-    body: "Push notifications are working.",
-    url: "/",
+    body: latest
+      ? "Push is working. Tap to open your latest activity."
+      : "Push notifications are working.",
+    url: latest ? `/?activity=${latest.id}` : "/",
+    activity: latest?.id,
   });
 
   return NextResponse.json({ ok: true, ...result });

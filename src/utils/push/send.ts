@@ -18,6 +18,10 @@ export interface PushMessage {
   title: string;
   body: string;
   url?: string;
+  // Optional activity id carried alongside the url. The service worker forwards
+  // it to an already-open app window so it can route in-app, which is the only
+  // path that works on iOS where WindowClient.navigate() is a no-op.
+  activity?: string;
 }
 
 export interface SendResult {
@@ -72,6 +76,7 @@ export async function sendPushToUser(
     title: msg.title,
     body: msg.body,
     url: msg.url ?? "/",
+    activity: msg.activity ?? null,
   });
 
   const stale: string[] = [];

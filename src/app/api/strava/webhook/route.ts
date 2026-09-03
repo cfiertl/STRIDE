@@ -130,7 +130,12 @@ async function processActivityEvent(event: any) {
     const pushRes = await sendPushToUser(userId, {
       title: "STRIDE",
       body: "New activity available to view in STRIDE",
-      url: "/",
+      // Deep-link straight to the run that just landed. `activity` is the same
+      // id in a form the service worker can hand to the running app over
+      // postMessage, for the (common, on iOS) case where the PWA is already
+      // open and WindowClient.navigate() is unavailable.
+      url: `/?activity=${upserted.id}`,
+      activity: upserted.id,
     });
     console.log(
       `strava webhook: push for ${stravaId} subs=${pushRes.subscriptions} sent=${pushRes.sent} pruned=${pushRes.pruned} errors=${JSON.stringify(pushRes.errors)}`
