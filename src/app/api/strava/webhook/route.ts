@@ -4,6 +4,7 @@ import { createAdminClient } from "@/utils/supabase/admin";
 import { getStravaAccessToken } from "@/utils/strava/token";
 import { sendPushToUser } from "@/utils/push/send";
 import { captureSpotifyForActivity } from "@/utils/spotify/capture";
+import { computeRunMetrics } from "@/utils/metrics/run";
 import { waitUntil } from "@vercel/functions";
 
 // waitUntil keeps the function alive past the response, but it's still bounded by
@@ -152,6 +153,12 @@ async function processActivityEvent(event: any) {
       { activity_id: upserted.id, user_id: userId, streams, fetched_at: new Date().toISOString() },
       { onConflict: "activity_id" }
     );
+    // Derive the grade-aware figures now, while the streams are already in hand.
+    // Insights reads these columns instead of the blob (migration 015).
+    const metrics = computeRunMetrics(streams);
+    if (metrics.gap_pace_s != null) {
+      await admin.from("activities").update(metrics).eq("id", upserted.id);
+    }
   }
 
   if (firstSeen) {

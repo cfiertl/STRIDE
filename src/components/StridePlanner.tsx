@@ -940,6 +940,11 @@ function rowsToRun(activity, log) {
     pain: (log && log.pain) || [],
     notes: (log && log.notes) || "",
     avgHr: activity.avg_hr ?? null,
+    // Grade-aware figures precomputed at sync time (migration 015). Null until
+    // the metrics backfill has reached this run, so every reader guards.
+    gapPace: activity.gap_pace_s != null ? Number(activity.gap_pace_s) : null,
+    warmupGapPace: activity.warmup_gap_pace_s != null ? Number(activity.warmup_gap_pace_s) : null,
+    warmupClimb: activity.warmup_climb_m != null ? Number(activity.warmup_climb_m) : null,
   };
 }
 
@@ -2347,7 +2352,9 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness, onReschedule, 
 
       {last && (
         <section className="card">
-          <div className="card-head"><h3>Last run</h3><span className="muted">{relDate(last.date)}</span></div>
+          {/* "Last activity", not "Last run" — this card shows the most recent
+              thing you did, which is often a walk or a gym session. */}
+          <div className="card-head"><h3>Last activity</h3><span className="muted">{relDate(last.date)}</span></div>
           <div className="hero-row quad">
             <Stat label="Type" value={ZONE_META[last.type] ? ZONE_META[last.type].name.split(" ")[0] : last.type} />
             <Stat label="Distance" value={`${last.distance}km`} />
@@ -2933,6 +2940,7 @@ function ActivityDetail({ activityId, onBack, profile, onScored, onDelete }) {
   const [streams, setStreams] = useState(null);
   const [completion, setCompletion] = useState(null);
   const [plays, setPlays] = useState([]);
+  const [allCompletions, setAllCompletions] = useState([]);
   const [focusT, setFocusT] = useState(null); // chart time pinned from the setlist
   const [reloadTick, setReloadTick] = useState(0);
   const chartRef = useRef(null);
@@ -2941,10 +2949,15 @@ function ActivityDetail({ activityId, onBack, profile, onScored, onDelete }) {
     let alive = true;
     setLoading(true);
     setFocusT(null);
-    Promise.all([loadActivityDetail(activityId), loadActivityStreams(activityId), loadCompletion(activityId), loadActivitySpotify(activityId)])
-      .then(([d, s, c, p]) => {
+    // allCompletions is the whole user's plan↔run links, not just this run's —
+    // the session picker needs it to know which planned sessions other runs
+    // have already claimed. It's three small columns, so pulling the lot is
+    // cheaper than a per-week query.
+    Promise.all([loadActivityDetail(activityId), loadActivityStreams(activityId), loadCompletion(activityId), loadActivitySpotify(activityId), loadCompletions()])
+      .then(([d, s, c, p, all]) => {
         if (alive) {
-          setData(d); setStreams(s); setCompletion(c); setPlays(p || []); setLoading(false);
+          setData(d); setStreams(s); setCompletion(c); setPlays(p || []);
+          setAllCompletions(all || []); setLoading(false);
         }
       });
     return () => { alive = false; };
@@ -3082,7 +3095,7 @@ function ActivityDetail({ activityId, onBack, profile, onScored, onDelete }) {
       )}
 
       <PaceInsights pace={pace} laps={laps} completion={completion} profile={profile} />
-      <LinkSession activity={a} log={log} completion={completion} profile={profile} onSaved={() => setReloadTick((t) => t + 1)} />
+      <LinkSession activity={a} log={log} completion={completion} allCompletions={allCompletions} profile={profile} onSaved={() => setReloadTick((t) => t + 1)} />
       <ScoreCard activity={a} log={log} onSaved={() => { setReloadTick((t) => t + 1); onScored?.(); }} />
 
       {onDelete && (
@@ -3516,7 +3529,7 @@ function PaceInsights({ pace, laps, completion, profile }) {
   );
 }
 
-function LinkSession({ activity, log, completion, profile, onSaved }) {
+function LinkSession({ activity, log, completion, allCompletions, profile, onSaved }) {
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
 
@@ -3568,6 +3581,17 @@ function LinkSession({ activity, log, completion, profile, onSaved }) {
   const suggestedIdx = completion ? -1 : suggestSessionIdx(wk.sessions, activity);
   const suggested = suggestedIdx >= 0 ? wk.sessions[suggestedIdx] : null;
 
+  // Sessions in this week another run has already claimed. Offering them again
+  // is noise — one planned session is one run — so the picker only lists what's
+  // actually free, plus whichever one this run currently holds (so "Change"
+  // still shows you where you are).
+  const takenDays = new Set(
+    (allCompletions || [])
+      .filter((c) => c.planned_week === wk.week && c.activity_id !== activity.id)
+      .map((c) => c.planned_day)
+  );
+  const openSessions = wk.sessions.filter((s) => !takenDays.has(s.day));
+
   if (!editing) {
     const t = log && log.run_type;
     const typeName = t ? (ZONE_META[t] ? ZONE_META[t].name.split(" ")[0] : cap(t)) : "—";
@@ -3599,21 +3623,25 @@ function LinkSession({ activity, log, completion, profile, onSaved }) {
         <button className="btn-ghost" onClick={() => setEditing(false)}>Cancel</button>
       </div>
       <p className="muted small">Week {wk.week} · {wk.label} — tap the planned session this run was.</p>
-      <div className="sessions">
-        {wk.sessions.map((s, i) => {
-          const d = sessionDescription(s, null);
-          const on = completion && completion.planned_week === wk.week && completion.planned_day === s.day;
-          const sug = !on && i === suggestedIdx;
-          return (
-            <button key={i} className={`session pick ${on ? "on" : ""} ${sug ? "sug" : ""}`} onClick={() => link(s)} disabled={saving}>
-              <div className="session-day">{s.day}</div>
-              <div className="session-body"><div className="session-title">{d.title}</div></div>
-              {sug && <Pill tone="accent">likely</Pill>}
-              {s.quality && <Pill tone="hard">quality</Pill>}
-            </button>
-          );
-        })}
-      </div>
+      {openSessions.length === 0 ? (
+        <p className="muted small">Every session this week is already linked to another run. Unlink one of those first if this run should take its place.</p>
+      ) : (
+        <div className="sessions">
+          {openSessions.map((s) => {
+            const d = sessionDescription(s, null);
+            const on = completion && completion.planned_week === wk.week && completion.planned_day === s.day;
+            const sug = !on && suggested && s.day === suggested.day;
+            return (
+              <button key={s.day} className={`session pick ${on ? "on" : ""} ${sug ? "sug" : ""}`} onClick={() => link(s)} disabled={saving}>
+                <div className="session-day">{s.day}</div>
+                <div className="session-body"><div className="session-title">{d.title}</div></div>
+                {sug && <Pill tone="accent">likely</Pill>}
+                {s.quality && <Pill tone="hard">quality</Pill>}
+              </button>
+            );
+          })}
+        </div>
+      )}
       {completion && (
         <button className="btn-ghost wide" onClick={unlink} disabled={saving} style={{ marginTop: 10 }}>Unlink this run</button>
       )}
@@ -3798,6 +3826,10 @@ function SyncButton({ onDone }) {
       if (!last.ok) throw new Error(last.error || `${label} failed`);
       setStatus(`${label}… ${last.remaining ?? 0} left`);
       if (last.stoppedForRateLimit) return { ...last, rateLimited: true };
+      // A step that made no progress won't make any on the next pass either —
+      // some rows simply can't be processed (no GPS on a treadmill run, say),
+      // and they keep matching the pending filter. Stop rather than spin.
+      if (last.stalled) return last;
       if ((last.remaining ?? 0) === 0) return last;
     }
     return last;
@@ -3813,6 +3845,11 @@ function SyncButton({ onDone }) {
       const en = await loop("/api/strava/enrich", "Details");
       setStatus("Fetching streams…");
       const st = await loop("/api/strava/streams", "Streams");
+      // Derived pace/climb figures, worked out from the streams we just stored.
+      // No Strava calls, so this can't be rate-limited — it just needs the
+      // streams step ahead of it.
+      setStatus("Crunching run metrics…");
+      await loop("/api/strava/metrics", "Metrics");
       await onDone();
       setStatus(
         en.rateLimited || st.rateLimited
@@ -4049,6 +4086,86 @@ function Insights({ runs, fuel, zones, profile }) {
       hr: hrs.length ? Math.round(hrs.reduce((a, b) => a + b, 0) / hrs.length) : null,
     };
   };
+  // ---- the long view -------------------------------------------------------
+  // `runs` is really every activity — walks, swims and gym sessions included.
+  // That's tolerable for the short-window cards but not here: a walk is slow at
+  // a low heart rate, which is exactly the shape of a great easy run, and a
+  // handful of them would flatten the fitness curve into meaninglessness. A run
+  // is either a logged plan type or a Strava sport type with "run" in it
+  // (Run, TrailRun, VirtualRun).
+  const isRun = (r) => { const t = String(r.type || ""); return RUN_TYPES.includes(t) || /run/i.test(t); };
+  const onlyRuns = runs.filter(isRun);
+
+  // Everything above this looks at 28–56 days, which is the right window for
+  // "how is this block going" and the wrong one for "am I actually getting
+  // fitter". These two run over 12 months.
+
+  // Aerobic fitness, month by month: pace at a fixed heart rate. Comparing raw
+  // easy pace across months is confounded by how hard each month's easy runs
+  // happened to be, so convert every run to metres-per-minute per beat and read
+  // it back out at one reference HR — 5 bpm under the aerobic threshold, which
+  // is squarely "easy" and where most easy runs already sit.
+  const refHr = lt1 ? lt1 - 5 : null;
+  const monthKey = (d) => { const x = new Date(d); return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, "0")}`; };
+  const monthLabel = (k) => MONTHS[Number(k.slice(5)) - 1];
+  const lastMonths = (n) => {
+    const out = [], now = new Date();
+    for (let i = n - 1; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      out.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`);
+    }
+    return out;
+  };
+  const months12 = lastMonths(12);
+
+  // One easy run is a data point, not a month. Plotting singletons let a lone
+  // good day become "your best month" and anchor a claim the data can't carry.
+  const MIN_MONTH_RUNS = 2;
+  const fitCurve = refHr
+    ? months12.map((k) => {
+        const rs = onlyRuns.filter((r) => monthKey(r.date) === k && r.avgHr && r.avgHr < lt1 && paceOf(r) > 0);
+        if (rs.length < MIN_MONTH_RUNS) return { k, label: monthLabel(k), pace: null, n: rs.length };
+        // efficiency: metres covered per minute, per beat
+        const ef = rs.reduce((a, r) => a + ((1000 / paceOf(r)) * 60) / r.avgHr, 0) / rs.length;
+        return { k, label: monthLabel(k), pace: Math.round(1000 / ((ef * refHr) / 60)), n: rs.length };
+      })
+    : [];
+  const fitCurvePts = fitCurve.filter((m) => m.pace);
+  const curveReady = fitCurvePts.length >= 4;
+  const curveBest = curveReady ? fitCurvePts.reduce((a, b) => (b.pace < a.pace ? b : a)) : null;
+  const curveNow = curveReady ? fitCurvePts[fitCurvePts.length - 1] : null;
+
+  // Consistency: monthly distance across the same year, and the breaks in it.
+  const monthKm = months12.map((k) => ({
+    k,
+    label: monthLabel(k),
+    km: onlyRuns.filter((r) => monthKey(r.date) === k).reduce((a, r) => a + (parseFloat(r.distance) || 0), 0),
+  }));
+  const monthKmMax = Math.max(1, ...monthKm.map((m) => m.km));
+  const yearRuns = onlyRuns
+    .filter((r) => ageDays(r.date) < 365 && r.date)
+    .map((r) => r.date)
+    .sort();
+  const gaps = [];
+  for (let i = 1; i < yearRuns.length; i++) {
+    const days = Math.round((new Date(yearRuns[i]) - new Date(yearRuns[i - 1])) / 864e5);
+    if (days >= 14) gaps.push({ from: yearRuns[i - 1], to: yearRuns[i], days });
+  }
+  const daysLost = gaps.reduce((a, g) => a + g.days, 0);
+  const longestGap = gaps.length ? Math.max(...gaps.map((g) => g.days)) : 0;
+
+  // Warm-up load: what the first 10 minutes actually cost, from the precomputed
+  // grade-adjusted columns. Recent runs only — route habits change.
+  const warmRuns = onlyRuns.filter((r) => ageDays(r.date) < 120 && r.warmupGapPace && r.gapPace).slice(0, 12);
+  const warmReadyMetrics = warmRuns.length >= 4;
+  const warmAvgOpen = warmReadyMetrics ? warmRuns.reduce((a, r) => a + r.warmupGapPace, 0) / warmRuns.length : null;
+  const warmAvgRun = warmReadyMetrics ? warmRuns.reduce((a, r) => a + r.gapPace, 0) / warmRuns.length : null;
+  const warmClimbRuns = warmRuns.filter((r) => r.warmupClimb != null);
+  const warmAvgClimb = warmClimbRuns.length ? warmClimbRuns.reduce((a, r) => a + r.warmupClimb, 0) / warmClimbRuns.length : null;
+  // Positive = the opening ten minutes were run harder than the run's average.
+  const warmOverEffort = warmReadyMetrics ? Math.round(warmAvgRun - warmAvgOpen) : 0;
+  const warmHotStarts = warmRuns.filter((r) => r.gapPace - r.warmupGapPace >= 15).length;
+
   const fitNow = easyWindow(0, 28), fitPrev = easyWindow(28, 56);
   const fitnessReady = fitNow.n >= 3 && fitPrev.n >= 3 && fitNow.pace && fitPrev.pace;
   const fitnessDelta = fitnessReady ? fitPrev.pace - fitNow.pace : 0; // +ve = faster now
@@ -4080,7 +4197,16 @@ function Insights({ runs, fuel, zones, profile }) {
   runs.forEach((r) => (r.pain || []).forEach((p) => (painTally[p] = (painTally[p] || 0) + 1)));
   const topPain = Object.entries(painTally).sort((a, b) => b[1] - a[1]);
 
-  const showWarm = avg(warmedScores) && avg(coldScores);
+  // Don't draw a conclusion off a handful of runs. Four warmed-up runs against
+  // eleven cold ones is not a comparison — one bad day moves the average by a
+  // full point — and showing it in green/red made the app assert something its
+  // own data didn't support. Needs a real sample on both sides first.
+  const WARM_MIN = 5;
+  const warmReady = warmedScores.length >= WARM_MIN && coldScores.length >= WARM_MIN;
+  const warmDelta = warmReady ? Number(avg(warmedScores)) - Number(avg(coldScores)) : 0;
+  // Half a point either way is inside the noise of a 1–10 self-rating.
+  const warmMeaningful = warmReady && Math.abs(warmDelta) >= 0.5;
+  const showWarm = warmedScores.length > 0 && coldScores.length > 0;
   const showHot = lt1 && easyPaced.length >= 3 && hotEasy.length > 0;
   const feelAny = showWarm || topWrong.length > 0 || showHot || topPain.length > 0;
 
@@ -4141,9 +4267,101 @@ function Insights({ runs, fuel, zones, profile }) {
         </section>
       )}
 
+      {curveReady && (
+        <section className="card insight">
+          <h3>Aerobic fitness, 12 months</h3>
+          <p className="muted small" style={{ marginTop: -4 }}>
+            Your easy pace at a steady {refHr} bpm, month by month. Same effort every month, so a
+            falling line is real fitness rather than a harder run.
+          </p>
+          <div className="curve-chart">
+            <ResponsiveContainer>
+              <ComposedChart data={fitCurve} margin={{ top: 8, right: 6, bottom: 0, left: 6 }}>
+                <CartesianGrid stroke="var(--line)" vertical={false} />
+                <XAxis dataKey="label" tick={{ fill: "var(--muted)", fontSize: 11 }} stroke="var(--line)" interval={0} />
+                {/* reversed: faster (a smaller number of seconds) reads as higher */}
+                <YAxis reversed domain={["dataMin - 15", "dataMax + 15"]} hide />
+                <Tooltip
+                  cursor={{ stroke: "var(--line)" }}
+                  contentStyle={{ background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 10, fontSize: 12 }}
+                  formatter={(v, _n, p) => [`${fmtPace(v)} · ${p.payload.n} run${p.payload.n === 1 ? "" : "s"}`, `at ${refHr} bpm`]}
+                />
+                <Area dataKey="pace" stroke="none" fill="var(--accent)" fillOpacity={0.12} isAnimationActive={false} connectNulls />
+                <Line dataKey="pace" stroke="var(--accent)" strokeWidth={2} dot={{ r: 3, fill: "var(--accent)", stroke: "none" }} isAnimationActive={false} connectNulls />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
+          <p className="muted small">
+            {curveNow.label} sits at <strong className="mono">{fmtPace(curveNow.pace)}</strong> ({curveNow.n} runs).
+            Your best month in this window was <strong className="mono">{fmtPace(curveBest.pace)}</strong> in{" "}
+            {curveBest.label} ({curveBest.n} runs).
+            {curveNow.pace - curveBest.pace >= 15
+              ? ` You've been ${Math.round(curveNow.pace - curveBest.pace)}s/km faster at this effort than you are now — that's fitness you've had and lost, not a ceiling you've hit.`
+              : " You're at or near your best in this window."}
+          </p>
+        </section>
+      )}
+
+      {gaps.length > 0 || monthKm.some((m) => m.km > 0) ? (
+        <section className="card insight">
+          <h3>Consistency, 12 months</h3>
+          <div className="vol-chart">
+            {monthKm.map((m) => (
+              <div key={m.k} className="vol-col" title={`${m.label}: ${m.km.toFixed(1)}km`}>
+                <div
+                  className="vol-bar"
+                  style={{ height: `${Math.max(2, Math.round((m.km / monthKmMax) * 100))}%`, ...(m.km === 0 ? { background: "var(--coral)", opacity: 0.35 } : {}) }}
+                />
+              </div>
+            ))}
+          </div>
+          <div className="vol-axis muted small">
+            <span>{monthKm[0].label}</span>
+            <span>{monthKm[monthKm.length - 1].label}</span>
+          </div>
+          {gaps.length > 0 ? (
+            <p className="muted small">
+              {gaps.length} break{gaps.length === 1 ? "" : "s"} of two weeks or more this year, the
+              longest <strong>{longestGap} days</strong>, adding up to <strong>{daysLost} days</strong>{" "}
+              between runs. Aerobic gains start unwinding inside a fortnight, so these are where the
+              fitness above goes.
+            </p>
+          ) : (
+            <p className="muted small">No break longer than two weeks this year. That consistency is doing more for you than any single session.</p>
+          )}
+        </section>
+      ) : null}
+
+      {warmReadyMetrics && (
+        <section className="card insight">
+          <h3>How you start</h3>
+          <p className="muted small" style={{ marginTop: -4 }}>
+            Your last {warmRuns.length} runs, comparing the first 10 minutes against the whole run.
+            Both are grade-adjusted, so a hill counts as the effort it actually was rather than the
+            pace it showed.
+          </p>
+          <div className="hero-row quad">
+            <Stat label="First 10 min" value={fmtPaceBare(warmAvgOpen)} accent />
+            <Stat label="Whole run" value={fmtPaceBare(warmAvgRun)} />
+            {warmAvgClimb != null && <Stat label="Early climb" value={`${Math.round(warmAvgClimb)}m`} />}
+            <Stat label="Hot starts" value={`${warmHotStarts}/${warmRuns.length}`} />
+          </div>
+          <p className="muted small">
+            {warmOverEffort >= 15
+              ? `You open about ${warmOverEffort}s/km harder than you run the rest, on ${warmHotStarts} of your last ${warmRuns.length}. Your heart rate needs four to five minutes to catch up with your legs, so the opening effort is the one that feels worst — and it's usually a hill in the first kilometre rather than a decision to run fast.`
+              : warmOverEffort <= -15
+                ? `You ease into it — the first 10 minutes run about ${Math.abs(warmOverEffort)}s/km softer than the rest. That's the right shape.`
+                : "Your opening ten minutes sit close to the run's overall effort, which is what you want."}
+            {warmAvgClimb != null && warmAvgClimb >= 10
+              ? ` You're also climbing about ${Math.round(warmAvgClimb)}m inside those first 10 minutes — if the breathing feels worst early, that's the likeliest reason. Running the loop the other way round would move it to the back half.`
+              : ""}
+          </p>
+        </section>
+      )}
+
       {fitnessReady && (
         <section className="card insight">
-          <h3>Aerobic fitness</h3>
+          <h3>Aerobic fitness, last 8 weeks</h3>
           <p>
             Your easy-run pace over the last 4 weeks averaged <strong className="mono">{fmtPace(fitNow.pace)}</strong>{fitNow.hr ? ` at ~${fitNow.hr} bpm` : ""}, vs <strong className="mono">{fmtPace(fitPrev.pace)}</strong> the 4 weeks before.
             {Math.abs(fitnessDelta) < 3
@@ -4161,11 +4379,22 @@ function Insights({ runs, fuel, zones, profile }) {
         <section className="card insight">
           <h3>Warm-up effect</h3>
           <p>
-            Runs where you warmed up score <strong style={{ color: "var(--positive)" }}>{avg(warmedScores)}/10</strong> on
-            average, vs <strong style={{ color: "var(--coral)" }}>{avg(coldScores)}/10</strong> when you didn't.
-            {Number(avg(warmedScores)) > Number(avg(coldScores)) + 0.5
-              ? " That gap is your 4–5km problem in numbers — warming up first is the cheapest win you have."
-              : " Keep logging — the picture will sharpen."}
+            Runs where you warmed up score{" "}
+            <strong style={warmMeaningful ? { color: warmDelta > 0 ? "var(--positive)" : "var(--coral)" } : undefined}>
+              {avg(warmedScores)}/10
+            </strong>{" "}
+            on average ({warmedScores.length} {warmedScores.length === 1 ? "run" : "runs"}), vs{" "}
+            <strong style={warmMeaningful ? { color: warmDelta > 0 ? "var(--coral)" : "var(--positive)" } : undefined}>
+              {avg(coldScores)}/10
+            </strong>{" "}
+            when you didn't ({coldScores.length}).
+            {!warmReady
+              ? ` Too few either way to read anything into yet — ${WARM_MIN} of each is where this starts meaning something.`
+              : !warmMeaningful
+                ? " No real difference so far."
+                : warmDelta > 0
+                  ? " Warming up first is the cheapest win you have."
+                  : " Your warmed-up runs are scoring lower, which usually means you're saving the warm-up for the sessions you already expect to be hard."}
           </p>
         </section>
       )}
@@ -4966,8 +5195,12 @@ function StyleBlock() {
       .form-grid { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; }
       .field { display:flex; flex-direction:column; gap:6px; font-size:12px; color:var(--muted); font-weight:600; margin-bottom:10px; min-width:0; }
       .field span { text-transform:uppercase; letter-spacing:0.05em; font-size:11px; }
+      /* 16px is not a taste call — it's the fix for the zoom bug. iOS Safari
+         zooms the viewport in whenever you focus a form field smaller than 16px,
+         and it never zooms back out on blur. That's why saving notes or a pain
+         map left the whole app slightly enlarged until you pinched it back. */
       input, select, textarea { background:var(--bg); border:1px solid var(--line); color:var(--ink);
-        border-radius:10px; padding:11px; font-family:inherit; font-size:14px; width:100%; min-width:0; max-width:100%; }
+        border-radius:10px; padding:11px; font-family:inherit; font-size:16px; width:100%; min-width:0; max-width:100%; }
       /* Safari gives date inputs a fixed intrinsic width that ignores width:100%
          unless the native appearance is off. */
       input[type="date"] { -webkit-appearance:none; appearance:none; }
@@ -5035,6 +5268,10 @@ function StyleBlock() {
       .bar-fill { height:100%; background:var(--accent); border-radius:999px; }
       .bar-n { font-family:var(--font-mono),monospace; font-size:12px; color:var(--muted); width:20px; text-align:right; }
 
+      /* ResponsiveContainer measures its parent, so the height has to live here
+         rather than on the chart. */
+      .curve-chart { height:150px; margin:10px 0 6px; }
+      .curve-chart .recharts-cartesian-axis-tick text { font-variant-numeric:tabular-nums; }
       .vol-chart { display:flex; align-items:flex-end; gap:6px; height:96px; margin-bottom:6px; }
       .vol-col { flex:1; display:flex; align-items:flex-end; height:100%; }
       .vol-bar { width:100%; background:var(--accent); border-radius:6px 6px 0 0; min-height:2px; }

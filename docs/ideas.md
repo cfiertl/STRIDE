@@ -237,3 +237,33 @@ is a Shortcuts personal automation that reads samples on the phone and POSTs the
 to us. That unlocks resting HR, HRV, sleep and wrist temperature — plus the thing
 no wearable app can do, which is joining a morning’s readings to the session
 score we already log in `run_logs.score`.
+
+---
+
+## Store the Strava activity name
+
+**Status:** Parked, deliberately. Today's card now reads "Last activity" instead
+of "Last run" — enough to stop it calling a walk a run. The nicer version shows
+the activity's actual name.
+
+Strava puts a `name` on every activity ("Afternoon Run", "Morning Walk", and
+anything you've renamed by hand). We don't store it, so the app can only ever
+describe an activity by its type. Showing the real name would make the Today
+card, the Activities list and the detail header all read like the thing you
+actually did.
+
+**The work:** a `name text` column on `activities`; `d.name` in the webhook's row
+map (`src/app/api/strava/webhook/route.ts`) and `a.name` in `mapActivity`
+(`src/app/api/strava/backfill/route.ts`); then a backfill pass over the existing
+~208 rows, since a new column arrives empty. Backfill is the only part with any
+weight — it re-walks the Strava list endpoint under the 15-minute rate limit,
+the same loop the Sync button already drives.
+
+**Display rule when it lands:** the name is the heading, with "Last activity" as
+the fallback for a manual entry or a null. Don't drop the type/distance/pace
+stats — a Strava name tells you *which* run, not how it went.
+
+**Why parked:** the rename fixed the actual complaint (a walk being labelled a
+run) for one line and no migration. The name is a nice-to-have on top, worth
+bundling with the next change that already touches the activities schema rather
+than spending a migration and a backfill on its own.
