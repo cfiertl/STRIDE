@@ -75,6 +75,13 @@ function thresholdPace(benchDistKm, benchTimeSec) {
 }
 
 // training zones as ranges off threshold pace (sec/km). Returns [slow, fast].
+//
+// The interval band is deliberately narrower than the others. A 16s-wide VO2
+// band spans two different sessions: run its slow edge and you get threshold
+// (HR settles ~LT2 and stops), run its fast edge and you get the VO2 response
+// the session exists for. A rep can't self-correct the way a 20-minute tempo
+// can, so the band has to be tight enough that its slow wall is still a
+// stimulus. Widths elsewhere are fine — a tempo run has time to find its level.
 function zonesFromThreshold(thr) {
   if (!thr) return null;
   return {
@@ -82,8 +89,13 @@ function zonesFromThreshold(thr) {
     long: [thr * 1.28, thr * 1.20],
     marathon: [thr * 1.13, thr * 1.08],
     tempo: [thr * 1.02, thr * 0.99],
-    interval: [thr * 0.94, thr * 0.90],
+    interval: [thr * 0.92, thr * 0.89],
     reps: [thr * 0.90, thr * 0.86],
+    // A recovery jog is one notch slower than easy — not a shuffle. Left
+    // unprescribed it gets run 90s/km slower than easy, which drops HR ~15bpm
+    // between reps and starts every rep from scratch. The band needs a slow
+    // bound as much as a fast one.
+    recovery: [thr * 1.36, thr * 1.26],
   };
 }
 
@@ -96,11 +108,57 @@ function computeZones(profile) {
   let z = hasBench ? zonesFromThreshold(thresholdPace(profile.benchDistKm, profile.benchTimeSec)) : null;
   if (profile.easyPaceSec) {
     const e = profile.easyPaceSec;
-    if (!z) z = { easy: null, long: null, marathon: null, tempo: null, interval: null, reps: null };
+    if (!z) z = { easy: null, long: null, marathon: null, tempo: null, interval: null, reps: null, recovery: null };
     z.easy = [e * 1.04, e * 0.97];
     z.long = [e * 1.03, e * 0.95];
+    // Anchored to easy rather than threshold for the same reason easy is: the
+    // runner's own conversational pace is the honest reference point.
+    z.recovery = [e * 1.08, e * 1.00];
   }
+  // Snap here rather than at each call site so there is exactly one band in the
+  // app: what's displayed, what durations are estimated from, what the watch
+  // card quotes and what staleWatchTargets compares are all the same numbers.
+  // A band that only exists to be rounded later is a second source of truth.
+  if (z) for (const k of Object.keys(z)) z[k] = snapBand(z[k], k);
   return z;
+}
+
+/* ---------- watch-grid pace snapping ---------- */
+
+// Watch workout builders quote pace alerts on a 10-second grid — Apple's won't
+// take 6:08. Quoting a pace no watch can be set to means the runner rounds it
+// themselves at 6am, and the rounding goes wherever the keypad is quickest.
+// That is not a hypothetical: a 6:08–6:24 interval band entered as 6:10–6:30
+// moved the slow wall 6s the wrong way, and the session was then run against
+// that wall for all five reps.
+//
+// So STRIDE quotes the grid directly. One number, already buildable.
+const WATCH_PACE_STEP_S = 10;
+
+// Which way a band rounds depends on how the session fails.
+//
+// Easy, long and marathon fail by being run too fast — the whole point of the
+// easy band is a ceiling, so both edges round slower. Tempo, interval, reps and
+// recovery fail by being run too slow: a rep off the back of its band is not a
+// gentler version of the session, it's a different session, and a recovery jog
+// that drifts to a shuffle stops holding HR up between reps. Those round faster.
+//
+// Either way the error lands on the side that still serves the session's intent.
+const PACE_ROUND_SLOWER = new Set(["easy", "long", "marathon"]);
+
+// Snap one pace (sec/km) to the grid, `slower` pushing to the larger number.
+function snapPaceSec(sec, slower) {
+  if (!sec || !isFinite(sec) || sec <= 0) return sec;
+  const f = slower ? Math.ceil : Math.floor;
+  return f(sec / WATCH_PACE_STEP_S) * WATCH_PACE_STEP_S;
+}
+
+// Snap a whole [slow, fast] band. Both edges move the same way, so the band
+// keeps its width and never straddles the grid in two directions at once.
+function snapBand(band, zoneKey) {
+  if (!band) return band;
+  const slower = PACE_ROUND_SLOWER.has(zoneKey);
+  return [snapPaceSec(band[0], slower), snapPaceSec(band[1], slower)];
 }
 
 // `effort` is the feel-based anchor for the zone. GPS pace is too noisy to chase
@@ -113,6 +171,7 @@ const ZONE_META = {
   tempo: { name: "Tempo / Threshold", effort: "~1hr race effort", note: "Comfortably hard. ~1hr race effort. Builds your lactate ceiling." },
   interval: { name: "Interval / VO2", effort: "3k–5k effort", note: "Hard. 3–5min reps. Lifts top-end aerobic power." },
   reps: { name: "Reps / Strides", effort: "fast & relaxed", note: "Fast & short. Form, economy, leg speed. Stay relaxed." },
+  recovery: { name: "Recovery jog", effort: "jog, not shuffle", note: "Between reps. Slower than easy, but still running — slow enough and your HR resets, and the next rep starts from scratch." },
 };
 
 /* ---------- plan generation ---------- */
@@ -231,8 +290,19 @@ function generatePlan(profile) {
   const taper = profile.goalMode === "fitness" ? 0 : (goalDistanceKm >= 30 ? 3 : goalDistanceKm >= 15 ? 2 : 1);
   const buildWeeks = Math.max(2, totalWeeks - taper);
 
-  // peak weekly volume: progress ~ from current, 10%/wk, cutback every 4th
+  // peak weekly volume: progress ~ from current, 10%/wk, cutback every 4th.
+  //
+  // The build line and the prescribed week are two different numbers, and
+  // conflating them flattens the whole plan. A cutback is one easier week, not
+  // a permanent step down — but multiplying the running total by 0.75 rebased
+  // the progression, and since 1.10³ × 0.75 = 0.998, every four-week cycle
+  // netted out at zero. A 15-week plan off 5km/wk peaked at 6km/wk.
+  //
+  // So `trend` carries the progression and only advances on building weeks;
+  // the cutback week quotes 75% of it and leaves it alone, so the next block
+  // resumes from where the last one actually got to.
   const weeks = [];
+  let trend = currentWeeklyKm;
   let vol = currentWeeklyKm;
   for (let w = 0; w < totalWeeks; w++) {
     const isTaper = w >= buildWeeks;
@@ -241,9 +311,10 @@ function generatePlan(profile) {
       const t = w - buildWeeks; // 0..taper-1
       vol = currentWeeklyKm + (peakVol(currentWeeklyKm, buildWeeks) - currentWeeklyKm) * (1 - (t + 1) / (taper + 1));
     } else if (cutback) {
-      vol = vol * 0.75;
-    } else if (w > 0) {
-      vol = vol * 1.10;
+      vol = trend * 0.75;
+    } else {
+      if (w > 0) trend = trend * 1.10;
+      vol = trend;
     }
     const weekVol = Math.round(vol);
     const weekStart = addDays(firstMonday, w * 7);
@@ -272,11 +343,14 @@ function resolveSchedule(profile, days) {
 }
 
 function peakVol(start, buildWeeks) {
-  // approximate peak after compounding ~10%/wk with periodic cutbacks
+  // The peak the build reaches — must mirror generatePlan's trend exactly, or
+  // the taper interpolates down from a volume the plan never prescribed.
+  // Cutback weeks are dips off the trend, so they don't advance it and don't
+  // set the peak either.
   let v = start;
   for (let i = 1; i < buildWeeks; i++) {
-    if ((i + 1) % 4 === 0) v *= 0.75;
-    else v *= 1.1;
+    if ((i + 1) % 4 === 0) continue; // cutback week: dips, doesn't rebase
+    v *= 1.1;
   }
   return v;
 }
@@ -389,11 +463,17 @@ function sessionSteps(s) {
   if (s.type === "interval") {
     return [
       { kind: "warmup", label: "Easy warm-up with strides", sec: 15 * 60, zone: "easy" },
+      // 4×4:00, not 5×3:00. HR needs 60–90s to catch up to a change in effort,
+      // so a 3:00 rep started from a recovery-jog heart rate spends half its
+      // length climbing and ends before it arrives — five of those plateau well
+      // under threshold no matter how honestly they're run. A 4:00 rep pays the
+      // same ramp once and then spends the remainder at the intensity the
+      // session is for. Same total work, far more of it on target.
       {
         kind: "reps",
-        reps: 5,
-        work: { label: "Hard", sec: 3 * 60, zone: "interval" },
-        rest: { label: "Jog", sec: 90, zone: "easy" },
+        reps: 4,
+        work: { label: "Hard", sec: 4 * 60, zone: "interval" },
+        rest: { label: "Jog", sec: 2 * 60, zone: "recovery" },
       },
       { kind: "cooldown", label: "Easy cool-down", sec: 10 * 60, zone: "easy" },
     ];
@@ -843,6 +923,8 @@ function rowToProfile(row) {
     lt2Hr: row.lt2_hr ?? null,
     lt2SourceActivity: row.lt2_source_activity ?? null,
     hrTestedAt: row.hr_tested_at ?? null,
+    maxHr: row.max_hr ?? null,
+    restingHr: row.resting_hr ?? null,
   };
 }
 // app profile object -> DB row. Drops derived goalLabel; "" race date -> null.
@@ -868,6 +950,8 @@ function profileToRow(p, userId) {
     lt2_hr: p.lt2Hr ?? null,
     lt2_source_activity: p.lt2SourceActivity ?? null,
     hr_tested_at: p.hrTestedAt ?? null,
+    max_hr: p.maxHr ?? null,
+    resting_hr: p.restingHr ?? null,
   };
 }
 
@@ -949,6 +1033,7 @@ function rowsToRun(activity, log) {
     pain: (log && log.pain) || [],
     notes: (log && log.notes) || "",
     avgHr: activity.avg_hr ?? null,
+    maxHr: activity.max_hr ?? null,
     // Grade-aware figures precomputed at sync time (migration 015). Null until
     // the metrics backfill has reached this run, so every reader guards.
     gapPace: activity.gap_pace_s != null ? Number(activity.gap_pace_s) : null,
@@ -1553,7 +1638,11 @@ function WatchSetup({ session, zones, built, onBuilt, profile }) {
   sessionSteps(session).forEach((st) => {
     if (st.kind === "reps") {
       blocks.push({ name: "Work", sec: st.work.sec, target: stepPace(st.work, zones, "hard"), reps: st.reps });
-      blocks.push({ name: "Recovery", sec: st.rest.sec, target: "", reps: st.reps });
+      // The recovery block used to be quoted with no target at all. It has a
+      // band in the model and always did — leaving it blank is what let it get
+      // run at 90s/km slower than intended, which is how HR ends up resetting
+      // between every rep.
+      blocks.push({ name: "Recovery", sec: st.rest.sec, target: stepPace(st.rest, zones, ""), reps: st.reps });
       return;
     }
     blocks.push({
@@ -3730,14 +3819,101 @@ function hrZoneBands(lt1, lt2) {
   ];
 }
 
+/* ---------- the other zone models, for comparison only ---------- */
+
+// Strava and Apple Fitness both show a five-zone model, and neither measures
+// anything about the runner: they slice a range into fifths from two endpoints.
+// A threshold model measures where physiology actually changes. That's why a
+// five-zone "Zone 2" and a threshold model's easy ceiling can sit 10+ bpm apart
+// with both correctly computed — they are not the same claim, they just collide
+// on the word "zone 2".
+//
+// Nothing here feeds training. It exists so the hub can name the disagreement,
+// because the alternative is the runner reconciling it by hand, and the obvious
+// way to do that is to widen easy until it matches how easy running feels —
+// which quietly turns every easy day into a threshold day.
+const ZONE_EDGES = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+
+// `reserve` selects Karvonen (% of max−rest, what Apple Fitness uses) over the
+// simpler % of max. Returns five [lo, hi) bands, or null without its inputs.
+function pctZoneBands(maxHr, restingHr, reserve) {
+  if (!maxHr) return null;
+  if (reserve && !restingHr) return null;
+  const base = reserve ? restingHr : 0;
+  const span = reserve ? maxHr - restingHr : maxHr;
+  if (span <= 0) return null;
+  return ZONE_EDGES.slice(0, 5).map((lo, i) => ({
+    z: i + 1,
+    lo: Math.round(base + span * lo),
+    hi: Math.round(base + span * ZONE_EDGES[i + 1]),
+  }));
+}
+
+// Which numbered zone a bpm lands in, for "your LT1 is their Zone 4".
+function pctZoneOf(bands, hr) {
+  if (!bands || !hr) return null;
+  if (hr < bands[0].lo) return 1;
+  const hit = bands.find((b) => hr >= b.lo && hr < b.hi);
+  return hit ? hit.z : 5;
+}
+
+function ZoneModelCompare({ lt1, lt2, maxHr, restingHr }) {
+  const models = [
+    { key: "max", name: "% of max HR", sub: `max ${maxHr}`, bands: pctZoneBands(maxHr, restingHr, false) },
+    { key: "hrr", name: "% of HR reserve", sub: restingHr ? `max ${maxHr}, rest ${restingHr}` : "needs resting HR", bands: pctZoneBands(maxHr, restingHr, true) },
+  ].filter((m) => m.bands);
+  if (!models.length) return null;
+
+  return (
+    <div className="zone-compare">
+      <div className="pt-section">The same heart rates, in the models Strava and Apple show you</div>
+      <div className="zc-table">
+        <div className="zc-row zc-head">
+          <span>Model</span><span>Zone 2 tops at</span><span>Your LT1 {lt1}</span><span>Your LT2 {lt2}</span>
+        </div>
+        <div className="zc-row">
+          <span className="zc-name">STRIDE · thresholds<em>measured</em></span>
+          <span className="mono">{lt1}</span>
+          <span className="zc-note">easy ceiling</span>
+          <span className="zc-note">threshold</span>
+        </div>
+        {models.map((m) => (
+          <div key={m.key} className="zc-row">
+            <span className="zc-name">{m.name}<em>{m.sub}</em></span>
+            <span className="mono">{m.bands[1].hi}</span>
+            <span className="mono">Zone {pctZoneOf(m.bands, lt1)}</span>
+            <span className="mono">Zone {pctZoneOf(m.bands, lt2)}</span>
+          </div>
+        ))}
+      </div>
+      <p className="muted small" style={{ marginTop: 8 }}>
+        If a watch app told you easy running stops in the low 150s and that felt wrong, this is why:
+        its Zone 2 is a fifth of a range, not your aerobic threshold. Yours is {lt1}, and it was
+        measured. <strong>Treat {lt1} as a ceiling, not a target</strong> — easy days want to sit
+        clearly under it, or every one of them becomes a threshold day.
+      </p>
+    </div>
+  );
+}
+
 function HRZoneHub({ profile, runs, onSaveHr }) {
   const [picking, setPicking] = useState(false);
   const [busyId, setBusyId] = useState(null);
   const [lt1Draft, setLt1Draft] = useState(profile?.lt1Hr ?? "");
+  const [maxDraft, setMaxDraft] = useState(profile?.maxHr ?? "");
+  const [restDraft, setRestDraft] = useState(profile?.restingHr ?? "");
 
   const lt2 = profile?.lt2Hr ?? null;
   const lt1 = profile?.lt1Hr ?? null;
   const isSetUp = lt2 != null;
+
+  // The highest HR ever actually recorded, offered as the max rather than
+  // 220−age. It's a floor on the true figure, not the figure itself — but it's
+  // an observation, which 220−age never is.
+  const observed = (runs || []).reduce(
+    (best, r) => (r.maxHr && (!best || r.maxHr > best.maxHr) ? r : best),
+    null
+  );
 
   // candidate tests: have HR, ~22–45 min, hardest (highest avg HR) first
   const candidates = (runs || [])
@@ -3760,6 +3936,20 @@ function HRZoneHub({ profile, runs, onSaveHr }) {
     const v = parseInt(lt1Draft, 10);
     if (!Number.isFinite(v) || v <= 0 || (lt2 && v >= lt2)) { alert("LT1 should be a number below your LT2."); return; }
     onSaveHr({ lt1Hr: v });
+  };
+
+  // Both anchors save together — the reserve model needs the pair, and saving
+  // one at a time leaves the comparison half-drawn between clicks.
+  const saveAnchors = () => {
+    const mx = parseInt(maxDraft, 10);
+    const rt = parseInt(restDraft, 10);
+    const okMax = Number.isFinite(mx) && mx > 0;
+    const okRest = restDraft === "" || (Number.isFinite(rt) && rt > 0);
+    if (!okMax) { alert("Max HR should be a number — your highest observed is a good start."); return; }
+    if (!okRest) { alert("Resting HR should be a number, or left blank."); return; }
+    if (okRest && restDraft !== "" && rt >= mx) { alert("Resting HR should be below your max HR."); return; }
+    if (lt2 && mx <= lt2) { alert(`Max HR should be above your LT2 of ${lt2}.`); return; }
+    onSaveHr({ maxHr: mx, restingHr: restDraft === "" ? null : rt });
   };
 
   return (
@@ -3817,6 +4007,32 @@ function HRZoneHub({ profile, runs, onSaveHr }) {
             </div>
           </label>
           <p className="muted small">On an easy run, note the HR where talking in full sentences gets hard — enter it here to sharpen the easy/gray-zone line.</p>
+
+          <label className="field" style={{ marginTop: 14 }}>
+            <span>Max &amp; resting HR <span className="muted">· not used for training — only to compare against Strava and Apple</span></span>
+            <div className="row-gap">
+              <input type="number" placeholder="max" value={maxDraft} onChange={(e) => setMaxDraft(e.target.value)} style={{ maxWidth: 100 }} />
+              <input type="number" placeholder="resting" value={restDraft} onChange={(e) => setRestDraft(e.target.value)} style={{ maxWidth: 100 }} />
+              <button className="btn-ghost" onClick={saveAnchors}>Save</button>
+            </div>
+          </label>
+          {observed && (
+            <p className="muted small">
+              Highest you&apos;ve actually recorded is <strong>{observed.maxHr} bpm</strong> ({relDate(observed.date)}) —
+              a floor on your true max, and a better starting point than 220−age.
+              {String(profile?.maxHr ?? "") !== String(observed.maxHr) && (
+                <> <button className="link-inline" onClick={() => setMaxDraft(String(observed.maxHr))}>use it</button></>
+              )}
+            </p>
+          )}
+          <p className="muted small">
+            Resting HR is hand-entered for now; once the Apple Health bridge lands it arrives daily and this
+            becomes the fallback.
+          </p>
+
+          {profile?.maxHr && (
+            <ZoneModelCompare lt1={lt1} lt2={lt2} maxHr={profile.maxHr} restingHr={profile.restingHr} />
+          )}
 
           <button className="btn-ghost" style={{ marginTop: 12 }} onClick={() => setPicking(true)}>↻ Re-test / relink</button>
         </>
@@ -4759,6 +4975,8 @@ function Setup({ profile, onSave, zones, runs, onPlanReset }) {
       lt2Hr: profile?.lt2Hr ?? null,
       lt2SourceActivity: profile?.lt2SourceActivity ?? null,
       hrTestedAt: profile?.hrTestedAt ?? null,
+      maxHr: profile?.maxHr ?? null,
+      restingHr: profile?.restingHr ?? null,
     });
     // A new/changed plan invalidates the old plan→run linkages; wipe them so
     // stale "done" ticks don't carry over onto the regenerated schedule.
@@ -5433,6 +5651,22 @@ function StyleBlock() {
       .zdot { width:10px; height:10px; border-radius:3px; }
       .zname { font-weight:600; }
       .zpct { font-size:12px; text-align:right; }
+
+      /* comparison against the five-zone models — reference, not prescription,
+         so it reads quieter than the zone list above it */
+      .zone-compare { margin-top:14px; }
+      .zc-table { overflow-x:auto; }
+      .zc-row { display:grid; grid-template-columns:minmax(104px,1.4fr) auto auto auto; gap:10px;
+        align-items:center; padding:8px 0; border-top:1px solid var(--line); font-size:12px; }
+      .zc-head { border-top:none; color:var(--accent-dim); font-size:10px; text-transform:uppercase;
+        letter-spacing:0.05em; font-weight:600; padding-bottom:4px; }
+      .zc-head span:not(:first-child), .zc-row span:not(:first-child) { text-align:right; }
+      .zc-name { display:flex; flex-direction:column; gap:1px; font-weight:600; }
+      .zc-name em { font-style:normal; font-weight:400; font-size:10px; color:var(--muted); }
+      .zc-note { color:var(--muted); font-size:11px; }
+      /* inline "use it" affordance — .btn-link is block-level and centres */
+      .link-inline { background:none; border:none; padding:0; font:inherit; color:var(--accent);
+        font-weight:600; cursor:pointer; text-decoration:underline; }
       .test-pick { display:grid; grid-template-columns:1fr auto auto auto auto; gap:10px; align-items:center; width:100%; text-align:left; background:var(--bg); border:1px solid var(--line); color:var(--ink); border-radius:10px; padding:10px 12px; font-family:inherit; font-size:13px; cursor:pointer; margin-bottom:6px; }
       .test-pick:hover:not(:disabled) { border-color:var(--accent-dim); }
       .test-pick:disabled { opacity:.5; }
