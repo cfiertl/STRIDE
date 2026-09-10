@@ -355,12 +355,31 @@ function peakVol(start, buildWeeks) {
   return v;
 }
 
+// How a week's volume is divided. The long run has first claim; easy days take
+// what's left. Getting that order the wrong way round is what produced weeks
+// whose "easy" Thursday was longer than their long Saturday.
+const LONG_MIN_SHARE = 0.40;   // a long run is a share of the week, not just a point on a curve
+const CUTBACK_LONG = 0.80;     // cutbacks ease the long run too, not only the easy days
+const TAPER_LONG = 0.70;
+const EASY_MAX_OF_LONG = 0.75; // support volume, never a rival to the long run
+const EASY_MIN_KM = 4;         // below this a run costs more in friction than it returns
+const QUALITY_KM_EST = 6;      // a quality session incl. warm-up/cool-down
+
 function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, weekStart, overrides, start, goal) {
-  // long run grows toward ~ goalKm (capped for safety) but eased in taper
+  // Long run grows toward ~goalKm (capped for safety), eased in taper and cutback.
+  //
+  // The progression curve alone is blind to weekVol, so a plan whose starting
+  // volume is honest would hold the long run at its goalKm*0.35 floor for the
+  // first weeks and pour the surplus into the easy day. Taking the larger of
+  // the curve and a share of the week fixes the ordering: volume can raise the
+  // long run early, and the curve still governs once it outgrows the share.
   const longCap = goalKm <= 10 ? goalKm * 1.0 : goalKm <= 21.1 ? goalKm * 0.95 : goalKm * 0.80;
   const progress = Math.min(1, (idx + 1) / Math.max(1, total - 2));
-  let longKm = Math.round(Math.min(longCap, Math.max(goalKm * 0.35, longCap * progress)));
-  if (isTaper) longKm = Math.round(longKm * 0.7);
+  const progressionKm = Math.max(goalKm * 0.35, longCap * progress);
+  let longKm = Math.min(longCap, Math.max(progressionKm, weekVol * LONG_MIN_SHARE));
+  if (cutback) longKm *= CUTBACK_LONG;
+  if (isTaper) longKm *= TAPER_LONG;
+  longKm = Math.round(longKm);
 
   const slots = [];
   // 1 long, on the chosen long day
@@ -374,15 +393,21 @@ function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, w
 
   // fill remaining preferred days with easy/zone2 runs to hit volume
   const easyD = sched.rest.slice(qualityCount);
-  // weekVol is a floor here, not a ceiling. Subtracting a growing long run from
-  // it drove easy days to their 4km minimum exactly as the long run — and so the
-  // need for supporting volume — was peaking, which is backwards. Size them off
-  // the long run as well and take whichever is larger. easyD is empty on a 2-day
-  // week (long + quality only), so this leaves those plans untouched.
-  const spare = Math.max(0, weekVol - longKm - qualityCount * 6); // assume ~6km per quality incl w/u
+  // Easy days split what the long run and the quality session leave.
+  //
+  // This used to floor them at half the long run, to stop them collapsing to
+  // the minimum exactly as the long run peaked. That was a symptom of a volume
+  // ramp that didn't ramp: weekVol stayed flat while longKm grew, so the
+  // subtraction ran out. With the ramp fixed the residual holds up on its own,
+  // and the floor now only pushes weeks past their own target — a cutback week
+  // came out 36% over. So the bound is inverted: a cap, not a floor. easyD is
+  // empty on a 2-day week (long + quality only), so those plans are untouched.
+  const spare = Math.max(0, weekVol - longKm - qualityCount * QUALITY_KM_EST);
   const perEasy =
     easyD.length > 0
-      ? Math.max(4, Math.round(Math.max(spare / easyD.length, longKm * 0.5)))
+      ? Math.max(EASY_MIN_KM,
+          Math.min(Math.round(spare / easyD.length),
+                   Math.floor(longKm * EASY_MAX_OF_LONG)))
       : 0;
   easyD.forEach((day) => slots.push({ day, type: "easy", km: perEasy }));
 
