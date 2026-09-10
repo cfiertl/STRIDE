@@ -1596,6 +1596,19 @@ function watchTargets(zones) {
   return out;
 }
 
+// A signature of the blocks themselves — rep count, work and rest durations —
+// so a session whose *shape* changed is caught even when its pace band didn't.
+// Comparing only the work pace was a real hole: 5×3:00 became 4×4:00 here, and
+// had the band happened to round to the same string, every already-built watch
+// would have kept quietly running the old session.
+function sessionShape(type) {
+  return sessionSteps({ type })
+    .map((st) => (st.kind === "reps"
+      ? `${st.reps}x${st.work.sec}/${st.rest.sec}`
+      : `${st.kind}:${stepSeconds(st, "mid")}`))
+    .join("|");
+}
+
 // Which confirmed watch workouts no longer match current paces.
 //
 // This lives in localStorage rather than on the profile deliberately: it
@@ -1616,8 +1629,18 @@ function staleWatchTargets(built, zones) {
   if (!built || !zones) return [];
   const now = watchTargets(zones);
   return Object.keys(now)
-    .filter((type) => built[type] && built[type].target && built[type].target !== now[type])
-    .map((type) => ({ type, was: built[type].target, now: now[type], at: built[type].at }));
+    .filter((type) => built[type] && built[type].target)
+    .map((type) => {
+      const shapeNow = sessionShape(type);
+      // Entries built before shapes were recorded have no baseline to compare
+      // against, so pace is all we can honestly judge them on — guessing
+      // "stale" there would nag about workouts that may well be correct.
+      const shapeChanged = built[type].shape != null && built[type].shape !== shapeNow;
+      const paceChanged = built[type].target !== now[type];
+      if (!shapeChanged && !paceChanged) return null;
+      return { type, was: built[type].target, now: now[type], at: built[type].at, shapeChanged };
+    })
+    .filter(Boolean);
 }
 
 // The same prescription as blocks to punch into a watch's custom-workout builder.
@@ -2053,7 +2076,7 @@ export default function App() {
 
   const markWatchBuilt = useCallback((type, target) => {
     setWatchBuilt((prev) => {
-      const next = { ...prev, [type]: { target, at: todayISO() } };
+      const next = { ...prev, [type]: { target, shape: sessionShape(type), at: todayISO() } };
       saveWatchBuilt(next);
       return next;
     });
@@ -2250,8 +2273,12 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness, onReschedule, 
             <Pill tone="warn">{staleWatch.length}</Pill>
           </div>
           <p className="muted small">
-            Your paces have moved since you built {staleWatch.length === 1 ? "this workout" : "these workouts"} on
-            your watch. Update the <strong>pace alert</strong> on the work block so it stops buzzing at the old range.
+            {staleWatch.some((w) => w.shapeChanged)
+              ? <>The <strong>blocks</strong> have changed since you built {staleWatch.length === 1 ? "this workout" : "these workouts"} on
+                your watch — not just the paces. Rebuild {staleWatch.length === 1 ? "it" : "them"} from the session below rather than
+                editing the pace alert.</>
+              : <>Your paces have moved since you built {staleWatch.length === 1 ? "this workout" : "these workouts"} on
+                your watch. Update the <strong>pace alert</strong> on the work block so it stops buzzing at the old range.</>}
           </p>
           <div className="watch-blocks">
             {staleWatch.map((w) => (
@@ -2259,7 +2286,7 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness, onReschedule, 
                 <span className="wb-name">{sessionDescription({ type: w.type }, zones).title}</span>
                 <span className="wb-was">{w.was}</span>
                 <span className="wb-arrow">→</span>
-                <span className="wb-target">{w.now}</span>
+                <span className="wb-target">{w.was === w.now ? "same pace, new blocks" : w.now}</span>
               </div>
             ))}
           </div>
