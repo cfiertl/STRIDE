@@ -30,7 +30,7 @@ export async function GET() {
 
   const admin = createAdminClient();
 
-  // Pending = a RUN with a streams row and no computed pace yet.
+  // Pending = a RUN with a streams row and at least one derived column missing.
   //
   // Every clause here is load-bearing, and the type filter was learned the hard
   // way. Without it the pending set included gym sessions, badminton and weight
@@ -45,23 +45,28 @@ export async function GET() {
   // The !inner join matters for the same reason: an activity that never got
   // streams would otherwise match forever. Newest first, so a part-finished
   // backfill still covers the recent runs Insights actually charts.
+  // Either derived column being absent makes a row pending. Keying only on
+  // gap_pace_s would have stranded every existing run when 017 added the HR
+  // histogram: they all already had a pace, so none would ever have been
+  // selected, and the new column would have filled itself in only for runs
+  // recorded from that day forward.
   const { data: acts, error: selErr } = await admin
     .from("activities")
     .select("id, activity_streams!inner(activity_id)")
     .eq("user_id", user.id)
-    .is("gap_pace_s", null)
+    .or("gap_pace_s.is.null,hr_seconds.is.null")
     .ilike("type", "%run%") // Run, TrailRun, VirtualRun
     .order("date", { ascending: false });
   if (selErr) {
     // Migrations are applied by hand in the Supabase dashboard, so a deploy can
     // land before 015 does. Fail this step softly rather than blowing up the
     // whole Sync run — everything before it has already done useful work.
-    if (/gap_pace_s/.test(selErr.message)) {
+    if (/gap_pace_s|hr_seconds/.test(selErr.message)) {
       return NextResponse.json({
         ok: true,
         computed: 0,
         remaining: 0,
-        note: "Run migration 015_run_metrics.sql, then sync again.",
+        note: "Run migrations 015_run_metrics.sql and 017_hr_seconds.sql, then sync again.",
       });
     }
     return NextResponse.json({ step: "select", error: selErr.message }, { status: 500 });
@@ -94,8 +99,11 @@ export async function GET() {
 
     for (const r of rows ?? []) {
       const metrics = computeRunMetrics(r.streams);
-      if (metrics.gap_pace_s == null) {
-        skipped += 1; // streams present but no usable GPS
+      // Pace and heart rate fail independently — a treadmill run has no GPS to
+      // give a pace but still has an HR histogram worth keeping, so the row is
+      // only truly unusable when nothing at all came back.
+      if (metrics.gap_pace_s == null && metrics.hr_seconds == null) {
+        skipped += 1;
         continue;
       }
       const { error } = await admin.from("activities").update(metrics).eq("id", r.activity_id);

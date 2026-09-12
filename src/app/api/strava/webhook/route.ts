@@ -156,7 +156,9 @@ async function processActivityEvent(event: any) {
     // Derive the grade-aware figures now, while the streams are already in hand.
     // Insights reads these columns instead of the blob (migration 015).
     const metrics = computeRunMetrics(streams);
-    if (metrics.gap_pace_s != null) {
+    // Pace needs GPS, the HR histogram doesn't — write whenever either landed,
+    // or a treadmill run would arrive with no intensity data at all.
+    if (metrics.gap_pace_s != null || metrics.hr_seconds != null) {
       await admin.from("activities").update(metrics).eq("id", upserted.id);
     }
   }

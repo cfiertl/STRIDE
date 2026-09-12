@@ -39,12 +39,14 @@ export interface RunMetrics {
   gap_pace_s: number | null;
   warmup_gap_pace_s: number | null;
   warmup_climb_m: number | null;
+  hr_seconds: Record<string, number> | null;
 }
 
 const EMPTY: RunMetrics = {
   gap_pace_s: null,
   warmup_gap_pace_s: null,
   warmup_climb_m: null,
+  hr_seconds: null,
 };
 
 const WARMUP_S = 600; // the first 10 minutes
@@ -54,6 +56,45 @@ const MAX_SAMPLE_GAP_S = 20;
 // Altitude jumps this big between consecutive samples are GPS noise. Barometric
 // watches are better, but one bad sample can invent 30 m of climb.
 const MAX_ALTITUDE_STEP_M = 8;
+
+/**
+ * Seconds spent at each whole bpm (migration 017).
+ *
+ * Stored per rate rather than per zone so the bands can be decided at read
+ * time: LT1 and LT2 move as fitness does, and a histogram re-buckets old runs
+ * for free where stored zone totals would quietly describe thresholds the
+ * runner no longer has.
+ *
+ * Gaps and the `moving` flag are treated exactly as the pace maths treats them,
+ * so a run's banded seconds still add up to something comparable with its
+ * moving time. That matters more than it sounds: standing at a lights for two
+ * minutes with a falling heart rate would otherwise land in the easiest band
+ * and read as easy running.
+ */
+function hrHistogram(streams: StravaStreams, time: number[] | null): Record<string, number> | null {
+  const hr = series(streams, "heartrate");
+  if (!time || !hr) return null;
+  const n = Math.min(time.length, hr.length);
+  if (n < 30) return null;
+
+  const moving = series(streams, "moving") as unknown as boolean[] | null;
+  const out: Record<string, number> = {};
+  let total = 0;
+
+  for (let i = 1; i < n; i++) {
+    const dt = time[i] - time[i - 1];
+    if (dt <= 0 || dt > MAX_SAMPLE_GAP_S) continue;
+    if (moving && moving[i] === false) continue;
+    const bpm = Math.round(hr[i]);
+    // 0 is a dropped strap reading, not a heart rate; the upper bound catches
+    // the spikes an optical sensor throws when the band shifts mid-run.
+    if (!(bpm > 20) || bpm > 250) continue;
+    out[bpm] = (out[bpm] ?? 0) + dt;
+    total += dt;
+  }
+
+  return total > 0 ? out : null;
+}
 
 /**
  * Flat-equivalent pace and warm-up load for one run.
@@ -71,14 +112,20 @@ const MAX_ALTITUDE_STEP_M = 8;
  */
 export function computeRunMetrics(streams: StravaStreams): RunMetrics {
   const time = series(streams, "time");
+
+  // Computed before the GPS guard below, and returned even when that guard
+  // trips: heart rate is the one figure a treadmill run still has, and
+  // intensity distribution is exactly the thing you'd want from one.
+  const hr_seconds = hrHistogram(streams, time);
+
   const distance = series(streams, "distance");
   const grade = series(streams, "grade_smooth");
-  if (!time || !distance || !grade) return EMPTY;
+  if (!time || !distance || !grade) return { ...EMPTY, hr_seconds };
 
   const altitude = series(streams, "altitude");
   const moving = series(streams, "moving") as unknown as boolean[] | null;
   const n = Math.min(time.length, distance.length, grade.length);
-  if (n < 30) return EMPTY;
+  if (n < 30) return { ...EMPTY, hr_seconds };
 
   let secs = 0, flatM = 0;                 // whole run
   let warmSecs = 0, warmFlatM = 0, climbM = 0; // first 10 minutes
@@ -116,5 +163,6 @@ export function computeRunMetrics(streams: StravaStreams): RunMetrics {
     gap_pace_s: pace(secs, flatM),
     warmup_gap_pace_s: pace(warmSecs, warmFlatM),
     warmup_climb_m: altitude ? Math.round(climbM * 10) / 10 : null,
+    hr_seconds,
   };
 }

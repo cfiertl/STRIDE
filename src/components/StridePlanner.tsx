@@ -1064,6 +1064,9 @@ function rowsToRun(activity, log) {
     gapPace: activity.gap_pace_s != null ? Number(activity.gap_pace_s) : null,
     warmupGapPace: activity.warmup_gap_pace_s != null ? Number(activity.warmup_gap_pace_s) : null,
     warmupClimb: activity.warmup_climb_m != null ? Number(activity.warmup_climb_m) : null,
+    // Seconds at each bpm (migration 017). Null until the metrics backfill has
+    // reached this run, so every reader guards.
+    hrSeconds: activity.hr_seconds && typeof activity.hr_seconds === "object" ? activity.hr_seconds : null,
   };
 }
 
@@ -4364,6 +4367,7 @@ function Insights({ runs: activities, fuel, zones, profile }) {
   if (runs.length < 3) return <Empty msg="Sync or log a few runs and the patterns will show up here." />;
 
   const lt1 = profile?.lt1Hr ?? null;
+  const lt2 = profile?.lt2Hr ?? null;
   const avg = (a) => (a.length ? (a.reduce((x, y) => x + y, 0) / a.length).toFixed(1) : null);
   const ageDays = (d) => (Date.now() - new Date(d).getTime()) / 864e5;
 
@@ -4375,8 +4379,39 @@ function Insights({ runs: activities, fuel, zones, profile }) {
   const vol = volRaw.map((w) => ({ ...w, plot: w.km > 0 ? w.km : volMax * 0.02 }));
   const load = loadWatch(runs);
 
-  // easy/hard balance over the last 28 days, by moving time
+  // Intensity distribution over the last 28 days.
+  //
+  // Preferred form reads the per-run HR histograms (migration 017) and bands
+  // them by the second. The fallback below classifies whole runs by their
+  // average HR, which is what this used to do exclusively and which is blind in
+  // two ways that matter. It cannot see inside a session — a tempo averaging
+  // 161 against an LT1 of 163 scored as entirely easy while half of it sat
+  // above threshold — and with only two buckets there is nowhere to put the
+  // band between the thresholds, which is the one the question is really about.
   const recent = runs.filter((r) => ageDays(r.date) < 28);
+
+  let bEasy = 0, bGrey = 0, bHard = 0, histRuns = 0;
+  if (lt1 && lt2) {
+    recent.forEach((r) => {
+      if (!r.hrSeconds) return;
+      histRuns += 1;
+      for (const [bpm, sec] of Object.entries(r.hrSeconds)) {
+        const b = Number(bpm), s = Number(sec);
+        if (!(s > 0)) continue;
+        if (b < lt1) bEasy += s;
+        else if (b < lt2) bGrey += s;
+        else bHard += s;
+      }
+    });
+  }
+  const bandTotal = bEasy + bGrey + bHard;
+  const pctOf = (v) => Math.round((v / bandTotal) * 100);
+  const bands = bandTotal > 0 && histRuns >= 3
+    ? { easy: pctOf(bEasy), grey: pctOf(bGrey), hard: pctOf(bHard), runs: histRuns }
+    : null;
+
+  // Fallback for before the histogram backfill has run, or when thresholds
+  // aren't set. Two buckets, whole-run averages — honest about being coarser.
   let easySec = 0, hardSec = 0, classified = 0;
   recent.forEach((r) => {
     const cls = runIntensity(r, zones, lt1);
@@ -4426,12 +4461,17 @@ function Insights({ runs: activities, fuel, zones, profile }) {
   // One easy run is a data point, not a month. Plotting singletons let a lone
   // good day become "your best month" and anchor a claim the data can't carry.
   const MIN_MONTH_RUNS = 2;
+  // Grade-adjusted where we have it. Raw pace made this chart read the terrain
+  // as much as the fitness: a hilly month can sit 35s/km off its flat
+  // equivalent, which is larger than a year's worth of real improvement and
+  // pointed the wrong way. Falls back to raw for manual runs with no GPS.
+  const efPace = (r) => r.gapPace || paceOf(r);
   const fitCurve = refHr
     ? months12.map((k) => {
-        const rs = runs.filter((r) => monthKey(r.date) === k && r.avgHr && r.avgHr < lt1 && paceOf(r) > 0);
+        const rs = runs.filter((r) => monthKey(r.date) === k && r.avgHr && r.avgHr < lt1 && efPace(r) > 0);
         if (rs.length < MIN_MONTH_RUNS) return { k, label: monthLabel(k), pace: null, n: rs.length };
         // efficiency: metres covered per minute, per beat
-        const ef = rs.reduce((a, r) => a + ((1000 / paceOf(r)) * 60) / r.avgHr, 0) / rs.length;
+        const ef = rs.reduce((a, r) => a + ((1000 / efPace(r)) * 60) / r.avgHr, 0) / rs.length;
         return { k, label: monthLabel(k), pace: Math.round(1000 / ((ef * refHr) / 60)), n: rs.length };
       })
     : [];
@@ -4579,7 +4619,32 @@ function Insights({ runs: activities, fuel, zones, profile }) {
           : <p className="muted small">The last bar is the current week so far, which is why it looks short.</p>}
       </section>
 
-      {easyPct != null && classified >= 4 && (
+      {bands ? (
+        <section className="card insight">
+          <h3>Intensity distribution</h3>
+          <div className="zbar">
+            <div className="zbar-seg" style={{ width: `${bands.easy}%`, background: "var(--positive)" }} />
+            <div className="zbar-seg" style={{ width: `${bands.grey}%`, background: "var(--amber)" }} />
+            <div className="zbar-seg" style={{ width: `${bands.hard}%`, background: "var(--coral)" }} />
+          </div>
+          <div className="zsplit">
+            <span><i style={{ background: "var(--positive)" }} />{bands.easy}% easy <em>under {lt1}</em></span>
+            <span><i style={{ background: "var(--amber)" }} />{bands.grey}% grey <em>{lt1}–{lt2 - 1}</em></span>
+            <span><i style={{ background: "var(--coral)" }} />{bands.hard}% hard <em>{lt2}+</em></span>
+          </div>
+          <p>
+            Last 4 weeks by the second, across {bands.runs} run{bands.runs === 1 ? "" : "s"} with heart-rate data.
+            {" "}
+            {bands.grey >= 20
+              ? <>A fifth or more of your running sits between your thresholds — too hard to recover from, too easy to drive much adaptation. The fix isn&apos;t less running: it&apos;s easier easy days, so the hard ones can be genuinely hard.</>
+              : bands.hard < 3
+                ? <>Barely any time above {lt2}. Your easy running is well controlled, but there&apos;s no real top-end stimulus in here — the quality sessions aren&apos;t reaching the intensity they&apos;re prescribed at.</>
+                : bands.easy >= 78
+                  ? <>Well polarised — most running genuinely easy, with a real dose above threshold rather than a smear through the middle. Keep it here.</>
+                  : <>More hard running than the 80/20 ideal. Easing the easy days down protects the quality of the hard ones.</>}
+          </p>
+        </section>
+      ) : easyPct != null && classified >= 4 ? (
         <section className="card insight">
           <h3>Easy / hard balance</h3>
           <div className="zbar">
@@ -4591,9 +4656,10 @@ function Insights({ runs: activities, fuel, zones, profile }) {
             {easyPct >= 75
               ? " Close to the 80/20 sweet spot — mostly easy, a controlled dose of hard. Keep it there."
               : " That's more hard running than the 80/20 ideal. Easing your easy days down protects the quality of your hard ones."}
+            {" "}Whole-run averages — Sync to get the by-the-second breakdown.
           </p>
         </section>
-      )}
+      ) : null}
 
       {curveReady && (
         <section className="card insight">
@@ -5726,6 +5792,12 @@ function StyleBlock() {
 
       .zbar { display:flex; height:14px; border-radius:999px; overflow:hidden; background:var(--bg); margin-bottom:12px; }
       .zbar-seg { min-width:2px; }
+      /* legend under the three-band intensity bar — wraps to two lines on a
+         narrow phone rather than squeezing the bpm ranges out of legibility */
+      .zsplit { display:flex; flex-wrap:wrap; gap:6px 14px; margin:-4px 0 10px; font-size:12px; font-weight:600; }
+      .zsplit span { display:inline-flex; align-items:center; gap:6px; }
+      .zsplit i { width:8px; height:8px; border-radius:2px; flex-shrink:0; }
+      .zsplit em { font-style:normal; font-weight:400; color:var(--muted); }
       .zrow { grid-template-columns:14px 1fr auto auto; }
       .ztime { font-size:12px; text-align:right; }
       .zshare { color:var(--accent); text-align:right; min-width:40px; }
