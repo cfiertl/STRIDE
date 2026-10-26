@@ -425,6 +425,21 @@ function buildWeek(idx, total, weekVol, goalKm, days, isTaper, cutback, sched, w
     return { ...s, origDay, day: dowName(date), date, skipped };
   });
 
+  // A plan can start after its own long day: started on a Sunday with a
+  // Saturday long run, week 1's Saturday is already behind it. Dropping it with
+  // the other pre-start days leaves the opening week without its one key
+  // session — and with nothing for that first run to link to, which forced the
+  // long day itself to Sunday for the whole plan. So an un-overridden long run
+  // that falls before the start moves to the first free day from the start.
+  const weekEnd = addDays(weekStart, 7);
+  const long = sessions.find((s) => s.type === "long");
+  if (long && long.date < start && start < weekEnd && !overrides[`${week}:${long.origDay}`]) {
+    const taken = new Set(sessions.filter((s) => s.date >= start).map((s) => s.date));
+    for (let d = start; d < weekEnd; d = addDays(d, 1)) {
+      if (!taken.has(d)) { long.date = d; long.day = dowName(d); break; }
+    }
+  }
+
   // Drop run days that can't actually be run: anything before the plan's start
   // date. A plan generated on Saturday starts that Saturday, so week 1's Mon–Fri
   // fall away here and the week's volume target scales to what's left.
