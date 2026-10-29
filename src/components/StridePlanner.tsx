@@ -711,6 +711,10 @@ function fmtDurRange(range) {
 function stepPace(step, zones, fallback) {
   const band = zones && step.zone && zones[step.zone];
   if (!band) return fallback;
+  return paceBandLabel(band);
+}
+
+function paceBandLabel(band) {
   const fast = fmtPace(band[1]);
   const slow = fmtPace(band[0]);
   // "4:03–4:14/km", not "4:03/km–4:14/km"
@@ -1603,27 +1607,47 @@ function SessionSteps({ session, zones, profile }) {
   );
 }
 
-// Which pace metric the watch alert should watch, per session type. They differ,
-// and the difference matters more than the range does:
+// Which pace metric the watch alert should watch, per session type.
 //
-// A 3-minute rep is too short for average pace to help — it needs most of the rep
-// to converge, by which point the rep is over and nothing can be corrected. Only
-// current pace can prompt a mid-rep correction, at the cost of GPS noise for the
-// first ~20s while it settles.
+// Intervals used current pace, on the theory that only it can prompt a mid-rep
+// correction. The 2026-10-27 4×4:00 disproved that: current pace swung ±35–50
+// s/km inside reps whose averages were steady, so it sat inside a 10s band ~10%
+// of the time and buzzed 12–20 times a rep. Widening doesn't rescue it — even a
+// 40s band is breached ~27 times a rep. It nags on GPS noise, and a runner who's
+// learned to tune it out misses the one real fade (which is what happened).
+// Replayed against the same reps, the rep's average pace with a 30s alert range
+// stayed quiet on three of four reps once it had settled. 4:00 reps give the
+// average time to settle; the 3:00 reps this was written for mostly didn't.
 //
-// A 22:30 threshold block is the opposite: average converges within a few minutes
-// and holding a steady average IS the session, whereas current pace would nag on
-// every rise and corner.
+// A 22:30 threshold block: average converges within a few minutes and holding
+// a steady average IS the session.
 const WATCH_PACE_METRIC = {
   tempo: {
     metric: "Average pace",
     why: "Over 22:30 the average settles quickly, and holding it steady is the session. Current pace would buzz on every rise and corner.",
   },
   interval: {
-    metric: "Current pace",
-    why: "Average pace can't react inside a 3:00 rep — it only converges once the rep is over. Ignore the first ~20s of each effort: that's GPS settling, not you.",
+    metric: "Average pace",
+    why: "Current pace swings ±40s/km on GPS inside a rep, so it buzzes constantly whatever you do. The rep's average settles within about a minute. Ignore any alert before 1:00.",
   },
 };
+
+// The alert range is wider than the target band on purpose. The band is what
+// to run; the alert is a guardrail for a real mistake. GPS can't resolve a
+// 10s band inside a 4:00 rep, so an alert set to the band itself fires on noise.
+// ±10s on each side keeps it on the watch's 10s grid and quiet when on pace,
+// and it still catches a rep that's clearly gone off. Smaller fades are for the
+// runner to catch by glancing at the rep's average at 2:00 and 3:00.
+// Tempo needs no margin: a 22:30 average has time to converge onto the band.
+const WATCH_ALERT_MARGIN_S = { interval: 10 };
+
+// [slow, fast] band for a step, widened by the alert margin for its session type.
+function watchAlertBand(step, zones, type) {
+  const band = zones && step.zone && zones[step.zone];
+  if (!band) return null;
+  const m = WATCH_ALERT_MARGIN_S[type] || 0;
+  return [band[0] + m, band[1] - m];
+}
 
 // The pace alert a watch workout would be built against, per structured session
 // type. Both the setup card and the drift check read this, so what gets confirmed
@@ -1633,8 +1657,8 @@ function watchTargets(zones) {
   ["tempo", "interval"].forEach((type) => {
     const core = sessionSteps({ type }).find((st) => st.kind === "reps" || st.kind === "work");
     if (!core) return;
-    const t = stepPace(core.kind === "reps" ? core.work : core, zones, "");
-    if (t) out[type] = t;
+    const band = watchAlertBand(core.kind === "reps" ? core.work : core, zones, type);
+    if (band) out[type] = paceBandLabel(band);
   });
   return out;
 }
@@ -1703,7 +1727,8 @@ function WatchSetup({ session, zones, built, onBuilt, profile }) {
   const blocks = [];
   sessionSteps(session).forEach((st) => {
     if (st.kind === "reps") {
-      blocks.push({ name: "Work", sec: st.work.sec, target: stepPace(st.work, zones, "hard"), reps: st.reps });
+      const alertBand = WATCH_ALERT_MARGIN_S[session.type] ? watchAlertBand(st.work, zones, session.type) : null;
+      blocks.push({ name: "Work", sec: st.work.sec, target: stepPace(st.work, zones, "hard"), alert: alertBand ? paceBandLabel(alertBand) : null, reps: st.reps });
       // The recovery block used to be quoted with no target at all. It has a
       // band in the model and always did — leaving it blank is what let it get
       // run at 90s/km slower than intended, which is how HR ends up resetting
@@ -1742,6 +1767,7 @@ function WatchSetup({ session, zones, built, onBuilt, profile }) {
                 <span className="wb-dur">{fmtTime(b.sec)}</span>
                 <span className="wb-target">
                   {b.target ? `${b.target}` : "no target"}
+                  {b.alert && <span className="wb-alert">alert {b.alert}</span>}
                   {b.target && metric && <span className="wb-metric">{metric.metric}</span>}
                   {b.hr && <span className="wb-hr">+ HR {b.hr.lo}–{b.hr.hi}</span>}
                 </span>
@@ -1751,9 +1777,15 @@ function WatchSetup({ session, zones, built, onBuilt, profile }) {
           </div>
           <p className="muted small" style={{ margin: "10px 0 0" }}>
             Apple Watch: Workout → Outdoor Run → ⋯ → <strong>Custom</strong>. Add the blocks above and set
-            a <strong>pace alert</strong> on the work block to that range — the watch buzzes when you drift
-            out, so you never have to read pace mid-rep. Build it once; this session repeats all plan.
+            a <strong>pace alert</strong> on the work block to {target ? <strong>{target}</strong> : "that range"}.
+            Build it once; this session repeats all plan.
           </p>
+          {session.type === "interval" && (
+            <p className="muted small" style={{ margin: "8px 0 0" }}>
+              The alert is deliberately wider than the target. Run to the target; the alert only goes off if a
+              rep has clearly gone wrong. For smaller drifts, glance at the rep's average pace at 2:00 and 3:00.
+            </p>
+          )}
           {metric && (
             <p className="muted small" style={{ margin: "8px 0 0" }}>
               Set the alert to <strong>{metric.metric}</strong> — not the other one. {metric.why}
@@ -1774,8 +1806,8 @@ function WatchSetup({ session, zones, built, onBuilt, profile }) {
           )}
           {session.type === "interval" && (
             <p className="muted small" style={{ margin: "8px 0 0" }}>
-              No HR alert on this one, deliberately: heart rate takes 60–90s to respond, so on a 3:00 rep it's
-              still climbing when the rep ends.
+              No HR alert on this one, deliberately: heart rate spends the first couple of minutes of a rep
+              climbing, then settles below LT2. That's normal for 4:00 reps, so an HR alert would buzz all rep.
             </p>
           )}
           {onBuilt && target && (
@@ -2338,7 +2370,12 @@ function Today({ profile, plan, runs, zones, go, onUpdateFitness, onReschedule, 
                 <span className="wb-name">{sessionDescription({ type: w.type }, zones).title}</span>
                 <span className="wb-was">{w.was}</span>
                 <span className="wb-arrow">→</span>
-                <span className="wb-target">{w.was === w.now ? "same pace, new blocks" : w.now}</span>
+                <span className="wb-target">
+                  {w.was === w.now ? "same pace, new blocks" : w.now}
+                  {/* The metric changes too (intervals moved off current pace), and a
+                      range typed into an alert still on the old metric keeps nagging. */}
+                  {w.was !== w.now && WATCH_PACE_METRIC[w.type] && <span className="wb-metric">{WATCH_PACE_METRIC[w.type].metric}</span>}
+                </span>
               </div>
             ))}
           </div>
@@ -5585,6 +5622,8 @@ function StyleBlock() {
       .watch-block .wb-target { display:flex; flex-direction:column; align-items:flex-end; gap:1px; }
       .wb-metric { font-family:inherit; font-size:9.5px; font-weight:700; text-transform:uppercase;
         letter-spacing:0.04em; color:var(--accent); }
+      .wb-alert { font-family:var(--font-mono),monospace; font-size:11px; font-weight:700;
+        color:var(--ink); font-variant-numeric:tabular-nums; white-space:nowrap; }
       .wb-hr { font-family:var(--font-mono),monospace; font-size:11px; font-weight:700;
         color:var(--viz-b); font-variant-numeric:tabular-nums; }
       .step-hr { color:var(--viz-b); }
