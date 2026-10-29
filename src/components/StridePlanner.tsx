@@ -2242,7 +2242,16 @@ useEffect(() => {
             Paces updated from your {paceToast.distKm}km in {fmtTime(paceToast.timeSec)} — about
             {" "}{Math.round(paceToast.gain * 100)}% quicker.
           </span>
-          <button className="link-btn" onClick={() => setTab("setup")}>View pace history</button>
+          {/* There is no pace history — the bench is a single value — so this
+              goes to where the new paces are shown. It also has to drop the
+              ?activity param like every other way out of a run, and land on the
+              card rather than the top of Setup, or it looks like nothing happened. */}
+          <button className="link-btn" onClick={() => {
+            setPaceToast(null);
+            clearActivityParam();
+            setTab("setup");
+            requestAnimationFrame(() => document.getElementById("setup-fitness")?.scrollIntoView({ behavior: "smooth", block: "start" }));
+          }}>See new paces</button>
           <button className="toast-close" onClick={() => setPaceToast(null)}>✕</button>
         </div>
       )}
@@ -3213,7 +3222,7 @@ function ActivityDetail({ activityId, onBack, profile, onScored, onDelete }) {
         ) : null;
       })()}
 
-      <HRZoneBreakdown streams={streams} lt1={profile?.lt1Hr} lt2={profile?.lt2Hr} />
+      <HRZoneBreakdown streams={streams} lt1={profile?.lt1Hr} lt2={profile?.lt2Hr} runType={log && log.run_type} />
 
       {splits.length > 0 && (
         <section className="card">
@@ -3481,7 +3490,10 @@ function ScoreCard({ activity, log, onSaved }) {
     setSaving(true);
     try {
       await saveRunLog(activity.id, {
-        type: (log && log.run_type) || activity.type || null,
+        // Never persist Strava's activity type ("Run") here: it isn't a run
+        // type, and once stored it reads as a classification. Unlinked stays
+        // null; linking to a plan session sets the real type.
+        type: (log && log.run_type) || null,
         score: Number(score),
         warmup,
         wrong: score <= 6 ? wrong : [],
@@ -3821,7 +3833,7 @@ function LinkSession({ activity, log, completion, allCompletions, profile, onSav
 }
 
 
-function HRZoneBreakdown({ streams, lt1, lt2 }) {
+function HRZoneBreakdown({ streams, lt1, lt2, runType }) {
   if (!streams) return null;
   const hr = streams.heartrate && (Array.isArray(streams.heartrate) ? streams.heartrate : streams.heartrate.data);
   const time = streams.time && (Array.isArray(streams.time) ? streams.time : streams.time.data);
@@ -3863,7 +3875,7 @@ function HRZoneBreakdown({ streams, lt1, lt2 }) {
           : null)}
       </div>
       <div className="zlist">
-            {hrZoneBands(lt1, lt2).map((z) => (
+            {hrZoneBands(lt1, lt2, runType).map((z) => (
               <div key={z.key} className="zitem">
                 <div className="zrow">
                   <span className="zdot" style={{ background: z.color }} />
@@ -3881,11 +3893,30 @@ function HRZoneBreakdown({ streams, lt1, lt2 }) {
 
 const LT1_FACTOR = 0.85; // LT1 pre-fill ≈ 85% of LT2; refined later via talk test
 
-function hrZoneBands(lt1, lt2) {
+// The generic notes are written for easy running, where time between the
+// thresholds means the effort crept up. On a quality run that reading is
+// backwards: 4:00 interval reps plateau between LT1 and LT2 because HR lags
+// the effort and the jogs reset it, so the run that was done right gets told
+// to "keep time here low", and Z3's note implies the reps should have reached
+// LT2. Quality runs get notes that describe what their zones should look like.
+const QUALITY_RUN_TYPES = new Set(["tempo", "interval", "reps"]);
+
+function hrZoneBands(lt1, lt2, runType) {
+  if (QUALITY_RUN_TYPES.has(runType)) {
+    return [
+      { key: "z1", name: "Z1 · Easy",   range: `< ${lt1}`,          color: "var(--accent-dim)", note: "Warm-up, cool-down and recovery jogs." },
+      { key: "z2", name: "Z2 · Steady", range: `${lt1}–${lt2 - 1}`,  color: "var(--amber)",      note: runType === "tempo"
+        ? "Where a tempo builds. It should settle near the top of this band, just under LT2."
+        : "Expected for reps of 4 minutes or less. HR lags the effort and the jogs reset it, so judge reps by pace, and by peak HR climbing rep to rep." },
+      { key: "z3", name: "Z3 · Hard",   range: `${lt2}+`,           color: "var(--coral)",      note: runType === "tempo"
+        ? "Above threshold. A tempo that spends long here was run too hard."
+        : "Short reps rarely reach this. Only long reps, or the last of a set, tend to touch it." },
+    ];
+  }
   return [
     { key: "z1", name: "Z1 · Easy",      range: `< ${lt1}`,          color: "var(--accent-dim)", note: "Conversational, fully aerobic. This should be the bulk of your running." },
     { key: "z2", name: "Z2 · Gray zone", range: `${lt1}–${lt2 - 1}`,  color: "var(--amber)",      note: "Too hard to recover from, too easy to drive big gains. Keep time here low." },
-    { key: "z3", name: "Z3 · Hard",      range: `${lt2}+`,           color: "var(--coral)",      note: "Threshold and above — your quality sessions and intervals." },
+    { key: "z3", name: "Z3 · Hard",      range: `${lt2}+`,           color: "var(--coral)",      note: "Threshold and above: races, time trials, the top end of a tempo." },
   ];
 }
 
@@ -5215,7 +5246,7 @@ function Setup({ profile, onSave, zones, runs, onPlanReset }) {
       
       <PushToggle />
 
-      <section className="card">
+      <section className="card" id="setup-fitness" style={{ scrollMarginTop: 72 }}>
         <h3>Your current fitness <span className="muted">(sets your paces)</span></h3>
         <p className="muted small">
           Use your most recent <strong>representative</strong> hard effort — a recent 5K, 10K or parkrun
@@ -5466,6 +5497,7 @@ function StyleBlock() {
       .toast .link-btn { flex-shrink:0; background:none; border:none; padding:0; color:var(--accent); font-size:14px; font-weight:600; cursor:pointer; white-space:nowrap; }
       .toast .toast-close { flex-shrink:0; background:none; border:none; padding:0 2px; color:var(--muted); font-size:16px; line-height:1; cursor:pointer; }
       .toast .toast-close:hover { color:var(--ink); }
+      .route-tiles { filter:grayscale(0.85) brightness(1.04) contrast(0.92); }
       @keyframes toast-in { from { opacity:0; transform:translate(-50%,8px); } to { opacity:1; transform:translate(-50%,0); } }
 
       .hero { background:linear-gradient(135deg, var(--panel-2), var(--panel)); }

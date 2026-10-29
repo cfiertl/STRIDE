@@ -17,9 +17,14 @@ export default function RouteMap({ latlng }) {
 
   return (
     <MapContainer bounds={bounds} boundsOptions={{ padding: [20, 20] }} scrollWheelZoom={false} style={{ height: 280, width: "100%", borderRadius: 12 }}>
+      {/* OSM's own tiles: no key. CARTO's basemaps started serving an "API KEY
+          REQUIRED" image in place of every tile. Desaturated so the route line
+          stays the loudest thing on the map, as it was on CARTO's light style. */}
       <TileLayer
-        url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
-        attribution='&copy; OpenStreetMap &copy; CARTO'
+        url="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        maxZoom={19}
+        className="route-tiles"
       />
       <Polyline positions={latlng} pathOptions={{ color: "var(--accent)", weight: 3, opacity: 0.9 }} />
     </MapContainer>
